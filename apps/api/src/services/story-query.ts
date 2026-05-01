@@ -1,5 +1,5 @@
 import { ScopeType } from "@prisma/client";
-import type { SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem } from "@news/shared";
+import type { SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 import { extractRegion } from "../domain/category.js";
 import { computeAuthorityStats, isGlobalTierDomain, scoreDomainAuthority } from "../domain/source-ranking.js";
 import { prisma } from "../lib/prisma.js";
@@ -21,6 +21,7 @@ export async function listStoryDates(): Promise<string[]> {
 interface StoryFilters {
   category?: string | undefined;
   region?: string | undefined;
+  keyword?: string | undefined;
 }
 
 interface StoryPaging {
@@ -42,6 +43,60 @@ function buildStoryWhere(date: string, filters: StoryFilters = {}) {
     where.topCategory = filters.category;
   } else if (filters.region) {
     where.topCategory = { startsWith: `${filters.region}` };
+  }
+
+  if (filters.keyword) {
+    const keyword = normalizeKeyword(filters.keyword);
+    return {
+      ...where,
+      OR: [
+        {
+          features: {
+            some: {
+              scopeType: ScopeType.CLUSTER,
+              featureSet: {
+                path: ["keywords"],
+                array_contains: keyword,
+              },
+            },
+          },
+        },
+        {
+          articles: {
+            some: {
+              article: {
+                features: {
+                  some: {
+                    scopeType: ScopeType.ARTICLE,
+                    featureSet: {
+                      path: ["keywordsEnglish"],
+                      array_contains: keyword,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          articles: {
+            some: {
+              article: {
+                features: {
+                  some: {
+                    scopeType: ScopeType.ARTICLE,
+                    featureSet: {
+                      path: ["keywords"],
+                      array_contains: keyword,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
   }
 
   return where;
@@ -99,6 +154,54 @@ function safeDisplaySummary(article: {
   }
 
   return null;
+}
+
+type ArticleFeaturePayload = {
+  keywords?: string[];
+  keywordsEnglish?: string[];
+  entities?: string[];
+  biasSignals?: string[];
+  sentiment?: number;
+  subjectivity?: number;
+  translatedSummary?: string | null;
+  translatedTitle?: string | null;
+};
+
+type ClusterFeaturePayload = {
+  keywords?: string[];
+  kagiClusterNumber?: number;
+  keywordStatus?: string;
+};
+
+function normalizeKeyword(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function matchesKeyword(candidate: string, keyword: string): boolean {
+  return normalizeKeyword(candidate) === normalizeKeyword(keyword);
+}
+
+function collectTopCounts(values: string[], limit = 8): Array<{ label: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((left, right) => {
+      if (right.count !== left.count) return right.count - left.count;
+      return left.label.localeCompare(right.label);
+    })
+    .slice(0, limit);
+}
+
+function collectUniqueKeywords(values: string[], limit = 12): string[] {
+  return values
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .filter((value, index, array) => array.findIndex((candidate) => candidate.toLowerCase() === value.toLowerCase()) === index)
+    .slice(0, limit);
 }
 
 function toIsoDateOrFallback(value: Date | null | undefined, fallback: Date): string {
@@ -237,8 +340,12 @@ function scoreSourceProfileTrust(domains: string[], profileCountByDomain: Map<st
 }
 
 export async function listStoryFacets(date: string): Promise<StoryFacetDto> {
+  return listStoryFacetsFiltered(date);
+}
+
+export async function listStoryFacetsFiltered(date: string, filters: StoryFilters = {}): Promise<StoryFacetDto> {
   const rows = await prisma.storyCluster.findMany({
-    where: buildStoryWhere(date),
+    where: buildStoryWhere(date, filters),
     include: {
       articles: {
         include: {
@@ -619,17 +726,179 @@ export async function getStoryComparison(id: string): Promise<StoryComparison | 
 }
 
 export async function getSourceProfile(domain: string): Promise<SourceProfileDto | null> {
+  const normalizedDomain = domain.trim().toLowerCase();
   const row = await prisma.sourceProfile.findUnique({
-    where: { domain },
+    where: { domain: normalizedDomain },
+  });
+  const storyRows = await prisma.storyCluster.findMany({
+    where: {
+      articles: {
+        some: {
+          article: {
+            OR: [
+              { domain: normalizedDomain },
+              { duplicateDomains: { has: normalizedDomain } },
+            ],
+          },
+        },
+      },
+    },
+    include: {
+      features: {
+        where: { scopeType: ScopeType.CLUSTER },
+        take: 1,
+      },
+      articles: {
+        include: {
+          article: {
+            include: {
+              features: {
+                where: { scopeType: ScopeType.ARTICLE },
+              },
+            },
+          },
+        },
+      },
+    },
+    orderBy: { storyDate: "desc" },
+    take: 20,
   });
 
-  if (!row) return null;
+  if (!row && storyRows.length === 0) return null;
+
+  const allMatchedArticles = storyRows.flatMap((story) =>
+    story.articles
+      .map((link) => link.article)
+      .filter((article) =>
+        article.domain.trim().toLowerCase() === normalizedDomain
+        || article.duplicateDomains.some((value) => value.trim().toLowerCase() === normalizedDomain),
+      ),
+  );
+
+  const topCategories = collectTopCounts(
+    allMatchedArticles.map((article) => article.category).filter((value): value is string => Boolean(value)),
+    6,
+  );
+  const topKeywords = collectUniqueKeywords(
+    allMatchedArticles.flatMap((article) => {
+      const feature = article.features[0]?.featureSet as ArticleFeaturePayload | undefined;
+      return feature?.keywordsEnglish ?? feature?.keywords ?? [];
+    }),
+    10,
+  );
+  const latestStoryDate = storyRows[0] ? toIsoDate(storyRows[0].storyDate) : null;
+  const stories = (await Promise.all(storyRows.map((story) => getStoryDetail(story.id)))).filter(
+    (value): value is StoryDetail => Boolean(value),
+  );
 
   return {
-    domain: row.domain,
-    sourceName: row.sourceName,
-    articleCount: row.articleCount,
-    averageSentiment: row.averageSentiment,
-    commonBiasSignals: row.commonBiasSignals,
+    domain: normalizedDomain,
+    sourceName: row?.sourceName ?? allMatchedArticles[0]?.sourceName ?? normalizedDomain,
+    description: row?.description ?? null,
+    country: row?.country ?? null,
+    countryOfOrigin: row?.countryOfOrigin ?? null,
+    headquarters: row?.headquarters ?? null,
+    mediaOwner: row?.mediaOwner ?? null,
+    ownershipType: row?.ownershipType ?? null,
+    employeeCount: row?.employeeCount ?? null,
+    wikipediaUrl: row?.wikipediaUrl ?? null,
+    associatedEntities: row?.associatedEntities ?? [],
+    articleCount: allMatchedArticles.length,
+    averageSentiment: row?.averageSentiment ?? 0,
+    commonBiasSignals: row?.commonBiasSignals ?? [],
+    topCategories,
+    topKeywords,
+    latestStoryDate,
+    stories,
+  };
+}
+
+export async function getTagProfile(keyword: string): Promise<TagProfileDto | null> {
+  const normalizedKeyword = normalizeKeyword(keyword);
+  if (!normalizedKeyword) return null;
+
+  const rows = await prisma.storyCluster.findMany({
+    include: {
+      features: {
+        where: { scopeType: ScopeType.CLUSTER },
+        take: 1,
+      },
+      articles: {
+        include: {
+          article: {
+            include: {
+              features: {
+                where: { scopeType: ScopeType.ARTICLE },
+              },
+            },
+          },
+        },
+      },
+    },
+    orderBy: { storyDate: "desc" },
+  });
+
+  const relatedKeywords: string[] = [];
+  const relatedEntities: string[] = [];
+  const topDomains: string[] = [];
+  const topCategories: string[] = [];
+  const matchedDates: string[] = [];
+  const matchedStoryIds = new Set<string>();
+  const matchedArticleIds = new Set<string>();
+  const matchedSourceDomains = new Set<string>();
+
+  for (const row of rows) {
+    const clusterFeature = row.features[0]?.featureSet as ClusterFeaturePayload | undefined;
+    const clusterKeywords = clusterFeature?.keywords ?? [];
+    const matchingArticles = row.articles
+      .map((link) => link.article)
+      .filter((article) => {
+        const feature = article.features[0]?.featureSet as ArticleFeaturePayload | undefined;
+        const articleKeywords = feature?.keywordsEnglish ?? feature?.keywords ?? [];
+        return articleKeywords.some((value) => matchesKeyword(value, normalizedKeyword));
+      });
+
+    const clusterMatched = clusterKeywords.some((value) => matchesKeyword(value, normalizedKeyword));
+    if (!clusterMatched && matchingArticles.length === 0) continue;
+
+    matchedStoryIds.add(row.id);
+    topDomains.push(...row.articles.map((item) => item.article.domain));
+    if (row.topCategory) topCategories.push(row.topCategory);
+    matchedDates.push(toIsoDate(row.storyDate));
+
+    for (const article of matchingArticles) {
+      const feature = article.features[0]?.featureSet as ArticleFeaturePayload | undefined;
+      const articleKeywords = feature?.keywordsEnglish ?? feature?.keywords ?? [];
+      relatedKeywords.push(...articleKeywords.filter((value) => !matchesKeyword(value, normalizedKeyword)));
+      relatedEntities.push(...(feature?.entities ?? []));
+      matchedArticleIds.add(article.id);
+      matchedSourceDomains.add(article.domain);
+      topDomains.push(article.domain);
+      if (article.category) topCategories.push(article.category);
+      if (article.publishedAt) {
+        matchedDates.push(toIsoDate(article.publishedAt));
+      }
+    }
+
+    relatedKeywords.push(...clusterKeywords.filter((value) => !matchesKeyword(value, normalizedKeyword)));
+  }
+
+  if (matchedStoryIds.size === 0 && matchedArticleIds.size === 0) return null;
+  const sortedDates = matchedDates.filter(Boolean).sort((left, right) => left.localeCompare(right));
+
+  return {
+    keyword,
+    normalizedKeyword,
+    storyCount: matchedStoryIds.size,
+    articleCount: matchedArticleIds.size,
+    sourceCount: matchedSourceDomains.size,
+    dateFrom: sortedDates[0] ?? null,
+    dateUntil: sortedDates[sortedDates.length - 1] ?? null,
+    topDomains: collectTopCounts(topDomains, 8),
+    topCategories: collectTopCounts(topCategories, 8),
+    relatedKeywords: collectUniqueKeywords(relatedKeywords.filter((value) => !matchesKeyword(value, normalizedKeyword)), 12),
+    relatedEntities: collectUniqueKeywords(relatedEntities, 12),
+    stories: [],
+    articles: [],
   };
 }

@@ -74,9 +74,63 @@ export const storyComparisonSchema = z.object({
 export const sourceProfileSchema = z.object({
   domain: z.string(),
   sourceName: z.string(),
+  description: z.string().nullable(),
+  country: z.string().nullable(),
+  countryOfOrigin: z.string().nullable(),
+  headquarters: z.string().nullable(),
+  mediaOwner: z.string().nullable(),
+  ownershipType: z.string().nullable(),
+  employeeCount: z.number().int().nullable(),
+  wikipediaUrl: z.string().url().nullable(),
+  associatedEntities: z.array(z.string()),
   articleCount: z.number().int(),
   averageSentiment: z.number(),
   commonBiasSignals: z.array(z.string()),
+  topCategories: z.array(
+    z.object({
+      label: z.string(),
+      count: z.number().int(),
+    }),
+  ),
+  topKeywords: z.array(z.string()),
+  latestStoryDate: isoDateSchema.nullable(),
+  stories: z.array(storyListItemSchema),
+});
+
+export const tagProfileSchema = z.object({
+  keyword: z.string(),
+  normalizedKeyword: z.string(),
+  storyCount: z.number().int(),
+  articleCount: z.number().int(),
+  sourceCount: z.number().int(),
+  dateFrom: isoDateSchema.nullable(),
+  dateUntil: isoDateSchema.nullable(),
+  topDomains: z.array(
+    z.object({
+      label: z.string(),
+      count: z.number().int(),
+    }),
+  ),
+  topCategories: z.array(
+    z.object({
+      label: z.string(),
+      count: z.number().int(),
+    }),
+  ),
+  relatedKeywords: z.array(z.string()),
+  relatedEntities: z.array(z.string()),
+  stories: z.array(storyListItemSchema),
+  articles: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      url: z.string().url(),
+      domain: z.string(),
+      publishedAt: z.string(),
+      summary: z.string().nullable(),
+      keywords: z.array(z.string()),
+    }),
+  ),
 });
 
 export const storyFacetSchema = z.object({
@@ -90,3 +144,4 @@ export type StoryDetail = z.infer<typeof storyDetailSchema>;
 export type StoryComparison = z.infer<typeof storyComparisonSchema>;
 export type SourceProfileDto = z.infer<typeof sourceProfileSchema>;
 export type StoryFacetDto = z.infer<typeof storyFacetSchema>;
+export type TagProfileDto = z.infer<typeof tagProfileSchema>;

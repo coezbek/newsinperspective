@@ -1,4 +1,5 @@
 import { env } from "../config/env.js";
+import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 
 interface OpenRouterKeywordInput {
   title: string;
@@ -15,11 +16,6 @@ interface OpenRouterKeywordResult {
   error: string | null;
 }
 
-const defaultFreeModels = [
-  "qwen/qwen3.6-plus:free",
-  "qwen/qwen3-next-80b-a3b-instruct:free",
-  "qwen/qwen3-coder:free",
-];
 const openRouterTimeoutMs = 6_000;
 const openRouterBackoffScheduleMs = [5_000, 15_000, 60_000];
 const openRouterMaxBackoffMs = 120_000;
@@ -54,13 +50,6 @@ function computeBackoffMs(round: number, retryAfterMs: number | null): number {
   return Math.min(base + jitter, openRouterMaxBackoffMs);
 }
 
-function rotateModels(models: string[], seed: string): string[] {
-  if (models.length <= 1) return models;
-  const hash = [...seed].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-  const offset = hash % models.length;
-  return [...models.slice(offset), ...models.slice(0, offset)];
-}
-
 function parseKeywordsFromResponse(content: string): string[] {
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   if (!jsonMatch) return [];
@@ -81,13 +70,8 @@ export async function extractKeywordsWithOpenRouter(
   input: OpenRouterKeywordInput,
 ): Promise<OpenRouterKeywordResult> {
   const log = input.onAttemptLog;
-  const models = (
-    env.OPENROUTER_MODEL
-      ? env.OPENROUTER_MODEL.split(",").map((value) => value.trim())
-      : defaultFreeModels
-  ).filter((value): value is string => value.length > 0);
-  const orderedModels = rotateModels(models, `${input.title}:${input.language ?? "unknown"}`);
-  const primaryModel = models[0] ?? defaultFreeModels[0]!;
+  const models = resolveOpenRouterModels(env.OPENROUTER_MODEL);
+  const primaryModel = models[0]!;
   const maxKeywords = input.maxKeywords ?? 8;
 
   if (!env.OPENROUTER_API_KEY) {
@@ -104,8 +88,16 @@ export async function extractKeywordsWithOpenRouter(
     "Rules:",
     "- keep proper names if relevant",
     "- exclude stop words and generic discourse words",
+    "- translate keywords into concise English labels",
+    "- use specific topical labels, not generic labels",
+    "- avoid vague keywords such as: news, article, report, issue, attack, analysis, update, release, event, company milestone",
     `- return at most ${maxKeywords} keywords`,
-    "- preserve the text language",
+    "- preserve proper names closely when translating",
+    "- prefer 1 to 4 words per keyword",
+    "Examples:",
+    "- good: [\"Zoom security\", \"privilege escalation\", \"macOS vulnerability\", \"webcam access\"]",
+    "- good: [\"Lazarus Group\", \"macOS malware\", \"fileless payloads\", \"in-memory loading\"]",
+    "- bad: [\"released\", \"new\", \"cyber attack\", \"story\"]",
     "",
     `Title: ${input.title}`,
     `Summary: ${input.summary ?? ""}`,
@@ -116,6 +108,7 @@ export async function extractKeywordsWithOpenRouter(
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
 
   for (let round = 0; round < maxRounds; round += 1) {
+    const orderedModels = orderOpenRouterModels(models, `${input.title}:${input.language ?? "unknown"}`, { round });
     let sawRetryableError = false;
     let maxRetryAfterMs: number | null = null;
     log?.(`round ${round + 1}/${maxRounds}: trying ${orderedModels.length} model(s)`);

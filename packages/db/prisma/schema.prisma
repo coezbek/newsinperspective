@@ -144,14 +144,25 @@ model ClusterArticle {
 }
 
 model SourceProfile {
-  id                String     @id @default(cuid())
-  domain            String     @unique
-  sourceName        String
-  articleCount      Int        @default(0)
-  averageSentiment  Float      @default(0)
-  commonBiasSignals String[]
-  createdAt         DateTime   @default(now())
-  updatedAt         DateTime   @updatedAt
+  id                 String     @id @default(cuid())
+  domain             String     @unique
+  sourceName         String
+  description        String?
+  country            String?
+  countryOfOrigin    String?
+  headquarters       String?
+  mediaOwner         String?
+  ownershipType      String?
+  employeeCount      Int?
+  wikipediaUrl       String?
+  associatedEntities String[]
+  articleCount       Int        @default(0)
+  averageSentiment   Float      @default(0)
+  commonBiasSignals  String[]
+  lastEnrichedAt     DateTime?
+  enrichmentModel    String?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
 }
 
 model NlpFeature {

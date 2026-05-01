@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { getCurrentDateString } from "../lib/runtime-date.js";
 import { closeArticleExtractionBrowser, extractArticleTextFromUrl } from "../services/article-text.js";
 import {
   KagiCategoryFetchProgress,
@@ -102,6 +103,7 @@ async function main() {
     "Science",
     "Gaming",
   ]);
+  const snapshotDate = process.argv[5] ?? getCurrentDateString();
 
   console.log("Selecting clusters from Kagi...");
   const categoryProgressStartedAt = Date.now();
@@ -131,7 +133,7 @@ async function main() {
     );
   }
 
-  const baseDir = resolve(process.cwd(), "notebooks", "exports", "kagi-top", new Date().toISOString().slice(0, 10));
+  const baseDir = resolve(process.cwd(), "notebooks", "exports", "kagi-top", snapshotDate);
   await mkdir(baseDir, { recursive: true });
 
   const results = [];
@@ -209,6 +211,7 @@ async function main() {
 
     const payload = {
       generatedAt: new Date().toISOString(),
+      snapshotDate,
       selection: {
         globalLimit,
         perCategoryLimit,

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { StoryComparison, StoryDetail, StoryFacetDto, StoryListItem } from "@news/shared";
+  import type { SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 
   const API_BASE =
     typeof window !== "undefined"
@@ -22,14 +22,27 @@
     error: string;
   }
 
+  type ViewState =
+    | { kind: "feed" }
+    | { kind: "source"; domain: string }
+    | { kind: "tag"; keyword: string };
+
   let dates: string[] = [];
   let startDate = "";
   let preferredRegion = "";
   let settingsOpen = false;
   let daySections: DaySection[] = [];
+  let currentView: ViewState = { kind: "feed" };
+  let sourceProfile: SourceProfileDto | null = null;
+  let sourceLoading = false;
+  let sourceError = "";
+  let tagProfile: TagProfileDto | null = null;
+  let tagLoading = false;
+  let tagError = "";
   let globalError = "";
   let loadingNextDate = false;
   let nextDateCursor = 0;
+  let loadedFeedSignature = "";
   let infiniteObserver: IntersectionObserver | null = null;
   let activeDebugNodes: HTMLElement[] = [];
   let debugOverlay: HTMLDivElement | null = null;
@@ -261,20 +274,49 @@
     return `${API_BASE}/api/favicons/${encodeURIComponent(domain)}`;
   }
 
+  function sourcePath(domain: string): string {
+    return `/newssite/${encodeURIComponent(domain)}`;
+  }
+
+  function tagPath(keyword: string): string {
+    return `/tag/${encodeURIComponent(keyword)}`;
+  }
+
+  function activeKeywordFilter(): string {
+    return currentView.kind === "tag" ? currentView.keyword : "";
+  }
+
+  function parseViewFromPath(pathname: string): ViewState {
+    const sourceMatch = pathname.match(/^\/newssite\/(.+)$/);
+    if (sourceMatch?.[1]) {
+      return { kind: "source", domain: decodeURIComponent(sourceMatch[1]) };
+    }
+
+    const tagMatch = pathname.match(/^\/tag\/(.+)$/);
+    if (tagMatch?.[1]) {
+      return { kind: "tag", keyword: decodeURIComponent(tagMatch[1]) };
+    }
+
+    return { kind: "feed" };
+  }
+
+  function navigate(path: string): void {
+    if (typeof window === "undefined") return;
+    if (window.location.pathname === path) return;
+    window.history.pushState({}, "", path);
+    void syncRouteFromLocation();
+  }
+
+  function handleInternalNavigation(event: MouseEvent, path: string): void {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    navigate(path);
+  }
+
   function handleFaviconError(event: Event): void {
     const target = event.currentTarget as HTMLImageElement | null;
     if (!target) return;
     target.style.display = "none";
-  }
-
-  function resolveDomainUrl(story: StoryDetail | null, domain: string): string | null {
-    if (!story) return null;
-    const normalizedDomain = domain.trim().toLowerCase();
-    const match = story.articles.find((article) =>
-      article.domain.trim().toLowerCase() === normalizedDomain
-      || article.syndicatedDomains.some((value) => value.trim().toLowerCase() === normalizedDomain)
-    );
-    return match?.url ?? null;
   }
 
   function otherSourceCount(story: StoryDetail | null): number {
@@ -309,8 +351,17 @@
 
     if (preferredRegion) params.set("region", preferredRegion);
     if (category) params.set("category", category);
+    if (activeKeywordFilter()) params.set("keyword", activeKeywordFilter());
 
     return fetchJson<StoryListItem[]>(`/api/stories?${params.toString()}`);
+  }
+
+  async function ensureFeedDatesLoaded(): Promise<void> {
+    if (dates.length > 0) return;
+    dates = await fetchJson<string[]>("/api/dates");
+    if (!startDate && dates[0]) {
+      startDate = dates[0];
+    }
   }
 
   async function loadStoryForSection(date: string, storyId: string): Promise<void> {
@@ -390,7 +441,10 @@
 
     try {
       const [facets, stories] = await Promise.all([
-        fetchJson<StoryFacetDto>(`/api/facets?date=${date}`),
+        fetchJson<StoryFacetDto>(`/api/facets?${new URLSearchParams({
+          date,
+          ...(activeKeywordFilter() ? { keyword: activeKeywordFilter() } : {}),
+        }).toString()}`),
         fetchStoriesForDay(date, ""),
       ]);
 
@@ -436,6 +490,7 @@
   async function resetFeed(): Promise<void> {
     globalError = "";
     daySections = [];
+    loadedFeedSignature = currentView.kind === "tag" ? `tag:${currentView.keyword}` : "feed";
 
     const startIndex = dates.indexOf(startDate);
     nextDateCursor = startIndex >= 0 ? startIndex : 0;
@@ -448,6 +503,57 @@
 
   async function handlePreferredRegionChange(): Promise<void> {
     await resetFeed();
+  }
+
+  async function loadSourcePage(domain: string): Promise<void> {
+    sourceLoading = true;
+    sourceError = "";
+    sourceProfile = null;
+
+    try {
+      sourceProfile = await fetchJson<SourceProfileDto>(`/api/sources/${encodeURIComponent(domain)}`);
+    } catch (value) {
+      sourceError = value instanceof Error ? value.message : "Failed to load source profile";
+    } finally {
+      sourceLoading = false;
+    }
+  }
+
+  async function loadTagPage(keyword: string): Promise<void> {
+    tagLoading = true;
+    tagError = "";
+    tagProfile = null;
+
+    try {
+      tagProfile = await fetchJson<TagProfileDto>(`/api/tags/${encodeURIComponent(keyword)}`);
+      await ensureFeedDatesLoaded();
+      await resetFeed();
+    } catch (value) {
+      tagError = value instanceof Error ? value.message : "Failed to load keyword profile";
+    } finally {
+      tagLoading = false;
+    }
+  }
+
+  async function syncRouteFromLocation(): Promise<void> {
+    if (typeof window === "undefined") return;
+    currentView = parseViewFromPath(window.location.pathname);
+
+    if (currentView.kind === "source") {
+      await loadSourcePage(currentView.domain);
+      return;
+    }
+
+    if (currentView.kind === "tag") {
+      await loadTagPage(currentView.keyword);
+      return;
+    }
+
+    await ensureFeedDatesLoaded();
+    const nextSignature = "feed";
+    if ((daySections.length === 0 || loadedFeedSignature !== nextSignature) && dates[0]) {
+      await resetFeed();
+    }
   }
 
   function observeInfiniteScroll(node: HTMLDivElement): { destroy: () => void } {
@@ -480,6 +586,9 @@
   onMount(() => {
     let devtoolsInterval: number | null = null;
     let syncDevtools: (() => void) | null = null;
+    const handlePopState = () => {
+      void syncRouteFromLocation();
+    };
 
     if (import.meta.env.DEV) {
       syncDevtools = () => {
@@ -495,11 +604,11 @@
       document.addEventListener("mouseleave", handleDebugPointerLeave, true);
     }
 
+    window.addEventListener("popstate", handlePopState);
+
     (async () => {
-      dates = await fetchJson<string[]>("/api/dates");
-      if (!dates[0]) return;
-      startDate = dates[0];
-      await resetFeed();
+      await ensureFeedDatesLoaded();
+      await syncRouteFromLocation();
     })().catch((value) => {
       globalError = value instanceof Error ? value.message : "Failed to initialize feed";
     });
@@ -513,6 +622,7 @@
       }
       window.removeEventListener("resize", requestDebugRender);
       window.removeEventListener("scroll", requestDebugRender, true);
+      window.removeEventListener("popstate", handlePopState);
       document.removeEventListener("mouseover", handleDebugPointer, true);
       document.removeEventListener("mouseleave", handleDebugPointerLeave, true);
       if (debugRenderFrame !== null) {
@@ -528,7 +638,13 @@
 </script>
 
 <svelte:head>
-  <title>NewsInPerspective</title>
+  <title>
+    {currentView.kind === "source"
+      ? `${currentView.domain} · NewsInPerspective`
+      : currentView.kind === "tag"
+        ? `${currentView.keyword} · NewsInPerspective`
+        : "NewsInPerspective"}
+  </title>
 </svelte:head>
 
 <main class="shell" use:debugComponent={componentLabel("AppShell")}>
@@ -538,8 +654,14 @@
       <div>
         <h1>See how the same story moves across outlets, regions, and days.</h1>
         <p class="lede">
-          Each date section shows its own category chooser, top story feed, and cluster explorer.
-          Scroll down to load the next day.
+          {#if currentView.kind === "feed"}
+            Each date section shows its own category chooser, top story feed, and cluster explorer.
+            Scroll down to load the next day.
+          {:else if currentView.kind === "source"}
+            Source profiles combine outlet metadata with the stories currently associated with that domain.
+          {:else}
+            Keyword pages show where a topic appears, which sources publish it, and what other entities travel with it.
+          {/if}
         </p>
       </div>
 
@@ -549,7 +671,7 @@
       </button>
     </div>
 
-    {#if settingsOpen}
+    {#if settingsOpen && currentView.kind === "feed"}
       <div class="settings-panel" use:debugComponent={componentLabel("SettingsPanel")}>
         <label>
           <span>Start date</span>
@@ -577,7 +699,156 @@
     <p class="error" use:debugComponent={componentLabel("GlobalError")}>{globalError}</p>
   {/if}
 
-  {#each daySections as section (section.date)}
+  {#if currentView.kind === "source"}
+    <section class="panel focus-page" use:debugComponent={componentLabel("SourcePage", currentView.domain)}>
+      <div class="detail-head">
+        <div>
+          <p class="eyebrow">News Source</p>
+          <div class="source-title-row">
+            <img class="favicon source-favicon" src={faviconUrl(currentView.domain)} alt="" loading="lazy" width="18" height="18" on:error={handleFaviconError} />
+            <h2>{currentView.domain}</h2>
+          </div>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+
+      {#if sourceLoading}
+        <p class="loading">Loading source profile...</p>
+      {:else if sourceError}
+        <p class="error">{sourceError}</p>
+      {:else if sourceProfile}
+        <div class="focus-grid">
+          <section class="panel inset-panel">
+            <p class="eyebrow">Profile</p>
+            <h3>{sourceProfile.sourceName}</h3>
+            <p>{sourceProfile.description ?? "No enriched source description is available yet."}</p>
+            <div class="chip-row">
+              {#if sourceProfile.country}<span class="chip">Country: {sourceProfile.country}</span>{/if}
+              {#if sourceProfile.countryOfOrigin}<span class="chip">Origin: {sourceProfile.countryOfOrigin}</span>{/if}
+              {#if sourceProfile.headquarters}<span class="chip">HQ: {sourceProfile.headquarters}</span>{/if}
+              {#if sourceProfile.mediaOwner}<span class="chip">Owner: {sourceProfile.mediaOwner}</span>{/if}
+              {#if sourceProfile.ownershipType}<span class="chip">Ownership: {sourceProfile.ownershipType}</span>{/if}
+              {#if sourceProfile.employeeCount}<span class="chip">Employees: {sourceProfile.employeeCount}</span>{/if}
+            </div>
+            {#if sourceProfile.wikipediaUrl}
+              <p><a href={sourceProfile.wikipediaUrl} target="_blank" rel="noreferrer">Wikipedia</a></p>
+            {/if}
+            {#if sourceProfile.associatedEntities.length > 0}
+              <div class="chip-row">
+                {#each sourceProfile.associatedEntities as entity}
+                  <span class="chip">{entity}</span>
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          <section class="panel inset-panel">
+            <p class="eyebrow">Facets</p>
+            <div class="inline-stats">
+              <div class="inline-stat"><span class="stat-label">Articles</span><strong>{sourceProfile.articleCount}</strong></div>
+              <div class="inline-stat"><span class="stat-label">Sentiment</span><strong>{sourceProfile.averageSentiment}</strong></div>
+              <div class="inline-stat"><span class="stat-label">Latest story</span><strong>{sourceProfile.latestStoryDate ?? "n/a"}</strong></div>
+            </div>
+            <div class="facet-list">
+              {#each sourceProfile.topCategories as facet}
+                <span class="chip">{facet.label} · {facet.count}</span>
+              {/each}
+            </div>
+            <div class="facet-list">
+              {#each sourceProfile.topKeywords as keyword}
+                <a href={tagPath(keyword)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+              {/each}
+            </div>
+            <div class="facet-list">
+              {#each sourceProfile.commonBiasSignals as signal}
+                <span class="chip">{signal}</span>
+              {/each}
+            </div>
+          </section>
+        </div>
+
+        <section class="panel inset-panel">
+          <p class="eyebrow">Stories Featuring This Source</p>
+          <div class="stories">
+            {#each sourceProfile.stories as story}
+              <article class="story-card">
+                <span class="meta">
+                  {formatCategoryLabel(story.category)} · {story.importanceScore} score · {story.sourceCount} sources
+                </span>
+                <strong>{story.title}</strong>
+                <span class="signals">{formatDateRange(story.dateFrom, story.dateUntil)}</span>
+                <span class="story-keywords">
+                  {#each story.keywords as keyword, index}
+                    {#if index > 0}, {/if}
+                    <a href={tagPath(keyword)} on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                  {/each}
+                </span>
+              </article>
+            {/each}
+          </div>
+        </section>
+      {/if}
+    </section>
+  {:else if currentView.kind === "tag"}
+    <section class="panel focus-page" use:debugComponent={componentLabel("TagPage", currentView.keyword)}>
+      <div class="detail-head">
+        <div>
+          <p class="eyebrow">Keyword</p>
+          <h2>{currentView.keyword}</h2>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+
+      {#if tagLoading}
+        <p class="loading">Loading keyword profile...</p>
+      {:else if tagError}
+        <p class="error">{tagError}</p>
+      {:else if tagProfile}
+        <div class="focus-grid">
+          <section class="panel inset-panel">
+            <p class="eyebrow">Overview</p>
+            <div class="inline-stats">
+              <div class="inline-stat"><span class="stat-label">Stories</span><strong>{tagProfile.storyCount}</strong></div>
+              <div class="inline-stat"><span class="stat-label">Articles</span><strong>{tagProfile.articleCount}</strong></div>
+              <div class="inline-stat"><span class="stat-label">Sources</span><strong>{tagProfile.sourceCount}</strong></div>
+            </div>
+            <p>{tagProfile.dateFrom ?? "n/a"} to {tagProfile.dateUntil ?? "n/a"}</p>
+            <div class="facet-list">
+              {#each tagProfile.topDomains as facet}
+                <a href={sourcePath(facet.label)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, sourcePath(facet.label))}>{facet.label} · {facet.count}</a>
+              {/each}
+            </div>
+            <div class="facet-list">
+              {#each tagProfile.topCategories as facet}
+                <span class="chip">{facet.label} · {facet.count}</span>
+              {/each}
+            </div>
+          </section>
+
+          <section class="panel inset-panel">
+            <p class="eyebrow">Related Terms</p>
+            <div class="facet-list">
+              {#each tagProfile.relatedKeywords as keyword}
+                <a href={tagPath(keyword)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+              {/each}
+            </div>
+            <div class="facet-list">
+              {#each tagProfile.relatedEntities as entity}
+                <span class="chip">{entity}</span>
+              {/each}
+            </div>
+          </section>
+        </div>
+      {/if}
+    </section>
+  {/if}
+
+  {#if currentView.kind !== "source"}
+    {#each daySections as section (section.date)}
     <section class="day-block panel" use:debugComponent={componentLabel("DaySection", section.date)}>
       <div class="day-separator" use:debugComponent={componentLabel("DaySeparator", section.date)}>
         <span>{section.date}</span>
@@ -652,7 +923,12 @@
                 </span>
                 <strong>{story.title}</strong>
                 <span class="signals">{formatDateRange(story.dateFrom, story.dateUntil)}</span>
-                <span class="story-keywords">{story.keywords.join(", ")}</span>
+                <span class="story-keywords">
+                  {#each story.keywords as keyword, index}
+                    {#if index > 0}, {/if}
+                    <a href={tagPath(keyword)} on:click|stopPropagation={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                  {/each}
+                </span>
               </button>
             {/each}
           </div>
@@ -677,39 +953,22 @@
                   use:debugComponent={componentLabel("TopDomains", shortId(section.selectedStory.id))}
                 >
                   {#each section.selectedStory.topDomains as domain}
-                    {@const link = resolveDomainUrl(section.selectedStory, domain)}
-                    {#if link}
-                      <a
-                        class="domain-chip domain-link"
-                        href={link}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <img
-                          class="favicon"
-                          src={faviconUrl(domain)}
-                          alt=""
-                          loading="lazy"
-                          width="14"
-                          height="14"
-                          on:error={handleFaviconError}
-                        />
-                        <span>{domain}</span>
-                      </a>
-                    {:else}
-                      <span class="domain-chip">
-                        <img
-                          class="favicon"
-                          src={faviconUrl(domain)}
-                          alt=""
-                          loading="lazy"
-                          width="14"
-                          height="14"
-                          on:error={handleFaviconError}
-                        />
-                        <span>{domain}</span>
-                      </span>
-                    {/if}
+                    <a
+                      class="domain-chip domain-link"
+                      href={sourcePath(domain)}
+                      on:click={(event) => handleInternalNavigation(event, sourcePath(domain))}
+                    >
+                      <img
+                        class="favicon"
+                        src={faviconUrl(domain)}
+                        alt=""
+                        loading="lazy"
+                        width="14"
+                        height="14"
+                        on:error={handleFaviconError}
+                      />
+                      <span>{domain}</span>
+                    </a>
                   {/each}
                   {#if otherSourceCount(section.selectedStory) > 0}
                     <span class="domain-more">and {otherSourceCount(section.selectedStory)} other sources</span>
@@ -721,7 +980,7 @@
                 {#if section.comparison}
                   <div class="chip-row">
                     {#each section.comparison.sharedKeywords as keyword}
-                      <span class="chip">{keyword}</span>
+                    <a href={tagPath(keyword)} class="chip" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
                     {/each}
                   </div>
 
@@ -742,7 +1001,7 @@
                   <div class="article-head-rail">
                     <header class="article-head" use:debugComponent={componentLabel("ArticleHeader", article.domain)}>
                       <p class="meta article-meta">
-                        <span class="domain-chip">
+                        <a class="domain-chip domain-link" href={sourcePath(article.domain)} on:click={(event) => handleInternalNavigation(event, sourcePath(article.domain))}>
                           <img
                             class="favicon"
                             src={faviconUrl(article.domain)}
@@ -753,7 +1012,7 @@
                             on:error={handleFaviconError}
                           />
                           <span>{article.domain}</span>
-                        </span>
+                        </a>
                         <span>· {article.publishedAt.slice(0, 10)}</span>
                       </p>
                       <h4>{article.title}</h4>
@@ -779,6 +1038,14 @@
                         Sentiment {article.sentiment} · Subjectivity {article.subjectivity} ·
                         Bias &lt;not yet determined&gt;
                       </p>
+                      {#if article.keywords.length > 0}
+                        <p class="signals">
+                          {#each article.keywords as keyword, keywordIndex}
+                            {#if keywordIndex > 0}, {/if}
+                            <a href={tagPath(keyword)} on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                          {/each}
+                        </p>
+                      {/if}
                       <a href={article.url} target="_blank" rel="noreferrer">Read source</a>
                     </div>
                   </div>
@@ -794,19 +1061,20 @@
         </section>
       </div>
     </section>
-  {/each}
+    {/each}
 
-  <div
-    class="load-anchor"
-    use:observeInfiniteScroll
-    use:debugComponent={componentLabel("InfiniteScrollAnchor")}
-  >
-    {#if loadingNextDate}
-      <p>Loading next day...</p>
-    {:else if nextDateCursor >= dates.length && daySections.length > 0}
-      <p>No more dates.</p>
-    {/if}
-  </div>
+    <div
+      class="load-anchor"
+      use:observeInfiniteScroll
+      use:debugComponent={componentLabel("InfiniteScrollAnchor")}
+    >
+      {#if loadingNextDate}
+        <p>Loading next day...</p>
+      {:else if nextDateCursor >= dates.length && daySections.length > 0}
+        <p>No more dates.</p>
+      {/if}
+    </div>
+  {/if}
 </main>
 
 <style>
@@ -834,6 +1102,10 @@
     color: var(--text);
   }
 
+  a {
+    color: inherit;
+  }
+
   .shell {
     max-width: 1320px;
     margin: 0 auto;
@@ -852,6 +1124,29 @@
   .day-block {
     padding: 20px 22px;
     margin-bottom: 16px;
+  }
+
+  .focus-page {
+    padding: 22px;
+  }
+
+  .focus-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .inset-panel {
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+
+  .facet-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 12px;
   }
 
   .hero-row,
@@ -1049,9 +1344,28 @@
   }
 
   .story-keywords {
-    color: #3f536f;
-    font-size: 0.92rem;
-    line-height: 1.45;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .story-keywords a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 0 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(15, 98, 254, 0.16);
+    background: rgba(220, 232, 255, 0.86);
+    color: var(--accent-strong);
+    font-size: 0.84rem;
+    line-height: 1;
+    text-decoration: none;
+    text-underline-offset: 3px;
+  }
+
+  .story-keywords a:hover {
+    text-decoration: underline;
   }
 
   .detail {
@@ -1066,6 +1380,32 @@
     margin: -2px -2px 12px;
     padding: 2px 2px 0;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(255, 255, 255, 0.95));
+    display: flex;
+    align-items: start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .page-actions {
+    flex: 0 0 auto;
+    padding-top: 4px;
+  }
+
+  .back-link {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+  }
+
+  .source-title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+  }
+
+  .source-favicon {
+    flex: 0 0 auto;
   }
 
   .comparison {
@@ -1101,6 +1441,16 @@
   .domain-link:hover {
     border-color: var(--border-strong);
     box-shadow: 0 6px 14px rgba(20, 55, 111, 0.12);
+  }
+
+  .chip-link {
+    text-decoration: none;
+  }
+
+  .chip-link:hover,
+  .chip:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
   }
 
   .domain-more {
@@ -1290,6 +1640,10 @@
   }
 
   @media (max-width: 980px) {
+    .focus-grid {
+      grid-template-columns: 1fr;
+    }
+
     .hero-row,
     .day-head,
     .day-layout {

@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
+import { getCurrentDateString } from "../lib/runtime-date.js";
 import { enrichArticleText } from "../services/article-text.js";
 import { runIngestion } from "../services/ingestion.js";
 
@@ -13,7 +14,7 @@ export async function registerInternalRoutes(app: FastifyInstance): Promise<void
       .default({});
 
     const body = bodySchema.parse(request.body ?? {});
-    const date = body.date ?? new Date().toISOString().slice(0, 10);
+    const date = body.date ?? getCurrentDateString();
 
     return runIngestion(date);
   });

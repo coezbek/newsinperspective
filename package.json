@@ -5,6 +5,7 @@
   "packageManager": "pnpm@10.32.1",
   "scripts": {
     "api:start": "pnpm --filter @news/api start",
+    "backfill:article-redirects": "pnpm --filter @news/api backfill:article-redirects",
     "build": "turbo run build",
     "compare:keywords": "pnpm --filter @news/api compare:keywords",
     "retry:openrouter-keywords": "pnpm --filter @news/api retry:openrouter-keywords",

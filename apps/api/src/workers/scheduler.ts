@@ -1,5 +1,7 @@
 import { env } from "../config/env.js";
+import { getCurrentDateString } from "../lib/runtime-date.js";
 import { runIngestion } from "../services/ingestion.js";
+import { runOpenRouterBacklog } from "../services/openrouter-backlog.js";
 
 function msUntilNextRun(timeUtc: string): number {
   const [hours, minutes] = timeUtc.split(":").map(Number);
@@ -18,9 +20,15 @@ export function startScheduler(): void {
   const scheduleNext = () => {
     const wait = msUntilNextRun(env.AUTO_INGEST_TIME_UTC);
     setTimeout(async () => {
-      const date = new Date().toISOString().slice(0, 10);
+      const date = getCurrentDateString();
       try {
         await runIngestion(date);
+        void runOpenRouterBacklog({
+          date,
+          articleLimit: 25,
+          clusterLimit: 10,
+          sourceLimit: 10,
+        });
       } finally {
         scheduleNext();
       }

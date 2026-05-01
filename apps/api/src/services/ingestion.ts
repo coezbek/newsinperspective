@@ -5,8 +5,9 @@ import { createFileLogger } from "../lib/file-logger.js";
 import { prisma } from "../lib/prisma.js";
 import { clusterArticles } from "./clustering.js";
 import { fetchFeedCatalog } from "./feed-catalog.js";
-import { buildArticleFeatures, buildClusterKeywordsWithOpenRouter } from "./nlp.js";
+import { buildArticleFeatures, buildClusterKeywordFallback } from "./nlp.js";
 import { fetchFeedEntries } from "./rss-ingest.js";
+import { upsertSourceProfiles } from "./source-profiles.js";
 
 function startOfDay(date: string): Date {
   return new Date(`${date}T00:00:00.000Z`);
@@ -218,13 +219,25 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
               id: `${saved.id}-article`,
             },
             update: {
-              featureSet: toInputJson(featureSet),
+              featureSet: toInputJson({
+                ...featureSet,
+                aiEnrichmentStatus: "pending",
+                aiEnrichmentModel: null,
+                aiEnrichmentError: null,
+                aiEnrichedAt: null,
+              }),
             },
             create: {
               id: `${saved.id}-article`,
               scopeType: ScopeType.ARTICLE,
               articleId: saved.id,
-              featureSet: toInputJson(featureSet),
+              featureSet: toInputJson({
+                ...featureSet,
+                aiEnrichmentStatus: "pending",
+                aiEnrichmentModel: null,
+                aiEnrichmentError: null,
+                aiEnrichedAt: null,
+              }),
             },
           });
         }
@@ -317,14 +330,22 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
         cluster.articleIds.includes(article.id),
       );
 
-      const clusterKeywordResult = await buildClusterKeywordsWithOpenRouter(
-        cluster.title,
-        clusterArticlesForKeywords.map((article) => ({
-          title: article.title,
-          summary: article.summary,
-          body: article.fullText ?? article.contentSnippet,
-          language: article.language,
-        })),
+      const fallbackKeywords = buildClusterKeywordFallback(
+        clusterArticlesForKeywords.map((article) => {
+          const articleFeature = buildArticleFeatures(
+            article.title,
+            article.summary,
+            article.fullText ?? article.contentSnippet,
+            article.language,
+          );
+          return {
+            title: article.title,
+            summary: article.summary,
+            body: article.fullText ?? article.contentSnippet,
+            language: article.language,
+            keywords: articleFeature.keywordsEnglish,
+          };
+        }),
       );
 
       await prisma.nlpFeature.create({
@@ -333,11 +354,11 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
           clusterId: created.id,
           featureSet: toInputJson({
             order: index,
-            keywords: clusterKeywordResult.keywords,
-            keywordSource: clusterKeywordResult.source,
-            keywordStatus: clusterKeywordResult.status,
-            keywordModel: clusterKeywordResult.model,
-            keywordError: clusterKeywordResult.error,
+            keywords: fallbackKeywords,
+            keywordSource: "openrouter",
+            keywordStatus: "keywords_pending",
+            keywordModel: null,
+            keywordError: null,
           }),
         },
       });
@@ -347,7 +368,7 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
 
     const sourceStats = new Map<
       string,
-      { sourceName: string; count: number; sentiments: number[]; biasSignals: string[] }
+      { sourceName: string; count: number; sentimentSum: number; biasSignals: Set<string> }
     >();
 
     for (const article of articles) {
@@ -358,38 +379,17 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
       const current = sourceStats.get(article.domain) ?? {
         sourceName: article.sourceName,
         count: 0,
-        sentiments: [],
-        biasSignals: [],
+        sentimentSum: 0,
+        biasSignals: new Set<string>(),
       };
       current.count += 1;
-      current.sentiments.push(payload?.sentiment ?? 0);
-      current.biasSignals.push(...(payload?.biasSignals ?? []));
+      current.sentimentSum += payload?.sentiment ?? 0;
+      for (const signal of payload?.biasSignals ?? []) {
+        current.biasSignals.add(signal);
+      }
       sourceStats.set(article.domain, current);
     }
-
-    for (const [domain, stats] of sourceStats.entries()) {
-      const averageSentiment =
-        stats.sentiments.length === 0
-          ? 0
-          : Number((stats.sentiments.reduce((sum, value) => sum + value, 0) / stats.sentiments.length).toFixed(3));
-
-      await prisma.sourceProfile.upsert({
-        where: { domain },
-        update: {
-          sourceName: stats.sourceName,
-          articleCount: stats.count,
-          averageSentiment,
-          commonBiasSignals: [...new Set(stats.biasSignals)].slice(0, 8),
-        },
-        create: {
-          domain,
-          sourceName: stats.sourceName,
-          articleCount: stats.count,
-          averageSentiment,
-          commonBiasSignals: [...new Set(stats.biasSignals)].slice(0, 8),
-        },
-      });
-    }
+    await upsertSourceProfiles(sourceStats, { incremental: false, enrichMetadata: false });
 
     finalStatus =
       failures.length === 0

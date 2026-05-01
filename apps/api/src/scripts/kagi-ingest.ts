@@ -3,13 +3,15 @@ import { resolve } from "node:path";
 import { ExtractionStatus, Prisma, ScopeType } from "@prisma/client";
 import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
+import { getCurrentDateString, startOfUtcDay } from "../lib/runtime-date.js";
 import { closeArticleExtractionBrowser, extractArticleTextFromUrl } from "../services/article-text.js";
 import {
   KagiCategoryFetchProgress,
   closeKagiBrowser,
   listClustersForIngestion,
 } from "../services/kagi-news.js";
-import { buildArticleFeatures, buildClusterKeywordsWithOpenRouter } from "../services/nlp.js";
+import { buildArticleFeatures, buildClusterKeywordFallback } from "../services/nlp.js";
+import { upsertSourceProfiles } from "../services/source-profiles.js";
 import {
   buildSoftDedupePlan,
   DedupeDocumentInput,
@@ -39,6 +41,7 @@ interface ClusterSourceInput {
 
 interface IngestedClusterPayload {
   generatedAt: string;
+  snapshotDate?: string;
   selection: {
     globalLimit: number;
     perCategoryLimit: number;
@@ -171,10 +174,6 @@ function renderCategoryProgress(progress: KagiCategoryFetchProgress, startedAt: 
   if (progress.current >= progress.total) {
     finishProgressLine();
   }
-}
-
-function startOfDay(date: string): Date {
-  return new Date(`${date}T00:00:00.000Z`);
 }
 
 function toIsoDate(value: Date): string {
@@ -424,7 +423,9 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
   dedupeMatchedArticleCount: number;
 }> {
   const generatedAt = parseDate(payload.generatedAt, new Date());
-  const snapshotDate = startOfDay(toIsoDate(generatedAt));
+  const snapshotDate = payload.snapshotDate
+    ? startOfUtcDay(payload.snapshotDate)
+    : startOfUtcDay(toIsoDate(generatedAt));
   const category = payload.chosenCluster.categoryName ?? null;
 
   const cluster = await prisma.storyCluster.upsert({
@@ -541,13 +542,25 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
         id: `${article.id}-article`,
       },
       update: {
-        featureSet: toInputJson(featureSet),
+        featureSet: toInputJson({
+          ...featureSet,
+          aiEnrichmentStatus: "pending",
+          aiEnrichmentModel: null,
+          aiEnrichmentError: null,
+          aiEnrichedAt: null,
+        }),
       },
       create: {
         id: `${article.id}-article`,
         scopeType: ScopeType.ARTICLE,
         articleId: article.id,
-        featureSet: toInputJson(featureSet),
+        featureSet: toInputJson({
+          ...featureSet,
+          aiEnrichmentStatus: "pending",
+          aiEnrichmentModel: null,
+          aiEnrichmentError: null,
+          aiEnrichedAt: null,
+        }),
       },
     });
 
@@ -605,19 +618,13 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     `[kagi:ingest][dedupe] strategy=${dedupePlan.strategy} groups=${dedupePlan.groupCount} matchedArticles=${dedupePlan.matchedArticleCount}`,
   );
 
-  const clusterKeywordResult = await buildClusterKeywordsWithOpenRouter(
-    payload.chosenCluster.title,
+  const clusterKeywordFallback = buildClusterKeywordFallback(
     payload.sources.map((source) => ({
       title: source.title,
       summary: source.fullText ?? null,
       body: source.fullText ?? null,
       language: null,
     })),
-    {
-      onAttemptLog: (message) => {
-        printEvent(`[kagi:ingest][keywords] ${payload.chosenCluster.storyId} ${message}`);
-      },
-    },
   );
 
   const existingClusterFeature = await prisma.nlpFeature.findFirst({
@@ -633,11 +640,11 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
       where: { id: existingClusterFeature.id },
       data: {
         featureSet: toInputJson({
-          keywords: clusterKeywordResult.keywords,
-          keywordSource: clusterKeywordResult.source,
-          keywordStatus: clusterKeywordResult.status,
-          keywordModel: clusterKeywordResult.model,
-          keywordError: clusterKeywordResult.error,
+          keywords: clusterKeywordFallback,
+          keywordSource: "openrouter",
+          keywordStatus: "keywords_pending",
+          keywordModel: null,
+          keywordError: null,
           dedupeStrategy: dedupePlan.strategy,
           dedupeGroupCount: dedupePlan.groupCount,
           dedupeMatchedArticleCount: dedupePlan.matchedArticleCount,
@@ -651,11 +658,11 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
         scopeType: ScopeType.CLUSTER,
         clusterId: cluster.id,
         featureSet: toInputJson({
-          keywords: clusterKeywordResult.keywords,
-          keywordSource: clusterKeywordResult.source,
-          keywordStatus: clusterKeywordResult.status,
-          keywordModel: clusterKeywordResult.model,
-          keywordError: clusterKeywordResult.error,
+          keywords: clusterKeywordFallback,
+          keywordSource: "openrouter",
+          keywordStatus: "keywords_pending",
+          keywordModel: null,
+          keywordError: null,
           dedupeStrategy: dedupePlan.strategy,
           dedupeGroupCount: dedupePlan.groupCount,
           dedupeMatchedArticleCount: dedupePlan.matchedArticleCount,
@@ -665,41 +672,14 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     });
   }
 
-  for (const [domain, stats] of sourceStats.entries()) {
-    const existing = await prisma.sourceProfile.findUnique({
-      where: { domain },
-    });
-    const previousCount = existing?.articleCount ?? 0;
-    const previousSentimentTotal = (existing?.averageSentiment ?? 0) * previousCount;
-    const nextCount = previousCount + stats.count;
-    const nextAverageSentiment =
-      nextCount > 0 ? Number(((previousSentimentTotal + stats.sentimentSum) / nextCount).toFixed(3)) : 0;
-    const nextBiasSignals = [...new Set([...(existing?.commonBiasSignals ?? []), ...stats.biasSignals])].slice(0, 8);
-
-    await prisma.sourceProfile.upsert({
-      where: { domain },
-      update: {
-        sourceName: existing?.sourceName ?? stats.sourceName,
-        articleCount: nextCount,
-        averageSentiment: nextAverageSentiment,
-        commonBiasSignals: nextBiasSignals,
-      },
-      create: {
-        domain,
-        sourceName: stats.sourceName,
-        articleCount: stats.count,
-        averageSentiment: Number((stats.sentimentSum / Math.max(stats.count, 1)).toFixed(3)),
-        commonBiasSignals: [...stats.biasSignals].slice(0, 8),
-      },
-    });
-  }
+  await upsertSourceProfiles(sourceStats, { incremental: true, enrichMetadata: false });
 
   return {
     importedArticles,
-    keywordSource: clusterKeywordResult.source,
-    keywordStatus: clusterKeywordResult.status,
-    keywordModel: clusterKeywordResult.model,
-    keywordError: clusterKeywordResult.error,
+    keywordSource: "openrouter",
+    keywordStatus: "keywords_pending",
+    keywordModel: null,
+    keywordError: null,
     dedupeStrategy: dedupePlan.strategy,
     dedupeGroupCount: dedupePlan.groupCount,
     dedupeMatchedArticleCount: dedupePlan.matchedArticleCount,
@@ -721,6 +701,7 @@ async function main() {
     "Science",
     "Gaming",
   ]);
+  const snapshotDate = process.argv[5] ?? getCurrentDateString();
 
   console.log("Selecting clusters from Kagi...");
   console.log(
@@ -753,7 +734,7 @@ async function main() {
     );
   }
 
-  const baseDir = resolve(process.cwd(), "notebooks", "exports", "kagi-top", new Date().toISOString().slice(0, 10));
+  const baseDir = resolve(process.cwd(), "notebooks", "exports", "kagi-top", snapshotDate);
   await mkdir(baseDir, { recursive: true });
 
   const results: Array<{
@@ -804,6 +785,7 @@ async function main() {
 
     const payload: IngestedClusterPayload = {
       generatedAt: new Date().toISOString(),
+      snapshotDate,
       selection: {
         globalLimit,
         perCategoryLimit,

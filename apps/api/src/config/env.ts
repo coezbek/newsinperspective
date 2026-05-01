@@ -19,6 +19,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4400),
   HOST: z.string().default("0.0.0.0"),
   WEB_ORIGIN: z.string().default("http://localhost:5317"),
+  APP_DATE_TIMEZONE: z.string().default("UTC"),
   KAGI_KITE_URL: z
     .string()
     .url()
@@ -37,6 +38,7 @@ const envSchema = z.object({
   INGEST_FEED_LIMIT: z.coerce.number().optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().optional(),
+  OPENROUTER_MODEL_OFFSET: z.coerce.number().int().default(0),
 });
 
 export const env = envSchema.parse(process.env);

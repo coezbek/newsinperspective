@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { getCurrentDateString } from "../lib/runtime-date.js";
 import { closeArticleExtractionBrowser, extractArticleTextFromUrl } from "../services/article-text.js";
 import { closeKagiBrowser, listTopClustersBySourceCount } from "../services/kagi-news.js";
 
@@ -18,6 +19,7 @@ function slugify(value: string): string {
 
 async function main() {
   const topLimit = parseLimitArg(process.argv[2]);
+  const snapshotDate = process.argv[3] ?? getCurrentDateString();
   const clusters = await listTopClustersBySourceCount(topLimit);
 
   if (clusters.length === 0) {
@@ -30,7 +32,7 @@ async function main() {
     "notebooks",
     "exports",
     "kagi-random",
-    new Date().toISOString().slice(0, 10),
+    snapshotDate,
     `${chosen.story.cluster_number}-${slugify(chosen.story.title)}`,
   );
   await mkdir(exportDir, { recursive: true });
@@ -66,6 +68,7 @@ async function main() {
 
   const payload = {
     generatedAt: new Date().toISOString(),
+    snapshotDate,
     topLimit,
     chosenCluster: {
       batchId: chosen.batchId,

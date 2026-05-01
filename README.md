@@ -9,20 +9,33 @@ Monorepo for a news-comparison project that ingests RSS feeds from Kagi's public
 - `packages/shared`: shared DTOs and schemas
 
 ## Local setup
-1. Select the repo Node version: `nvm use`
+Prerequisites (Linux/macOS):
+- `git`
+- `nvm`
+- Docker + Docker Compose
+- Python 3.12+ (for notebooks)
+- `uv` (for notebook workflow)
+
+1. Select and install the repo Node version: `nvm install && nvm use`
 2. Enable Corepack and install the pinned package manager: `corepack enable && corepack install`
-3. Install dependencies: `pnpm install`
-4. Start Postgres: `pnpm db:start`
-5. Generate Prisma client: `pnpm db:generate`
-6. Run migrations: `pnpm db:migrate`
-7. Start the backend: `pnpm api:start`
-8. Start the frontend: `pnpm web:start`
+3. Create env file: `cp .env.example .env`
+4. Install dependencies: `pnpm install`
+5. Start Postgres: `pnpm db:start`
+6. Generate Prisma client: `pnpm db:generate`
+7. Run migrations: `pnpm db:migrate`
+8. Start the backend in dev mode (terminal 1): `pnpm --filter @news/api dev`
+9. Start the frontend (terminal 2): `pnpm web:start`
 
 `package.json` pins `pnpm@10.32.1`, so once Corepack is enabled it will provision the correct `pnpm` version for this repo. If `nvm` is not already installed on your machine, install it first and then run `nvm use`.
 
 API defaults to `http://localhost:4400`, the frontend defaults to `http://localhost:5317`, and Postgres is exposed on `localhost:55432`.
+Logical run dates default to `UTC` via `APP_DATE_TIMEZONE`, while stored timestamps remain UTC instants in Postgres.
+
+If `pnpm db:start` fails with a Docker container-name conflict, you already have an existing
+`news-in-perspective-postgres` container from another checkout. Reuse that container or stop/remove it before retrying.
 
 For the first few runs, the default `.env` sets `INGEST_FEED_LIMIT=50` so ingestion completes quickly while you validate the pipeline. Remove or increase that limit once you are ready for broader collection.
+If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a broader comma-separated `OPENROUTER_MODEL` list.
 
 ## Ingestion
 Run a manual ingestion for a date:
@@ -89,7 +102,7 @@ For team NLP analysis in Jupyter, use the shared notebook workspace under `noteb
 1. Create the Python environment with `uv venv`
 2. Activate it with `source .venv/bin/activate`
 3. Install notebook tooling with `uv sync && uv pip install -r notebooks/requirements.txt`
-3. Export a date slice from the running API:
+4. Export a date slice from the running API:
 
 ```bash
 pnpm export:notebook -- \
@@ -98,8 +111,8 @@ pnpm export:notebook -- \
   --output-dir notebooks/exports/2026-03-23
 ```
 
-4. Convert the Jupytext template if needed: `source .venv/bin/activate && jupytext --to ipynb notebooks/templates/nlp_analysis.py`
-5. Open the notebook and point `EXPORT_DIR` at the exported slice.
+5. Convert the Jupytext template if needed: `source .venv/bin/activate && jupytext --to ipynb notebooks/templates/nlp_analysis.py`
+6. Open the notebook and point `EXPORT_DIR` at the exported slice.
 
 The exporter writes flat JSONL files that load directly into pandas dataframes and work well for shared notebook analysis.
 Activate `.venv` before running notebook or Drive-sync commands, since `pnpm drive:push` rebuilds the shared `.ipynb`.

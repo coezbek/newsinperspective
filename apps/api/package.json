@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "backfill:article-redirects": "tsx src/scripts/backfill-article-redirects.ts",
     "compare:keywords": "tsx src/scripts/compare-keywords.ts",
     "retry:openrouter-keywords": "tsx src/scripts/retry-openrouter-keywords.ts",
     "dev": "tsx watch src/index.ts",
     "enrich:status": "tsx src/scripts/enrich-status.ts",
+    "enrich:openrouter": "tsx src/scripts/enrich-openrouter.ts",
     "enrich:text": "tsx src/scripts/enrich-text.ts",
     "export:news-jsonl": "tsx src/scripts/export-news-jsonl.ts",
     "ingest": "tsx src/scripts/ingest.ts",

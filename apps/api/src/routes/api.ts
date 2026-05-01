@@ -3,11 +3,13 @@ import { z } from "zod";
 import { getCachedFavicon } from "../services/favicon-cache.js";
 import {
   getSourceProfile,
+  getTagProfile,
   getStoryComparison,
   getStoryDetail,
   listStoriesByDate,
   listStoryDates,
   listStoryFacets,
+  listStoryFacetsFiltered,
 } from "../services/story-query.js";
 
 export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
@@ -20,6 +22,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       category: z.string().optional(),
       region: z.string().optional(),
+      keyword: z.string().optional(),
       offset: z.coerce.number().int().min(0).optional(),
       limit: z.coerce.number().int().min(1).max(50).optional(),
     });
@@ -29,9 +32,14 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
         ? {
             category: query.category,
             region: query.region,
+            keyword: query.keyword,
           }
         : undefined;
-    return listStoriesByDate(query.date, filters, {
+    const finalFilters =
+      query.keyword && !filters
+        ? { keyword: query.keyword }
+        : filters;
+    return listStoriesByDate(query.date, finalFilters, {
       offset: query.offset,
       limit: query.limit,
     });
@@ -40,8 +48,12 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/facets", async (request) => {
     const querySchema = z.object({
       date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      keyword: z.string().optional(),
     });
     const query = querySchema.parse(request.query);
+    if (query.keyword) {
+      return listStoryFacetsFiltered(query.date, { keyword: query.keyword });
+    }
     return listStoryFacets(query.date);
   });
 
@@ -73,6 +85,16 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       return { message: "Source not found" };
     }
     return source;
+  });
+
+  app.get("/api/tags/:keyword", async (request, reply) => {
+    const params = z.object({ keyword: z.string() }).parse(request.params);
+    const tag = await getTagProfile(params.keyword);
+    if (!tag) {
+      reply.code(404);
+      return { message: "Tag not found" };
+    }
+    return tag;
   });
 
   app.get("/api/favicons/:domain", async (request, reply) => {

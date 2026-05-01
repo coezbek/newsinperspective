@@ -6,7 +6,9 @@ import { stat } from "node:fs/promises";
 import { ExtractionStatus, Prisma, ScopeType } from "@prisma/client";
 import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
-import { buildArticleFeatures, buildClusterKeywordsWithOpenRouter } from "../services/nlp.js";
+import { startOfUtcDay } from "../lib/runtime-date.js";
+import { buildArticleFeatures, buildClusterKeywordFallback } from "../services/nlp.js";
+import { upsertSourceProfiles } from "../services/source-profiles.js";
 import {
   buildSoftDedupePlan,
   DedupeDocumentInput,
@@ -29,6 +31,7 @@ interface ExportedClusterSource {
 
 interface ExportedClusterFile {
   generatedAt?: string | undefined;
+  snapshotDate?: string | undefined;
   chosenCluster: {
     storyId: string;
     clusterNumber?: number | undefined;
@@ -45,10 +48,6 @@ interface ClusterFileSelection {
   mode: "latest-batch" | "all" | "path";
   clusterFiles: string[];
   selectedRoot: string | null;
-}
-
-function startOfDay(date: string): Date {
-  return new Date(`${date}T00:00:00.000Z`);
 }
 
 function toIsoDate(value: Date): string {
@@ -200,7 +199,9 @@ async function main() {
       `[kagi:import-clusters] cluster ${clusterIndex + 1}/${clusterFiles.length} ${payload.chosenCluster.title}`,
     );
     const generatedAt = parseDate(payload.generatedAt, new Date());
-    const snapshotDate = startOfDay(toIsoDate(generatedAt));
+    const snapshotDate = payload.snapshotDate
+      ? startOfUtcDay(payload.snapshotDate)
+      : startOfUtcDay(toIsoDate(generatedAt));
     const category = payload.chosenCluster.categoryName ?? null;
 
     const cluster = await prisma.storyCluster.upsert({
@@ -225,6 +226,12 @@ async function main() {
     const articleIds: string[] = [];
     const dedupeInputs: DedupeDocumentInput[] = [];
     const duplicateDomainsByArticleId = new Map<string, string[]>();
+    const sourceStats = new Map<string, {
+      sourceName: string;
+      count: number;
+      sentimentSum: number;
+      biasSignals: Set<string>;
+    }>();
 
     for (const source of payload.sources) {
       const originalUrl = source.originalUrl ?? source.link;
@@ -291,19 +298,44 @@ async function main() {
         source.fullText ? null : buildAnalysisText(source),
         null,
       );
+      const sourceKey = source.domain.trim().toLowerCase();
+      const sourceEntry = sourceStats.get(sourceKey) ?? {
+        sourceName: source.domain,
+        count: 0,
+        sentimentSum: 0,
+        biasSignals: new Set<string>(),
+      };
+      sourceEntry.count += 1;
+      sourceEntry.sentimentSum += featureSet.sentiment;
+      for (const signal of featureSet.biasSignals) {
+        sourceEntry.biasSignals.add(signal);
+      }
+      sourceStats.set(sourceKey, sourceEntry);
 
       await prisma.nlpFeature.upsert({
         where: {
           id: `${article.id}-article`,
         },
         update: {
-          featureSet: toInputJson(featureSet),
+          featureSet: toInputJson({
+            ...featureSet,
+            aiEnrichmentStatus: "pending",
+            aiEnrichmentModel: null,
+            aiEnrichmentError: null,
+            aiEnrichedAt: null,
+          }),
         },
         create: {
           id: `${article.id}-article`,
           scopeType: ScopeType.ARTICLE,
           articleId: article.id,
-          featureSet: toInputJson(featureSet),
+          featureSet: toInputJson({
+            ...featureSet,
+            aiEnrichmentStatus: "pending",
+            aiEnrichmentModel: null,
+            aiEnrichmentError: null,
+            aiEnrichedAt: null,
+          }),
         },
       });
 
@@ -361,23 +393,15 @@ async function main() {
       `[kagi:import-clusters] dedupe strategy=${dedupePlan.strategy} groups=${dedupePlan.groupCount} matchedArticles=${dedupePlan.matchedArticleCount}`,
     );
 
-    const clusterKeywordResult = await buildClusterKeywordsWithOpenRouter(
-      payload.chosenCluster.title,
+    const clusterKeywordFallback = buildClusterKeywordFallback(
       payload.sources.map((source) => ({
         title: source.title,
         summary: source.fullText ?? null,
         body: source.fullText ?? null,
         language: null,
       })),
-      {
-        onAttemptLog: (message) => {
-          console.log(`[kagi:import-clusters][keywords] ${payload.chosenCluster.storyId} ${message}`);
-        },
-      },
     );
-    console.log(
-      `[kagi:import-clusters] keywords source=${clusterKeywordResult.source} status=${clusterKeywordResult.status} model=${clusterKeywordResult.model ?? "n/a"} error=${clusterKeywordResult.error ?? "none"}`,
-    );
+    console.log("[kagi:import-clusters] keywords deferred -> keywords_pending");
 
     const existingClusterFeature = await prisma.nlpFeature.findFirst({
       where: {
@@ -392,11 +416,11 @@ async function main() {
         where: { id: existingClusterFeature.id },
         data: {
           featureSet: toInputJson({
-            keywords: clusterKeywordResult.keywords,
-            keywordSource: clusterKeywordResult.source,
-            keywordStatus: clusterKeywordResult.status,
-            keywordModel: clusterKeywordResult.model,
-            keywordError: clusterKeywordResult.error,
+            keywords: clusterKeywordFallback,
+            keywordSource: "openrouter",
+            keywordStatus: "keywords_pending",
+            keywordModel: null,
+            keywordError: null,
             dedupeStrategy: dedupePlan.strategy,
             dedupeGroupCount: dedupePlan.groupCount,
             dedupeMatchedArticleCount: dedupePlan.matchedArticleCount,
@@ -410,11 +434,11 @@ async function main() {
           scopeType: ScopeType.CLUSTER,
           clusterId: cluster.id,
           featureSet: toInputJson({
-            keywords: clusterKeywordResult.keywords,
-            keywordSource: clusterKeywordResult.source,
-            keywordStatus: clusterKeywordResult.status,
-            keywordModel: clusterKeywordResult.model,
-            keywordError: clusterKeywordResult.error,
+            keywords: clusterKeywordFallback,
+            keywordSource: "openrouter",
+            keywordStatus: "keywords_pending",
+            keywordModel: null,
+            keywordError: null,
             dedupeStrategy: dedupePlan.strategy,
             dedupeGroupCount: dedupePlan.groupCount,
             dedupeMatchedArticleCount: dedupePlan.matchedArticleCount,
@@ -423,6 +447,8 @@ async function main() {
         },
       });
     }
+
+    await upsertSourceProfiles(sourceStats, { incremental: true, enrichMetadata: false });
 
     importedClusters += 1;
   }

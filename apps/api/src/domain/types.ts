@@ -21,9 +21,15 @@ export interface NormalizedArticleInput {
 
 export interface ArticleFeatureSet {
   keywords: string[];
+  keywordsEnglish: string[];
   entities: string[];
+  personEntities: string[];
+  organizationEntities: string[];
+  placeEntities: string[];
   sentiment: number;
   subjectivity: number;
   biasSignals: string[];
   language: string | null;
+  translatedTitle: string | null;
+  translatedSummary: string | null;
 }
