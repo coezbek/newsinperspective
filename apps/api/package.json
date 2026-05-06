@@ -38,7 +38,8 @@
     "perspective:relabel": "tsx src/scripts/perspective-relabel.ts",
     "perspective:clean-narratives": "tsx src/scripts/cluster-perspective-clean-narratives.ts",
     "perspective:resolve-countries": "tsx src/scripts/perspective-resolve-countries.ts",
-    "perspective:narrative": "tsx src/scripts/perspective-narrative.ts"
+    "perspective:narrative": "tsx src/scripts/perspective-narrative.ts",
+    "perspective:verify-wikidata": "tsx src/scripts/perspective-verify-wikidata.ts"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",

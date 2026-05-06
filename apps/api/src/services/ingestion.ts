@@ -394,38 +394,11 @@ export async function runIngestion(date: string): Promise<{ runId: string; statu
     }
     await upsertSourceProfiles(sourceStats, { incremental: false, enrichMetadata: false });
 
-    // Perspective intelligence: compute divergence + framing for each cluster
-    // produced this run. Best-effort — sidecar outage or per-cluster failure
-    // logs and continues, never breaks the ingestion run. No LLM narrative
-    // and no LLM country resolver here (both are explicit batch scripts).
-    if (createdClusterIds.length > 0) {
-      try {
-        const { computeClusterPerspective } = await import("./cluster-perspective.js");
-        let ok = 0;
-        let fail = 0;
-        for (const clusterId of createdClusterIds) {
-          try {
-            await computeClusterPerspective(clusterId, { generateNarrative: false });
-            ok += 1;
-          } catch (err) {
-            fail += 1;
-            logger.warn("perspective compute failed", {
-              clusterId,
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-        logger.info("perspective compute completed", {
-          ok,
-          fail,
-          total: createdClusterIds.length,
-        });
-      } catch (err) {
-        logger.warn("perspective stage skipped", {
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
+    // Perspective is intentionally NOT computed here. Articles still have
+    // language=null and translatedFullText=null at this point, so the sidecar
+    // would receive original-language text and TF-IDF would surface
+    // foreign-language tokens. Stage 4 (cluster-perspective-backfill) handles
+    // perspective after stage 2 has populated translations.
 
     finalStatus =
       failures.length === 0

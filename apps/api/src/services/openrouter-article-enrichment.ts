@@ -21,6 +21,15 @@ export interface OpenRouterArticleEnrichmentResult {
   organizations: string[];
   places: string[];
   language: string | null;
+  /**
+   * `false` when the input text isn't a real article — corporate footer,
+   * registration/copyright boilerplate, paywall page, login wall, photo-only
+   * captioned page, or under ~30 words of substantive prose. Downstream
+   * consumers should treat non-newsworthy articles like empty articles
+   * (skip clustering, skip perspective, skip entity linking).
+   */
+  isNewsworthy: boolean;
+  notNewsworthyReason: string | null;
   model: string;
   error: string | null;
 }
@@ -77,6 +86,8 @@ function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArticleEnr
 
   try {
     const parsed = JSON.parse(jsonMatch[0]) as {
+      isNewsworthy?: unknown;
+      notNewsworthyReason?: unknown;
       keywords?: unknown;
       translatedTitle?: unknown;
       translatedSummary?: unknown;
@@ -86,6 +97,13 @@ function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArticleEnr
       places?: unknown;
       language?: unknown;
     };
+
+    // Default to newsworthy when the field is missing — older cached
+    // responses (from before this field was added) shouldn't all flip to
+    // non-newsworthy. Only treat as not-newsworthy when the model
+    // explicitly returns `false`.
+    const isNewsworthy =
+      typeof parsed.isNewsworthy === "boolean" ? parsed.isNewsworthy : true;
 
     return {
       keywords: uniqueStrings(parsed.keywords),
@@ -98,6 +116,11 @@ function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArticleEnr
       organizations: uniqueStrings(parsed.organizations),
       places: uniqueStrings(parsed.places),
       language: typeof parsed.language === "string" ? parsed.language.trim() || null : null,
+      isNewsworthy,
+      notNewsworthyReason:
+        typeof parsed.notNewsworthyReason === "string"
+          ? parsed.notNewsworthyReason.trim() || null
+          : null,
     };
   } catch {
     return null;
@@ -122,24 +145,41 @@ export async function extractArticleEnrichmentWithOpenRouter(
       organizations: [],
       places: [],
       language: input.language,
+      isNewsworthy: true,
+      notNewsworthyReason: null,
       model: primaryModel,
       error: "OPENROUTER_API_KEY missing",
     };
   }
 
-  // Treat "unknown language" the same as "non-English": we'd rather pay for a
-  // translation that might come back null than miss one because the heuristic
-  // language detector hadn't fired yet.
-  const isDefinitelyEnglish =
-    typeof input.language === "string" && input.language.toLowerCase().slice(0, 2) === "en";
-  const requestFullTextTranslation = !isDefinitelyEnglish && Boolean(input.body && input.body.trim());
+  // We now ALWAYS request a populated translatedFullText whenever the body
+  // has content — the model produces either the English translation
+  // (non-English input) or the chrome-stripped English (English input).
+  // The "non-newsworthy" early exit lets the model bail without translation
+  // when the body is boilerplate.
+  const bodyHasContent = Boolean(input.body && input.body.trim());
   const cappedBody = input.body ? input.body.slice(0, TRANSLATED_FULL_TEXT_MAX_CHARS) : "";
 
   const prompt = [
     "Analyze this news article and return strict JSON only.",
     "JSON shape:",
-    "{\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"translatedFullText\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\"}",
-    "Output rules:",
+    "{\"isNewsworthy\":true,\"notNewsworthyReason\":\"...\",\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"translatedFullText\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\"}",
+    "isNewsworthy rules:",
+    "- false if the Body is corporate footer / registration / copyright / address / phone / business-license boilerplate (e.g. starts with 'CEO:', contains 'business registration number', 'communication sales registration', 'All Rights Reserved' as the bulk of the text)",
+    "- false if Body is a paywall / login / subscription wall (e.g. 'Become an Insider', 'Subscribe to read', 'Sign in to continue')",
+    "- false if Body is purely image-caption / photo-credit text (e.g. mostly '<photographer>/<agency>', 'hide caption', 'toggle caption')",
+    "- false if Body is < ~30 words of substantive prose after stripping chrome",
+    "- otherwise true",
+    "- when false, set notNewsworthyReason to a short phrase like 'corporate boilerplate', 'paywall', 'photo-credit page', 'too short'",
+    "Body cleanup rules (apply to translatedFullText AND to the body you analyse for keywords/entities):",
+    "- ALWAYS populate translatedFullText, even when the Body is already English — output the cleaned English body",
+    "- strip image captions and photo credits: lines like 'A bulk cargo ship sits at anchor in the Strait of Hormuz off Bandar Abbas, Iran, Saturday, May 2, 2026.', 'Amirhosein Khorgooi/AP/ISNA', 'Getty Images', 'Reuters/<name>', 'AP Photo/<name>'",
+    "- strip UI labels: 'hide caption', 'toggle caption', 'Read more', 'Read next', 'Share', 'Sign up', 'Subscribe'",
+    "- strip newsletter / podcast / 'follow us' prompts and social-share lines",
+    "- strip navigation / breadcrumb / category lines and 'related articles' teasers",
+    "- preserve paragraph breaks of actual article content",
+    "- if cleanup leaves < 30 words, set isNewsworthy=false and translatedFullText=null",
+    "Keyword/entity rules:",
     `- return at most ${maxKeywords} keywords`,
     "- keywords must be concise English topical labels of 1 to 4 words",
     "- use specific topical concepts, not generic labels",
@@ -147,9 +187,6 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- preserve proper names exactly when possible",
     "- translatedTitle and translatedSummary must be close English translations, not rewrites",
     "- translatedSummary should be 1 sentence, faithful, and plain factual prose",
-    requestFullTextTranslation
-      ? "- translatedFullText must be a faithful English translation of the Body, preserving paragraph breaks; do not summarise; if the Body is already English, return null"
-      : "- translatedFullText must be null (the article is already English or has no body)",
     "- persons, organizations, and places must be distinct arrays",
     "- language must be a lowercase ISO-639-1 code like en, fr, de, es, it, tr, el, zh, ja, ko, ru, ar",
     "- if uncertain, use null for strings and [] for arrays",
@@ -158,9 +195,9 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- avoid terms like: \"released\", \"new\", \"cyber attack\" unless the text is explicitly about an attack campaign and no more specific label exists",
     "Examples:",
     "Example 1 input title: The 'S' in Zoom, Stands for Security",
-    "Example 1 output: {\"keywords\":[\"Zoom security\",\"privilege escalation\",\"macOS vulnerability\",\"webcam access\",\"microphone access\"],\"translatedTitle\":\"The 'S' in Zoom, Stands for Security\",\"translatedSummary\":\"The article describes two local security flaws in Zoom's macOS client, including privilege escalation and covert webcam and microphone access.\",\"persons\":[],\"organizations\":[\"Zoom\"],\"places\":[],\"language\":\"en\"}",
-    "Example 2 input title: From Italy With Love?",
-    "Example 2 output: {\"keywords\":[\"HackingTeam\",\"reverse engineering\",\"Russian implant\",\"cyber espionage\",\"surveillance malware\"],\"translatedTitle\":\"From Italy With Love?\",\"translatedSummary\":\"The article says reverse engineering of a supposed Russian implant revealed code associated with HackingTeam.\",\"persons\":[],\"organizations\":[\"HackingTeam\"],\"places\":[\"Italy\",\"Russia\"],\"language\":\"en\"}",
+    "Example 1 output: {\"isNewsworthy\":true,\"notNewsworthyReason\":null,\"keywords\":[\"Zoom security\",\"privilege escalation\",\"macOS vulnerability\",\"webcam access\",\"microphone access\"],\"translatedTitle\":\"The 'S' in Zoom, Stands for Security\",\"translatedSummary\":\"The article describes two local security flaws in Zoom's macOS client, including privilege escalation and covert webcam and microphone access.\",\"translatedFullText\":\"<cleaned body>\",\"persons\":[],\"organizations\":[\"Zoom\"],\"places\":[],\"language\":\"en\"}",
+    "Example 2 (non-newsworthy): Body is 'JTBC Co., Ltd. CEO: Jeon Jin-bae, address: 38 Sangam-san-ro... business registration number: 104-86-33995... All Rights Reserved.'",
+    "Example 2 output: {\"isNewsworthy\":false,\"notNewsworthyReason\":\"corporate boilerplate\",\"keywords\":[],\"translatedTitle\":null,\"translatedSummary\":null,\"translatedFullText\":null,\"persons\":[],\"organizations\":[\"JTBC\"],\"places\":[],\"language\":\"en\"}",
     "",
     `Title: ${input.title}`,
     `Summary: ${input.summary ?? ""}`,
@@ -176,7 +213,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
         models,
         primaryModel,
         log,
-        requestFullTextTranslation,
+        bodyHasContent,
       ),
     {
       shouldCache: (result) => result.error === null,
@@ -187,12 +224,16 @@ export async function extractArticleEnrichmentWithOpenRouter(
 
 function isResponseComplete(
   parsed: Omit<OpenRouterArticleEnrichmentResult, "model" | "error">,
-  requestFullTextTranslation: boolean,
+  bodyHasContent: boolean,
 ): boolean {
-  // If we asked for a translation but the model returned nothing, the
-  // response is incomplete — some smaller free models silently skip the
-  // translatedFullText field. Reject so the loop tries another model.
-  if (requestFullTextTranslation && !parsed.translatedFullText) return false;
+  // Non-newsworthy responses are inherently terminal — accept them with
+  // null fields. Some smaller free models otherwise refuse to populate
+  // translatedFullText for boilerplate, which would loop forever.
+  if (!parsed.isNewsworthy) return true;
+  // For real articles we now require translatedFullText whenever the body
+  // had substantive content (English or not). This guarantees the
+  // chrome-stripped English version is always available downstream.
+  if (bodyHasContent && !parsed.translatedFullText) return false;
   return true;
 }
 
@@ -202,7 +243,7 @@ async function runArticleEnrichmentRequest(
   models: string[],
   primaryModel: string,
   log: ((message: string) => void) | undefined,
-  requestFullTextTranslation: boolean,
+  bodyHasContent: boolean,
 ): Promise<OpenRouterArticleEnrichmentResult> {
   let lastError = "OpenRouter request failed";
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
@@ -260,7 +301,7 @@ async function runArticleEnrichmentRequest(
       const content = payload.choices?.[0]?.message?.content ?? "";
       const parsed = parseEnrichmentFromResponse(content);
 
-      if (parsed && isResponseComplete(parsed, requestFullTextTranslation)) {
+      if (parsed && isResponseComplete(parsed, bodyHasContent)) {
         return {
           ...parsed,
           model,
@@ -286,7 +327,7 @@ async function runArticleEnrichmentRequest(
   const fallback = await callOpenAIFallback({ prompt, onAttemptLog: log });
   if (fallback) {
     const parsed = parseEnrichmentFromResponse(fallback.content);
-    if (parsed && isResponseComplete(parsed, requestFullTextTranslation)) {
+    if (parsed && isResponseComplete(parsed, bodyHasContent)) {
       return {
         ...parsed,
         model: fallback.model,
@@ -305,6 +346,8 @@ async function runArticleEnrichmentRequest(
     organizations: [],
     places: [],
     language: input.language,
+    isNewsworthy: true,
+    notNewsworthyReason: null,
     model: primaryModel,
     error: lastError,
   };

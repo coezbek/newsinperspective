@@ -8,6 +8,7 @@ import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { startOfUtcDay } from "../lib/runtime-date.js";
 import { buildArticleFeatures, buildClusterKeywordFallback } from "../services/nlp.js";
+import { buildTextFingerprint } from "../domain/fingerprint.js";
 import { upsertSourceProfiles } from "../services/source-profiles.js";
 import {
   buildSoftDedupePlan,
@@ -260,7 +261,9 @@ async function main() {
         create: {
           canonicalUrl,
           originalUrl,
-          textFingerprint: null,
+          textFingerprint: source.fullText
+            ? buildTextFingerprint(source.title, source.fullText)
+            : null,
           title: source.title,
           summary: null,
           contentSnippet: null,

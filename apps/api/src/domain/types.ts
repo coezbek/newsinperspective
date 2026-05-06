@@ -33,4 +33,13 @@ export interface ArticleFeatureSet {
   translatedTitle: string | null;
   translatedSummary: string | null;
   translatedFullText: string | null;
+  /**
+   * `false` when the LLM determines the text is not a real article
+   * (corporate boilerplate, paywall page, photo-credit page, etc).
+   * Downstream stages should treat non-newsworthy articles like
+   * empty-text articles. `null` means we haven't asked the LLM yet
+   * (heuristic-only enrichment path).
+   */
+  isNewsworthy: boolean | null;
+  notNewsworthyReason: string | null;
 }

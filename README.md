@@ -23,7 +23,7 @@ Repository: https://github.com/coezbek/newsinperspective
 ### Data & key technologies
 - News data from [Kagi News (Kite)](https://kite.kagi.com/)
 - [Svelte](https://svelte.dev/) + [Vite](https://vitejs.dev/) frontend
-- [Node.js](https://nodejs.org/) + [Express](https://expressjs.com/) + [TypeScript](https://www.typescriptlang.org/) API
+- [Node.js](https://nodejs.org/) + [Fastify](https://fastify.dev/) + [TypeScript](https://www.typescriptlang.org/) API
 - [Prisma](https://www.prisma.io/) ORM with [PostgreSQL](https://www.postgresql.org/)
 - [OpenRouter](https://openrouter.ai/) for LLM-based keyword and entity enrichment
 - Named entity recognition and entity linking against [Wikidata](https://www.wikidata.org/)
@@ -66,19 +66,11 @@ For the first few runs, the default `.env` sets `INGEST_FEED_LIMIT=50` so ingest
 If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a broader comma-separated `OPENROUTER_MODEL` list.
 
 ## Ingestion
-Run a manual ingestion for a date:
 
-```bash
-curl -X POST http://localhost:4400/internal/ingest/run \
-  -H 'content-type: application/json' \
-  -d '{"date":"2026-03-23"}'
-```
-
-Or run ingestion directly from the CLI:
-
-```bash
-pnpm ingest 2026-03-23
-```
+The current ingestion path is the cluster-based Kagi News pipeline
+(`pnpm kagi:ingest` → `src/scripts/kagi-ingest.ts`). For the original
+RSS-catalog ingestion (`pnpm ingest <date>` / `POST /internal/ingest/run`),
+see [LEGACY.md](./LEGACY.md).
 
 For long-running Kagi ingests, prefer a persistent `tmux` session with a log file so progress survives terminal disconnects:
 
@@ -139,7 +131,7 @@ Runtime logs are written to `logs/`, including:
 
 ## Daily pipeline
 
-Each daily run is a chain of four jobs, executed strictly serially by the
+Each daily run is a chain of five jobs, executed strictly serially by the
 pipeline runner (`apps/api/src/services/pipeline-runner.ts`). The scheduler
 (`apps/api/src/workers/scheduler.ts`) enqueues them in order when
 `AUTO_INGEST=true`, and the same chain can be reproduced manually:
@@ -150,11 +142,21 @@ pipeline runner (`apps/api/src/services/pipeline-runner.ts`). The scheduler
 | 2 | `openrouter-backlog` | `src/scripts/enrich-openrouter.ts` | `Article.translatedFullText`, `Article.language`, summary, cluster keywords |
 | 3 | `entity-re-enrich` | `src/scripts/entity-re-enrich.ts` | `NamedEntity`, `EntityMention` (spaCy NER + Wikipedia link inline) |
 | 4 | `cluster-perspective-backfill` | `src/scripts/cluster-perspective-backfill.ts` | Cluster perspective metrics |
+| 5 | `perspective-calibrate` | `src/scripts/perspective-calibrate.ts` | Refreshed divergence-score quantiles (when calibration TTL expired) |
 
 Stage 3 reads `translatedFullText` for non-English articles (falling back to
 `fullText` if translation hasn't run), so stage 2 must complete before stage 3.
 Wikipedia linking is **not** a separate stage; it runs inline per emitted
 spaCy entity inside `enrichArticleWithEntities`.
+
+Running `pnpm kagi:ingest` on its own only completes **stage 1**. It runs an
+inline best-effort `computeClusterPerspective` per cluster, but leaves
+keywords as `keywords_pending` and emits no translations, entities,
+narratives, or recalibration. To get a full daily slice you need to run
+stages 2–5 too (either via `AUTO_INGEST=true` or the manual chain below).
+LLM narrative generation (`perspective-narrative`) and the LLM country
+resolver (`perspective-resolve-countries`) are **explicit, out-of-band**
+batch scripts and are intentionally not part of the chain.
 
 Manual chain in tmux for a 100-article test (10 clusters × ≤10 articles):
 
@@ -167,9 +169,11 @@ tmux new-session -d -s pipeline "bash -lc '
          ENRICHMENT_CONCURRENCY=2 \
          KAGI_INGEST_MAX_SOURCES_PER_CLUSTER=10 \
          KAGI_INGEST_SKIP_EXISTING=false
-  pnpm --filter @news/api exec tsx src/scripts/kagi-ingest.ts 10 0          2>&1 | tee logs/pipeline-1-ingest.log     && \
-  pnpm --filter @news/api exec tsx src/scripts/enrich-openrouter.ts 100 50 50 '"$DATE"' 2>&1 | tee logs/pipeline-2-openrouter.log && \
-  pnpm --filter @news/api exec tsx src/scripts/entity-re-enrich.ts --date='"$DATE"'        2>&1 | tee logs/pipeline-3-entities.log
+  pnpm --filter @news/api exec tsx src/scripts/kagi-ingest.ts 10 0                              2>&1 | tee logs/pipeline-1-ingest.log         && \
+  pnpm --filter @news/api exec tsx src/scripts/enrich-openrouter.ts 100 50 50 '"$DATE"'         2>&1 | tee logs/pipeline-2-openrouter.log     && \
+  pnpm --filter @news/api exec tsx src/scripts/entity-re-enrich.ts --date='"$DATE"'             2>&1 | tee logs/pipeline-3-entities.log       && \
+  pnpm --filter @news/api exec tsx src/scripts/cluster-perspective-backfill.ts                  2>&1 | tee logs/pipeline-4-perspective.log    && \
+  pnpm --filter @news/api exec tsx src/scripts/perspective-calibrate.ts                         2>&1 | tee logs/pipeline-5-calibrate.log
   exec bash'"
 ```
 

@@ -1,7 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import { Browser, chromium } from "playwright";
+import { DiskCache } from "./disk-cache.js";
 
 export interface KagiBatchCategoriesResponse {
   batchId: string;
@@ -43,15 +41,16 @@ interface KagiStoriesResponse {
 
 const KAGI_API_BASE = "https://news.kagi.com/api";
 let kagiBrowserPromise: Promise<Browser> | null = null;
-const CACHE_DIR = resolve(process.cwd(), ".cache", "kagi-api");
+
+const kagiApiCache = new DiskCache<unknown>({
+  namespace: "kagi-api",
+  ttlMs: null,
+  disableEnvVar: "KAGI_API_CACHE_DISABLE",
+  dirEnvVar: "KAGI_API_CACHE_DIR",
+});
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function cachePathFor(url: string): string {
-  const key = createHash("sha1").update(url).digest("hex");
-  return resolve(CACHE_DIR, `${key}.json`);
 }
 
 async function getKagiBrowser(): Promise<Browser> {
@@ -81,14 +80,12 @@ export async function closeKagiBrowser(): Promise<void> {
 
 async function fetchJson<T>(path: string, options?: { forceRefresh?: boolean }): Promise<T> {
   const url = `${KAGI_API_BASE}${path}`;
-  const cachePath = cachePathFor(url);
   const forceRefresh = options?.forceRefresh ?? false;
+  const cacheKey = kagiApiCache.keyFor(url);
 
   if (!forceRefresh) {
-    try {
-      const cached = JSON.parse(await readFile(cachePath, "utf8")) as { fetchedAt: number; bodyText: string };
-      return JSON.parse(cached.bodyText) as T;
-    } catch {}
+    const cached = await (kagiApiCache as DiskCache<T>).get(cacheKey);
+    if (cached !== null) return cached;
   }
 
   const browser = await getKagiBrowser();
@@ -117,8 +114,7 @@ async function fetchJson<T>(path: string, options?: { forceRefresh?: boolean }):
         }
 
         const parsed = JSON.parse(bodyText) as T;
-        await mkdir(CACHE_DIR, { recursive: true });
-        await writeFile(cachePath, JSON.stringify({ fetchedAt: Date.now(), bodyText }), "utf8");
+        await (kagiApiCache as DiskCache<T>).set(cacheKey, parsed);
         return parsed;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));

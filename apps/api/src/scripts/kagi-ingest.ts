@@ -11,6 +11,7 @@ import {
   listClustersForIngestion,
 } from "../services/kagi-news.js";
 import { buildArticleFeatures, buildClusterKeywordFallback } from "../services/nlp.js";
+import { buildTextFingerprint } from "../domain/fingerprint.js";
 import { upsertSourceProfiles } from "../services/source-profiles.js";
 import {
   buildSoftDedupePlan,
@@ -457,12 +458,24 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     biasSignals: Set<string>;
   }>();
   let importedArticles = 0;
+  const importedArticleIds: string[] = [];
 
   for (const source of payload.sources) {
     const originalUrl = source.originalUrl ?? source.link;
     const canonicalUrl = source.finalUrl ?? originalUrl;
     const publishedAt = source.date ? new Date(source.date) : null;
     const extractionStatus = normalizeExtractionStatus(source.extractionStatus);
+
+    // Pre-fetch existing fullText so we can decide whether the AI-enrichment
+    // markers (translation/summary/keywords) on this article's NlpFeature are
+    // still valid. Resetting them to "pending" on every re-import forces
+    // stage 2 to re-translate even when the underlying text hasn't changed.
+    const existingArticle = await prisma.article.findUnique({
+      where: { canonicalUrl },
+      select: { fullText: true },
+    });
+    const previousFullText = existingArticle?.fullText ?? null;
+    const fullTextChanged = previousFullText !== (source.fullText ?? null);
 
     const article = await prisma.article.upsert({
       where: { canonicalUrl },
@@ -485,7 +498,11 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
       create: {
         canonicalUrl,
         originalUrl,
-        textFingerprint: null,
+        // Compute fingerprint over title + fullText when extraction succeeded.
+        // Falls back to null when there's nothing to hash (PENDING/FAILED).
+        textFingerprint: source.fullText
+          ? buildTextFingerprint(source.title, source.fullText)
+          : null,
         title: source.title,
         summary: null,
         contentSnippet: null,
@@ -537,6 +554,28 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     }
     sourceStats.set(sourceKey, sourceEntry);
 
+    // Preserve the prior aiEnrichmentStatus when the underlying text didn't
+    // change, so already-translated articles aren't re-translated by stage 2.
+    // When fullText changes (genuine re-extraction with different content),
+    // mark pending so stage 2 catches up.
+    let aiStatus: string = "pending";
+    let aiModel: string | null = null;
+    let aiError: string | null = null;
+    let aiEnrichedAt: string | null = null;
+    if (!fullTextChanged) {
+      const existingFeature = await prisma.nlpFeature.findUnique({
+        where: { id: `${article.id}-article` },
+        select: { featureSet: true },
+      });
+      const prev = (existingFeature?.featureSet as Record<string, unknown> | undefined) ?? {};
+      const prevStatus = prev.aiEnrichmentStatus as string | undefined;
+      if (prevStatus === "ready") {
+        aiStatus = "ready";
+        aiModel = (prev.aiEnrichmentModel as string | null | undefined) ?? null;
+        aiError = (prev.aiEnrichmentError as string | null | undefined) ?? null;
+        aiEnrichedAt = (prev.aiEnrichedAt as string | null | undefined) ?? null;
+      }
+    }
     await prisma.nlpFeature.upsert({
       where: {
         id: `${article.id}-article`,
@@ -544,10 +583,10 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
       update: {
         featureSet: toInputJson({
           ...featureSet,
-          aiEnrichmentStatus: "pending",
-          aiEnrichmentModel: null,
-          aiEnrichmentError: null,
-          aiEnrichedAt: null,
+          aiEnrichmentStatus: aiStatus,
+          aiEnrichmentModel: aiModel,
+          aiEnrichmentError: aiError,
+          aiEnrichedAt,
         }),
       },
       create: {
@@ -565,6 +604,7 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     });
 
     importedArticles += 1;
+    importedArticleIds.push(article.id);
   }
 
   await prisma.clusterArticle.deleteMany({
@@ -674,17 +714,18 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
 
   await upsertSourceProfiles(sourceStats, { incremental: true, enrichMetadata: false });
 
-  // Perspective intelligence — best-effort. No LLM narrative, no LLM country
-  // resolver. Failures are logged but don't break ingestion.
-  try {
-    const { computeClusterPerspective } = await import("../services/cluster-perspective.js");
-    await computeClusterPerspective(cluster.id, { generateNarrative: false });
-  } catch (err) {
-    console.warn(
-      `[kagi:ingest] perspective compute failed for cluster ${cluster.id}:`,
-      err instanceof Error ? err.message : err,
-    );
-  }
+  // Entity enrichment is intentionally NOT run here — same reason as
+  // perspective (above). At ingest time non-English articles have no
+  // `translatedFullText`, so spaCy en_core_web_sm receives original-language
+  // text and emits sentence fragments ("han atacado", "trong khi Mỹ áp đặt
+  // phong tỏa") that hammer Wikipedia with junk lookups. Stage 3
+  // (entity-re-enrich) handles NER after stage 2 has populated translations.
+
+  // Perspective is intentionally NOT computed here. At ingest time
+  // articles still have language=null and translatedFullText=null, so the
+  // sidecar would receive original-language text and TF-IDF would surface
+  // foreign-language tokens. Stage 4 (cluster-perspective-backfill) handles
+  // perspective after stage 2 has populated translations.
 
   return {
     importedArticles,

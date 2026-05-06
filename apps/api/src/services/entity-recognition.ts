@@ -43,6 +43,70 @@ const SPACY_LABEL_MAP: Record<string, EntityType> = {
   EVENT: EntityType.EVENT,
 };
 
+/**
+ * Stoplist of common spaCy NER false positives that consistently leak
+ * through from page chrome / boilerplate (e.g. social-network / UI labels).
+ */
+const ENTITY_STOPLIST = new Set([
+  "wifi", "meme", "investing more read", "read next", "sign up", "sign in",
+  "log in", "log out", "subscribe", "unsubscribe", "newsletter", "podcast",
+  "have an account", "more read", "twitter", "facebook", "instagram",
+]);
+
+/**
+ * Heuristic noise filter applied after spaCy. Drops mentions that are
+ * almost certainly junk: tokens with embedded digits/periods caused by
+ * extraction whitespace bugs, lone punctuation, ALL-CAPS noise of length 1,
+ * and members of the stoplist above. Keep this tight — over-filtering
+ * silently kills legitimate entities, so prefer false negatives only on
+ * clearly-broken inputs.
+ */
+function isNoiseEntity(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2) return true;
+  if (ENTITY_STOPLIST.has(trimmed.toLowerCase())) return true;
+  // Mid-token period like "2023.He" — extraction artifact, not a real entity.
+  if (/\w\.\w/.test(trimmed)) return true;
+  // Contains any digit — entity names shouldn't (years, prices, IDs leak in).
+  if (/\d/.test(trimmed)) return true;
+  // No alphabetic character at all.
+  if (!/[A-Za-zÀ-ɏ一-鿿]/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Canonicalize an entity surface form so the same entity from different
+ * articles dedupes to one `NamedEntity` row. Without this we ended up with
+ * pairs like {DUBAI, Dubai}, {Google's, Google}, {The Middle East's, …}
+ * each creating a separate row, exploding the dedup map and forcing
+ * redundant Wikipedia lookups.
+ *
+ * Normalization rules:
+ *   1. Curly apostrophes (U+2019, U+02BC) → straight apostrophe.
+ *   2. Strip trailing possessive `'s` / `'s`.
+ *   3. Strip trailing punctuation.
+ *   4. Title-case all-caps of length ≥ 5 (DUBAI → Dubai, REUTERS → Reuters)
+ *      while keeping short acronyms (BBC, NATO, USA, CCTV) intact.
+ */
+function canonicalizeEntityText(raw: string): string {
+  let s = raw.trim();
+  s = s.replace(/[’ʼ]/g, "'");
+  s = s.replace(/'s$/i, "");
+  s = s.replace(/[\s.,;:!?'"`]+$/g, "");
+  s = s.replace(/^[\s.,;:!?'"`]+/g, "");
+  if (s.length >= 5 && s === s.toUpperCase() && /[A-Z]/.test(s)) {
+    // Title-case each word so "DUBAI" → "Dubai" and "HONG KONG" → "Hong Kong".
+    s = s
+      .toLowerCase()
+      .split(/(\s+)/)
+      .map((part) =>
+        /\s+/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1),
+      )
+      .join("");
+  }
+  return s.trim();
+}
+
 function getServiceUrl(): string {
   const url = process.env.NER_SERVICE_URL;
   if (!url) {
@@ -76,31 +140,38 @@ class EntityRecognitionService {
 
     const sidecarEntities = await this.callSidecar(text);
 
-    const seen = new Map<string, EntityMention>();
+    // Return one mention per occurrence so downstream highlighting can mark
+    // every appearance. Dedup happens in the caller for entity creation only.
+    const mentions: EntityMention[] = [];
     for (const ent of sidecarEntities) {
       const mappedType = SPACY_LABEL_MAP[ent.label];
       if (!mappedType) continue;
       if (typeFilter && !typeFilter.includes(mappedType)) continue;
-      const entityText = ent.text.trim();
+      const rawText = ent.text.trim();
+      if (!rawText) continue;
+      // Canonicalize first (strips possessive `'s`, normalizes case for ALL-CAPS,
+      // straightens curly apostrophes) so the noise filter and downstream
+      // dedup operate on the same string variant we'll persist.
+      const entityText = canonicalizeEntityText(rawText);
       if (!entityText) continue;
+      if (isNoiseEntity(entityText)) continue;
       const confidence = DEFAULT_CONFIDENCE;
       if (confidence < minConf) continue;
 
-      const key = `${entityText.toLowerCase()}::${mappedType}`;
-      const existing = seen.get(key);
-      if (existing && existing.confidence >= confidence) continue;
+      // Anchor the highlight to the canonicalized length so e.g. "Google's"
+      // → "Google" highlights only the 6 leading chars, leaving the
+      // possessive `'s` outside the mark.
+      const endOffset = Math.min(ent.start + entityText.length, ent.end);
 
-      seen.set(key, {
+      mentions.push({
         entityText,
         entityType: mappedType,
         startOffset: ent.start,
-        endOffset: ent.end,
+        endOffset: endOffset > ent.start ? endOffset : ent.end,
         confidence,
         context: extractContext(text, ent.start, ent.end),
       });
     }
-
-    const mentions = Array.from(seen.values());
     const stats = calculateStatistics(mentions);
     const max = config?.maxEntitiesPerArticle;
     const limited = max && mentions.length > max ? mentions.slice(0, max) : mentions;
@@ -143,19 +214,26 @@ class EntityRecognitionService {
     const url = `${getServiceUrl()}/extract`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), getTimeoutMs());
+    console.log(`[ner] POST ${url} chars=${text.length} timeout=${getTimeoutMs()}ms`);
     try {
+      const t0 = Date.now();
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
         signal: controller.signal,
       });
+      console.log(`[ner] status ${res.status} in ${Date.now() - t0}ms`);
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new Error(`NER sidecar ${res.status}: ${body.slice(0, 200)}`);
       }
       const data = (await res.json()) as SidecarResponse;
+      console.log(`[ner] entities=${data.entities?.length ?? 0}`);
       return data.entities ?? [];
+    } catch (err) {
+      console.log(`[ner] threw: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -219,6 +297,9 @@ function extractContext(text: string, start: number, end: number): string {
         lastBoundaryEnd = m.index + m[0].length;
       }
       const prevSentenceStart = lastBoundaryEnd;
+      // Without this `>= from` guard we infinite-loop when the nearest
+      // boundary lands exactly at our current `from` (i.e. no progress).
+      if (prevSentenceStart >= from) return false;
       const candidateLen = to - prevSentenceStart;
       if (candidateLen > CONTEXT_MAX_CHARS) return false;
       from = prevSentenceStart;
@@ -229,6 +310,8 @@ function extractContext(text: string, start: number, end: number): string {
     re.lastIndex = to;
     const m = re.exec(text);
     const nextEnd = m ? m.index + m[0].length : text.length;
+    // Same guard for the forward direction.
+    if (nextEnd <= to) return false;
     const candidateLen = nextEnd - from;
     if (candidateLen > CONTEXT_MAX_CHARS) return false;
     to = nextEnd;

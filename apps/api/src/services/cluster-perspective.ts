@@ -91,10 +91,20 @@ function pickArticleText(article: {
   summary: string | null;
   language: string | null;
 }): string {
+  // Prefer the LLM-cleaned English version when present (now produced for
+  // both English and non-English articles — strips chrome / image captions
+  // / boilerplate). Falls back to the raw English fullText, then content
+  // snippets. The `translatedFullText IS NULL → not-newsworthy` filter
+  // applied by the caller already excludes boilerplate articles.
+  if (article.translatedFullText && article.translatedFullText.trim()) {
+    return article.translatedFullText.trim();
+  }
   const isEnglish =
     !article.language || article.language.toLowerCase().slice(0, 2) === "en";
-  if (!isEnglish && article.translatedFullText && article.translatedFullText.trim()) {
-    return article.translatedFullText.trim();
+  if (!isEnglish) {
+    // Non-English without translation: skip — feeding original-language
+    // text to the SBERT/TF-IDF stack pollutes distinctive-word output.
+    return "";
   }
   return (article.fullText ?? article.contentSnippet ?? article.summary ?? "").trim();
 }
@@ -181,10 +191,13 @@ async function runCompute(
 
   // Per-source cap first (preserves source diversity), then global cap.
   // Articles arrive sorted by rank-asc / similarity-desc, so taking the top-N
-  // per source keeps each outlet's best representatives.
+  // per source keeps each outlet's best representatives. We key by `domain`
+  // here (not `sourceName`) because RSS feeds often expose section-titles as
+  // sourceName — a single publisher like SCMP shows up as 23 different
+  // sourceName values that should all be treated as one source.
   const perSourceCounts = new Map<string, number>();
   const afterPerSourceCap = cluster.articles.filter((link) => {
-    const key = link.article.sourceName || link.article.domain || "__unknown__";
+    const key = link.article.domain || link.article.sourceName || "__unknown__";
     const count = perSourceCounts.get(key) ?? 0;
     if (count >= maxPerSource) return false;
     perSourceCounts.set(key, count + 1);
@@ -216,7 +229,12 @@ async function runCompute(
       const knownCountry = profileCountry ?? resolveCountryFromDomain(a.domain, a.sourceName);
       return {
         article_id: a.id,
-        source_name: a.sourceName || a.domain,
+        // Group by `domain` for divergence analysis. `sourceName` is the RSS
+        // feed-section title and varies per section (e.g. SCMP exposes 23
+        // different sourceName values for the same publisher); using it
+        // would inflate n_sources and shrink per-source samples. Domain is
+        // the stable canonical identifier for an outlet.
+        source_name: a.domain || a.sourceName,
         domain: a.domain,
         knownCountry,
         text,

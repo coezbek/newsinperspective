@@ -1,4 +1,4 @@
-import { ScopeType } from "@prisma/client";
+import { ExtractionStatus, ScopeType } from "@prisma/client";
 import type { ArticleDetail, SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 import { extractRegion } from "../domain/category.js";
 import { computeAuthorityStats, isGlobalTierDomain, scoreDomainAuthority } from "../domain/source-ranking.js";
@@ -110,13 +110,14 @@ function buildTopDomainsForDisplay(
   articles: Array<{ article: { domain: string; duplicateDomains: string[] } }>,
   limit = 4,
 ): string[] {
+  // Only count the article's primary domain — including duplicateDomains
+  // (syndication mirrors) inflates the strip past `sourceCount` and creates
+  // confusing "3 articles across 3 sources" + 4 chips renderings.
   const domainCounts = new Map<string, number>();
   for (const { article } of articles) {
-    for (const domain of uniqueDomains(article)) {
-      const key = domain.trim().toLowerCase();
-      if (!key) continue;
-      domainCounts.set(key, (domainCounts.get(key) ?? 0) + 1);
-    }
+    const key = article.domain.trim().toLowerCase();
+    if (!key) continue;
+    domainCounts.set(key, (domainCounts.get(key) ?? 0) + 1);
   }
 
   const ranked = [...domainCounts.entries()]
@@ -457,8 +458,11 @@ export async function listStoriesByDate(
 
   const scoredRows = rows.map((row) => {
     const clusterDomains = [...new Set(row.articles.flatMap((item) => uniqueDomains(item.article)))];
-    const topDomains = buildTopDomainsForDisplay(row.articles, 4);
-    const topDomainArticles = pickRepresentativeArticles(row.articles, topDomains);
+    const usableArticles = row.articles.filter(
+      ({ article }) => article.extractionStatus !== ExtractionStatus.FAILED,
+    );
+    const topDomains = buildTopDomainsForDisplay(usableArticles, 4);
+    const topDomainArticles = pickRepresentativeArticles(usableArticles, topDomains);
     const clusterFeature = row.features[0]?.featureSet as
       | { keywords?: string[]; kagiClusterNumber?: number; keywordStatus?: string }
       | undefined;
@@ -554,10 +558,21 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       })
     : [];
   const profileCountByDomain = new Map(profileRows.map((item) => [item.domain, item.articleCount]));
-  const topDomainsForDisplay = buildTopDomainsForDisplay(row.articles, 4);
-  const topDomainRank = new Map(topDomainsForDisplay.map((domain, index) => [domain, index]));
 
-  const sortedRows = [...row.articles].sort((left, right) => {
+  // Drop articles whose body extraction failed — they have no text to compare,
+  // so they pollute the per-article list, near-duplicate detection and counts
+  // without contributing any signal. They remain in the underlying StoryCluster
+  // row; we just stop surfacing them via this API.
+  const usableArticles = row.articles.filter(
+    ({ article }) => article.extractionStatus !== ExtractionStatus.FAILED,
+  );
+  const usableArticleCount = usableArticles.length;
+  const usableSourceCount = new Set(
+    usableArticles.map(({ article }) => article.domain.trim().toLowerCase()),
+  ).size;
+  const topDomainsForDisplay = buildTopDomainsForDisplay(usableArticles, 4);
+  const topDomainRank = new Map(topDomainsForDisplay.map((domain, index) => [domain, index]));
+  const sortedRows = [...usableArticles].sort((left, right) => {
     const leftDomain = left.article.domain.trim().toLowerCase();
     const rightDomain = right.article.domain.trim().toLowerCase();
     const leftRank = topDomainRank.get(leftDomain) ?? Number.POSITIVE_INFINITY;
@@ -582,15 +597,13 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       | undefined;
 
     const isEnglish = !article.language || article.language.toLowerCase().slice(0, 2) === "en";
-    const listFullText = !isEnglish && article.translatedFullText && article.translatedFullText.trim().length > 0
-      ? article.translatedFullText
-      : article.fullText;
-    const listTitle = !isEnglish && article.translatedTitle && article.translatedTitle.trim().length > 0
-      ? article.translatedTitle
-      : article.title;
-    const listSummary = !isEnglish && article.translatedSummary
-      ? article.translatedSummary
-      : article.summary;
+    const hasTranslatedTitle = !!(article.translatedTitle && article.translatedTitle.trim().length > 0);
+    const hasTranslatedSummary = !!(article.translatedSummary && article.translatedSummary.trim().length > 0);
+    const hasTranslatedBody = !!(article.translatedFullText && article.translatedFullText.trim().length > 0);
+    const listFullText = !isEnglish && hasTranslatedBody ? article.translatedFullText : article.fullText;
+    const listTitle = !isEnglish && hasTranslatedTitle ? article.translatedTitle : article.title;
+    const listSummary = !isEnglish && hasTranslatedSummary ? article.translatedSummary : article.summary;
+    const isTranslated = !isEnglish && (hasTranslatedTitle || hasTranslatedSummary || hasTranslatedBody);
 
     return {
       id: article.id,
@@ -607,6 +620,8 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       }),
       contentSnippet: null,
       fullText: null,
+      language: article.language ?? null,
+      isTranslated,
       extractionStatus: article.extractionStatus,
       keywords: feature?.keywords ?? [],
       sentiment: feature?.sentiment ?? 0,
@@ -719,8 +734,8 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
     translatedTitle: row.translatedTitle,
     region: extractRegion(row.topCategory),
     category: row.topCategory,
-    articleCount: row.articleCount,
-    sourceCount: row.sourceCount,
+    articleCount: usableArticleCount,
+    sourceCount: usableSourceCount,
     topDomains: topDomainsForDisplay,
     keywords: detailKeywords,
     articles,

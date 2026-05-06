@@ -135,8 +135,20 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    const { getCalibration } = await import("../services/perspective-calibration.js");
+    const calibration = await getCalibration();
+    const divergence_thresholds = {
+      p25: calibration.p25,
+      p75: calibration.p75,
+      p90: calibration.p90,
+    };
+
     if (!query.narrative) {
-      return { ...perspective, narrative: await getStoredNarrative(params.id) };
+      return {
+        ...perspective,
+        divergence_thresholds,
+        narrative: await getStoredNarrative(params.id),
+      };
     }
 
     const { prisma } = await import("../lib/prisma.js");
@@ -146,7 +158,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     });
     const title = cluster?.title ?? "";
     const narrative = await generateClusterNarrative(params.id, title, perspective);
-    return { ...perspective, narrative };
+    return { ...perspective, divergence_thresholds, narrative };
   });
 
   app.get("/api/sources/:domain", async (request, reply) => {

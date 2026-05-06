@@ -15,14 +15,48 @@
   let hoveredEntity: LinkedEntity | null = $state(null);
   let hoverX = $state(0);
   let hoverY = $state(0);
+  let hoverAnchorEl: HTMLDivElement | null = $state(null);
+  let hoverTargetRect: DOMRect | null = null;
+  const HOVER_MARGIN = 8;
+  const HOVER_OFFSET = 6;
+
+  function clampHoverPosition(): void {
+    if (!hoverAnchorEl || !hoverTargetRect) return;
+    const card = hoverAnchorEl.firstElementChild as HTMLElement | null;
+    const cardWidth = card?.offsetWidth ?? hoverAnchorEl.offsetWidth;
+    const cardHeight = card?.offsetHeight ?? hoverAnchorEl.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const desiredCenter = hoverTargetRect.left + hoverTargetRect.width / 2;
+    const minLeft = HOVER_MARGIN + cardWidth / 2;
+    const maxLeft = vw - HOVER_MARGIN - cardWidth / 2;
+    hoverX = Math.max(minLeft, Math.min(maxLeft, desiredCenter));
+
+    let top = hoverTargetRect.bottom + HOVER_OFFSET;
+    if (top + cardHeight > vh - HOVER_MARGIN) {
+      const above = hoverTargetRect.top - HOVER_OFFSET - cardHeight;
+      if (above >= HOVER_MARGIN) {
+        top = above;
+      } else {
+        top = Math.max(HOVER_MARGIN, vh - HOVER_MARGIN - cardHeight);
+      }
+    }
+    hoverY = top;
+  }
 
   function handleEntityEnter(entity: LinkedEntity, ev: MouseEvent): void {
     hoveredEntity = entity;
     const target = ev.currentTarget as HTMLElement;
-    const rect = target.getBoundingClientRect();
-    hoverX = rect.left + rect.width / 2;
-    hoverY = rect.bottom + 6;
+    hoverTargetRect = target.getBoundingClientRect();
+    hoverX = hoverTargetRect.left + hoverTargetRect.width / 2;
+    hoverY = hoverTargetRect.bottom + HOVER_OFFSET;
   }
+
+  $effect(() => {
+    if (!hoveredEntity || !hoverAnchorEl) return;
+    clampHoverPosition();
+  });
 
   function handleEntityLeave(): void {
     hoveredEntity = null;
@@ -61,8 +95,12 @@
   const dispatch = createEventDispatcher<{ "entity-click": { entity: LinkedEntity } }>();
 
   /**
-   * Segment the text into parts: marked (entity) and unmarked (regular text)
-   * Handles overlapping entities by selecting highest confidence
+   * Segment the text into parts: marked (entity) and unmarked (regular text).
+   *
+   * Entity highlighting is purely client-side surface-form matching: the API
+   * returns the distinct entities for the article and we find every occurrence
+   * of each surface form in the displayed text. Longest-form-first so e.g.
+   * "Donald Trump" wins over a bare "Trump" inside the same span.
    */
   function segmentText(
     fullText: string,
@@ -72,66 +110,41 @@
       return [{ type: "text", content: fullText }];
     }
 
-    // Filter overlapping entities - keep highest confidence
-    const sortedEntities = [...allEntities].sort((a, b) => {
-      // If ranges overlap, higher confidence wins
-      if (
-        !(
-          a.endOffset <= b.startOffset ||
-          a.startOffset >= b.endOffset
-        )
-      ) {
-        return b.confidence - a.confidence;
-      }
-      return a.startOffset - b.startOffset;
-    });
+    // Map surface form (lowercased) → entity, preferring the longer surface
+    // form when two entities share a prefix.
+    const sorted = [...allEntities]
+      .filter((e) => e.entityText && e.entityText.trim().length >= 2)
+      .sort((a, b) => b.entityText.length - a.entityText.length);
 
-    // Remove overlapping entities (keep first occurrence)
-    const filtered: LinkedEntity[] = [];
-    for (const entity of sortedEntities) {
-      const overlaps = filtered.some(
-        (existing) =>
-          !(entity.endOffset <= existing.startOffset ||
-            entity.startOffset >= existing.endOffset)
-      );
-      if (!overlaps) {
-        filtered.push(entity);
-      }
+    const pattern = new RegExp(
+      `\\b(?:${sorted.map((e) => escapeRegex(e.entityText)).join("|")})\\b`,
+      "g",
+    );
+    const byLower = new Map<string, LinkedEntity>();
+    for (const e of sorted) {
+      const key = e.entityText.toLowerCase();
+      if (!byLower.has(key)) byLower.set(key, e);
     }
-
-    // Sort by start position
-    filtered.sort((a, b) => a.startOffset - b.startOffset);
 
     const segments: Array<{ type: "text" | "entity"; content: string; entity?: LinkedEntity }> = [];
     let lastIndex = 0;
-
-    for (const entity of filtered) {
-      // Add text before entity
-      if (entity.startOffset > lastIndex) {
-        segments.push({
-          type: "text",
-          content: fullText.slice(lastIndex, entity.startOffset),
-        });
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(fullText)) !== null) {
+      const entity = byLower.get(match[0].toLowerCase());
+      if (!entity) {
+        if (match[0].length === 0) pattern.lastIndex++;
+        continue;
       }
-
-      // Add entity
-      segments.push({
-        type: "entity",
-        content: fullText.slice(entity.startOffset, entity.endOffset),
-        entity,
-      });
-
-      lastIndex = entity.endOffset;
+      if (match.index > lastIndex) {
+        segments.push({ type: "text", content: fullText.slice(lastIndex, match.index) });
+      }
+      segments.push({ type: "entity", content: match[0], entity });
+      lastIndex = match.index + match[0].length;
+      if (match[0].length === 0) pattern.lastIndex++;
     }
-
-    // Add remaining text
     if (lastIndex < fullText.length) {
-      segments.push({
-        type: "text",
-        content: fullText.slice(lastIndex),
-      });
+      segments.push({ type: "text", content: fullText.slice(lastIndex) });
     }
-
     return segments;
   }
 
@@ -200,7 +213,7 @@
 </div>
 
 {#if hoveredEntity}
-  <div use:portal class="hover-card-anchor" style="left: {hoverX}px; top: {hoverY}px;">
+  <div bind:this={hoverAnchorEl} use:portal class="hover-card-anchor" style="left: {hoverX}px; top: {hoverY}px;">
     <EntityHoverCard entity={hoveredEntity} />
   </div>
 {/if}

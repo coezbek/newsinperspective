@@ -2,8 +2,11 @@ import { ScopeType } from "@prisma/client";
 import { Prisma } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
+import { withLlmCache } from "./llm-cache.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 import type { SidecarAnalyzeResponse } from "./cluster-perspective.js";
+
+type CallResult = { content: string; model: string } | { error: string };
 
 const OPENROUTER_TIMEOUT_MS = 30_000;
 const NARRATIVE_FEATURE_KIND = "perspective_v1";
@@ -100,7 +103,15 @@ function stripModelReasoning(raw: string): string {
   return out.trim();
 }
 
-async function callOpenRouter(prompt: string, seed: string): Promise<{ content: string; model: string } | { error: string }> {
+async function callOpenRouter(prompt: string, seed: string, kind: string): Promise<CallResult> {
+  return withLlmCache<CallResult>(
+    { kind, prompt },
+    () => callOpenRouterUncached(prompt, seed),
+    { shouldCache: (value) => "content" in value },
+  );
+}
+
+async function callOpenRouterUncached(prompt: string, seed: string): Promise<CallResult> {
   if (!env.OPENROUTER_API_KEY) {
     return { error: "OPENROUTER_API_KEY not configured" };
   }
@@ -159,8 +170,8 @@ export async function generateClusterNarrative(
   const seed = `${clusterId}:${perspective.n_sources}:${perspective.n_countries}`;
 
   const [framing, country] = await Promise.all([
-    framingPrompt ? callOpenRouter(framingPrompt, `framing:${seed}`) : Promise.resolve(null),
-    countryPrompt ? callOpenRouter(countryPrompt, `country:${seed}`) : Promise.resolve(null),
+    framingPrompt ? callOpenRouter(framingPrompt, `framing:${seed}`, "perspective-narrative-framing") : Promise.resolve(null),
+    countryPrompt ? callOpenRouter(countryPrompt, `country:${seed}`, "perspective-narrative-country") : Promise.resolve(null),
   ]);
 
   let model: string | null = null;

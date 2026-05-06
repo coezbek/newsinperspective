@@ -1,6 +1,7 @@
 import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { resolveCountryFromDomain } from "./country-from-domain.js";
+import { withLlmCache } from "./llm-cache.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 
 const OPENROUTER_TIMEOUT_MS = 12_000;
@@ -16,7 +17,7 @@ function buildPrompt(sourceName: string, domain: string): string {
   ].join(" ");
 }
 
-async function callOpenRouter(prompt: string, seed: string): Promise<string | null> {
+async function callOpenRouterUncached(prompt: string, seed: string): Promise<string | null> {
   if (!env.OPENROUTER_API_KEY) return null;
   const models = orderOpenRouterModels(resolveOpenRouterModels(env.OPENROUTER_MODEL), seed);
 
@@ -80,14 +81,19 @@ export async function resolveCountryWithLlm(
   const cacheKey = `${domain}|${sourceName ?? ""}`;
   if (inFlight.has(cacheKey)) return inFlight.get(cacheKey)!;
 
+  const prompt = buildPrompt(sourceName ?? domain, domain);
   const promise = (async () => {
-    const country = await callOpenRouter(buildPrompt(sourceName ?? domain, domain), cacheKey);
+    const country = await withLlmCache<string | null>(
+      { kind: "country-llm-resolver", prompt },
+      () => callOpenRouterUncached(prompt, cacheKey),
+      { shouldCache: (value) => value !== null },
+    );
     if (country) {
-      await prisma.sourceProfile
-        .update({ where: { domain }, data: { country } })
-        .catch(() => {
-          // Profile may not exist yet (some Article domains have no SourceProfile row).
-        });
+      await prisma.sourceProfile.upsert({
+        where: { domain },
+        update: { country },
+        create: { domain, sourceName: sourceName ?? domain, country },
+      });
     }
     return country;
   })();

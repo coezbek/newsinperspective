@@ -104,6 +104,93 @@ async function fetchArticleHtmlWithBrowser(url: string): Promise<{ html: string;
   }
 }
 
+/**
+ * Extract text from a Readability-parsed article preserving block-level
+ * boundaries. `textContent` on a parsed DOM concatenates with no whitespace
+ * between siblings, producing token-merges like "2023.He" — which then
+ * becomes a single NER candidate. Walk the structured content HTML and
+ * insert paragraph breaks between block elements before flattening.
+ */
+/**
+ * Remove paragraphs that are common page-chrome / call-to-action boilerplate
+ * leaking through Readability. Patterns are intentionally specific so we
+ * don't accidentally drop content. A paragraph is dropped if it contains any
+ * of these markers (case-insensitive). Run on the boundary-preserved text,
+ * then re-joined.
+ */
+const CHROME_MARKERS: RegExp[] = [
+  /you'?re currently following/i,
+  /unsubscribe via the link/i,
+  /have an account\??/i,
+  /become an insider/i,
+  /more read next/i,
+  /this story is available exclusively/i,
+  /sign up for (our|the) newsletter/i,
+  /sign in to/i,
+  /contact this reporter/i,
+  /do you have a story to share/i,
+  /personal email address.{0,30}nonwork/i,
+  /encrypted messaging app/i,
+  /share this article/i,
+  /follow us on/i,
+  /click here to/i,
+];
+
+function stripChromeParagraphs(text: string): string {
+  const paragraphs = text.split(/\n{2,}/);
+  const kept = paragraphs.filter((para) => {
+    const trimmed = para.trim();
+    if (!trimmed) return false;
+    return !CHROME_MARKERS.some((re) => re.test(trimmed));
+  });
+  return kept.join("\n\n");
+}
+
+function readabilityTextWithBoundaries(contentHtml: string, baseUrl: string): string {
+  const dom = new JSDOM(contentHtml, { url: baseUrl });
+  const doc = dom.window.document;
+  const blockTags = new Set([
+    "P", "DIV", "LI", "BR", "SECTION", "ARTICLE", "ASIDE", "BLOCKQUOTE",
+    "FIGURE", "FIGCAPTION", "H1", "H2", "H3", "H4", "H5", "H6", "TR",
+  ]);
+  // Walk text nodes in document order, inserting `\n\n` whenever we
+  // transition from one block ancestor to another.
+  const walker = doc.createTreeWalker(doc.body ?? doc.documentElement, dom.window.NodeFilter.SHOW_TEXT);
+  let lastBlock: Element | null = null;
+  const pieces: string[] = [];
+  let node = walker.nextNode();
+  while (node) {
+    const value = node.nodeValue ?? "";
+    if (value.trim()) {
+      let block: Element | null = node.parentElement;
+      while (block && !blockTags.has(block.tagName)) {
+        block = block.parentElement;
+      }
+      if (block && block !== lastBlock && pieces.length > 0) {
+        pieces.push("\n\n");
+      }
+      pieces.push(value);
+      lastBlock = block;
+    }
+    node = walker.nextNode();
+  }
+  return pieces
+    .join("")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    // Fix "2023.GameStop" / "video games.Cohen" — sentence-ending punct
+    // immediately followed by an uppercase letter is almost always a
+    // missing-space artifact from Readability flattening sibling block
+    // elements. Real currency / decimals like "$11.9" are unaffected
+    // because the next char is a digit, not an uppercase letter.
+    .replace(/([.!?])([A-Z])/g, "$1 $2")
+    // "ByAlex Bitter" — bylines often render as <span>By</span><span>Name</span>
+    // with no whitespace between. Insert a space after a leading "By" when
+    // it's directly followed by another capital letter.
+    .replace(/\bBy([A-Z])/g, "By $1")
+    .trim();
+}
+
 function extractTextFromHtml(html: string, url: string, formatPrefix = ""): { text: string; format: string } | null {
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("error", () => undefined);
@@ -111,7 +198,10 @@ function extractTextFromHtml(html: string, url: string, formatPrefix = ""): { te
   const dom = new JSDOM(html, { url, virtualConsole });
   const article = new Readability(dom.window.document).parse();
 
-  const readableText = normalizeWhitespace(article?.textContent ?? "");
+  const rawReadable = article?.content
+    ? readabilityTextWithBoundaries(article.content, url)
+    : normalizeWhitespace(article?.textContent ?? "");
+  const readableText = stripChromeParagraphs(rawReadable);
   if (readableText.length >= 280) {
     return {
       text: truncateText(readableText),

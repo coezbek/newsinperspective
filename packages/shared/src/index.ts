@@ -59,6 +59,8 @@ export const storyDetailSchema = storyListItemSchema.extend({
       summary: z.string().nullable(),
       contentSnippet: z.string().nullable(),
       fullText: z.string().nullable(),
+      language: z.string().nullable(),
+      isTranslated: z.boolean(),
       extractionStatus: z.enum(["PENDING", "SUCCESS", "FAILED"]),
       keywords: z.array(z.string()),
       sentiment: z.number(),
@@ -218,10 +220,14 @@ export const linkedEntitySchema = z.object({
   entityText: z.string(),
   entityType: entityTypeEnum,
   confidence: z.number().min(0).max(1),
-  startOffset: z.number().int(),
-  endOffset: z.number().int(),
-  context: z.string(),
-  articleId: z.string(),
+  // Per-article distinct entities don't carry offsets — the highlighter matches
+  // surface forms in the displayed text on the client. Kept optional for the
+  // rare callers that still surface a representative occurrence.
+  startOffset: z.number().int().optional(),
+  endOffset: z.number().int().optional(),
+  context: z.string().optional(),
+  articleId: z.string().optional(),
+  mentionCount: z.number().int().optional(),
   wikipediaUrl: z.string().url().optional(),
   summary: z.string().optional(),
   imageUrl: z.string().url().optional(),

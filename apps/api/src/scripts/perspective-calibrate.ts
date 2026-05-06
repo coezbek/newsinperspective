@@ -1,3 +1,4 @@
+import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { recalibrateIfStale } from "../services/perspective-calibration.js";
 

@@ -1,3 +1,4 @@
+import "../config/env.js";
 import { ScopeType } from "@prisma/client";
 import { computeClusterPerspective } from "../services/cluster-perspective.js";
 import { prisma } from "../lib/prisma.js";
@@ -78,6 +79,13 @@ async function findCandidateClusters(opts: CliOptions): Promise<Candidate[]> {
   return rows.map((r) => ({ id: r.id, title: r.title }));
 }
 
+/**
+ * Returns true only when a perspective_v1 row exists AND was written after
+ * the most recent change to any article in the cluster. This means the
+ * perspective is current with respect to translations / re-extractions that
+ * happened later (e.g. stage 2 OpenRouter translation populating
+ * translatedFullText), and the backfill can safely skip recompute.
+ */
 async function alreadyComputed(clusterId: string): Promise<boolean> {
   const row = await prisma.nlpFeature.findFirst({
     where: {
@@ -85,9 +93,18 @@ async function alreadyComputed(clusterId: string): Promise<boolean> {
       scopeType: ScopeType.CLUSTER,
       featureSet: { path: ["kind"], equals: "perspective_v1" },
     },
-    select: { id: true },
+    select: { id: true, updatedAt: true },
   });
-  return row !== null;
+  if (!row) return false;
+
+  const latestArticle = await prisma.article.findFirst({
+    where: { clusterLinks: { some: { clusterId } } },
+    orderBy: { updatedAt: "desc" },
+    select: { updatedAt: true },
+  });
+  if (!latestArticle) return true;
+
+  return row.updatedAt >= latestArticle.updatedAt;
 }
 
 interface Result {

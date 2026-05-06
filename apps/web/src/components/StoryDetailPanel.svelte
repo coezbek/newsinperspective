@@ -1,14 +1,13 @@
 <script lang="ts">
   import type { LinkedEntity, StoryComparison, StoryDetail } from "@news/shared";
-  import EntityHighlighter from "./EntityHighlighter.svelte";
   import EntityPopover from "./EntityPopover.svelte";
-  import EntityStats from "./EntityStats.svelte";
   import PerspectivePanel from "./PerspectivePanel.svelte";
 
   interface Props {
     story: StoryDetail;
     comparison: StoryComparison | null;
     articlePath: (id: string) => string;
+    comparePath?: (aId: string, bId: string) => string;
     sourcePath: (domain: string) => string;
     tagPath: (keyword: string) => string;
     faviconUrl: (domain: string) => string;
@@ -19,12 +18,14 @@
     onFaviconError: (event: Event) => void;
     apiBase: string;
     showEntities?: boolean;
+    datePath?: (date: string) => string;
   }
 
   let {
     story,
     comparison,
     articlePath,
+    comparePath,
     sourcePath,
     tagPath,
     faviconUrl,
@@ -35,12 +36,13 @@
     onFaviconError,
     apiBase,
     showEntities = false,
+    datePath,
   }: Props = $props();
 
-  let entityMap: Record<string, LinkedEntity[]> = {};
-  let entityLoadingByArticleId: Record<string, boolean> = {};
-  let entityErrorByArticleId: Record<string, string> = {};
-  let selectedEntity: LinkedEntity | null = null;
+  let entityMap = $state<Record<string, LinkedEntity[]>>({});
+  let entityLoadingByArticleId = $state<Record<string, boolean>>({});
+  let entityErrorByArticleId = $state<Record<string, string>>({});
+  let selectedEntity = $state<LinkedEntity | null>(null);
   let loadedStoryId = "";
 
   async function fetchArticleEntities(articleId: string): Promise<void> {
@@ -80,44 +82,41 @@
     await Promise.all(story.articles.map((article) => fetchArticleEntities(article.id)));
   }
 
-  function entityTextForArticle(article: StoryDetail["articles"][number]): string | null {
-    if (article.fullText?.trim()) return article.fullText;
-    return null;
-  }
-
-  function handleEntityClick(event: CustomEvent<{ entity: LinkedEntity }>): void {
-    selectedEntity = event.detail.entity;
-  }
-
   $effect(() => {
     if (!showEntities) return;
     if (loadedStoryId === story.id) return;
     loadedStoryId = story.id;
     void preloadStoryEntities();
   });
+
+  function sentimentLabel(score: number): { label: string; tone: "positive" | "neutral" | "negative" } {
+    if (score > 0.05) return { label: "Positive sentiment", tone: "positive" };
+    if (score < -0.05) return { label: "Negative sentiment", tone: "negative" };
+    return { label: "Neutral sentiment", tone: "neutral" };
+  }
 </script>
 
-<div class="detail-head">
+<div class="detail-head" class:detail-head--focus={showEntities}>
   <header>
-    <p class="eyebrow">
-      {formatScopeLabel(story.region, story.category)}
-    </p>
+    {#if !showEntities}
+      <p class="eyebrow">
+        {formatScopeLabel(story.region, story.category)}
+      </p>
+    {/if}
     <h3>
       <a
         class="story-title-link"
         href={`/stories/${encodeURIComponent(story.id)}`}
         on:click={(event) => onNavigate(event, `/stories/${encodeURIComponent(story.id)}`)}
+        title={story.translatedTitle && story.translatedTitle !== story.title ? story.title : undefined}
       >
         {story.translatedTitle ?? story.title}
       </a>
     </h3>
-    {#if story.translatedTitle && story.translatedTitle !== story.title}
-      <p class="original-title" title="Original title">{story.title}</p>
-    {/if}
     <p>
       {story.articleCount} articles across
-      {story.sourceCount} sources ·
-      {formatDateRange(story.dateFrom, story.dateUntil)}
+      {story.sourceCount} sources{#if !showEntities} ·
+      {formatDateRange(story.dateFrom, story.dateUntil)}{/if}
     </p>
     <div class="domain-strip" aria-label="Top domains">
       {#each story.topDomains as domain}
@@ -162,14 +161,15 @@
 <PerspectivePanel
   clusterId={story.id}
   {apiBase}
-  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url }))}
+  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText }))}
   {articlePath}
+  {comparePath}
   {onNavigate}
   {faviconUrl}
   {onFaviconError}
 />
 
-<div class="article-grid">
+<div class="article-grid" class:article-grid--focus={showEntities}>
   {#each story.articles as article}
     <article id={`article-${article.id}`} class="article-entry">
       <div class="article-head-rail">
@@ -187,88 +187,92 @@
               />
               <span>{article.domain}</span>
             </a>
-            <span>· {article.publishedAt.slice(0, 10)}</span>
+            <span>·</span>
+            {#if datePath}
+              <a
+                class="article-date-link"
+                href={datePath(article.publishedAt.slice(0, 10))}
+                on:click={(event) => onNavigate(event, datePath!(article.publishedAt.slice(0, 10)))}
+              >{article.publishedAt.slice(0, 10)}</a>
+            {:else}
+              <span>{article.publishedAt.slice(0, 10)}</span>
+            {/if}
+            <span class={`sentiment-pill sentiment-pill--${sentimentLabel(article.sentiment).tone}`} title={`Sentiment score ${article.sentiment.toFixed(2)}`}>{sentimentLabel(article.sentiment).label}</span>
+            {#if article.isTranslated && article.language}
+              <span class="lang-pill" title={`Translated from ${article.language.toUpperCase()} to English`}>
+                {article.language.slice(0, 2).toUpperCase()} → EN
+              </span>
+            {/if}
           </p>
           <h4><a href={articlePath(article.id)} on:click={(event) => onNavigate(event, articlePath(article.id))}>{article.title}</a></h4>
         </header>
       </div>
       <div class="article-card-body">
         <div class="article-body">
-          <p>{article.summary ?? "No summary available."}</p>
-          {#if article.nearDuplicatePeers.length > 0}
-            <p class="signals">
-              Possible near-duplicate coverage:
-              {#each article.nearDuplicatePeers as peer, peerIndex}
-                {#if peerIndex > 0}, {/if}
-                <a href={articlePath(peer.articleId)} on:click={(event) => onNavigate(event, articlePath(peer.articleId))}>{peer.domain}</a>
-              {/each}
-            </p>
-          {:else if article.syndicatedDomains.length > 0}
-            <p class="signals">
-              Possible near-duplicate coverage on {article.syndicatedDomains.join(", ")}
-            </p>
-          {/if}
-          <p class="signals">
-            Sentiment {article.sentiment} · Subjectivity {article.subjectivity}
-          </p>
-          {#if article.keywords.length > 0}
-            <p class="signals">
-              {#each article.keywords as keyword, keywordIndex}
-                {#if keywordIndex > 0}, {/if}
-                <a href={tagPath(keyword)} on:click={(event) => onNavigate(event, tagPath(keyword))}>{keyword}</a>
-              {/each}
-            </p>
-          {/if}
-          {#if showEntities}
-            <div class="entity-section">
-              <div class="entity-section-head">
-                <span class="signals">Named entities</span>
-                {#if entityLoadingByArticleId[article.id]}
-                  <span class="entity-loading">Loading entities...</span>
-                {/if}
+          <div class="article-main">
+            {#if article.summary}
+              <p>{article.summary}</p>
+            {:else if article.extractionStatus === "PENDING"}
+              <p class="placeholder-pending">Summary pending</p>
+            {:else}
+              <p class="placeholder-pending">Summary pending</p>
+            {/if}
+            {#if article.nearDuplicatePeers.length > 0}
+              <p class="signals">
+                Possible near-duplicate coverage:
+                {#each article.nearDuplicatePeers as peer, peerIndex}
+                  {#if peerIndex > 0}, {/if}
+                  <a href={articlePath(peer.articleId)} on:click={(event) => onNavigate(event, articlePath(peer.articleId))}>{peer.domain}</a>
+                {/each}
+              </p>
+            {:else if article.syndicatedDomains.length > 0}
+              <p class="signals">
+                Possible near-duplicate coverage on {article.syndicatedDomains.join(", ")}
+              </p>
+            {/if}
+            <a class="read-source" href={article.url} target="_blank" rel="noreferrer">Read source ↗</a>
+          </div>
+          <aside class="article-tag-strip" aria-label="Keywords and entities">
+            {#if article.keywords.length > 0}
+              <div class="tag-row">
+                <span class="tag-row-label">Keywords</span>
+                <div class="tag-row-chips">
+                  {#each article.keywords.slice(0, 4) as keyword}
+                    <a href={tagPath(keyword)} class="story-chip" on:click={(event) => onNavigate(event, tagPath(keyword))}>{keyword}</a>
+                  {/each}
+                  {#if article.keywords.length > 4}
+                    <a href={articlePath(article.id)} class="story-chip story-chip--more" on:click={(event) => onNavigate(event, articlePath(article.id))}>+{article.keywords.length - 4} more</a>
+                  {/if}
+                </div>
               </div>
-
-              {#if entityErrorByArticleId[article.id]}
-                <p class="entity-error">{entityErrorByArticleId[article.id]}</p>
-              {:else}
-                {#if entityTextForArticle(article)}
-                  <div class="entity-content">
-                    <div class="entity-text-card">
-                      <EntityHighlighter
-                        text={entityTextForArticle(article) ?? ""}
-                        entities={entityMap[article.id] ?? []}
-                        on:entity-click={handleEntityClick}
-                      />
-                    </div>
-                    <div class="entity-sidebar">
-                      <EntityStats
-                        entities={entityMap[article.id] ?? []}
-                        selectedEntityId={selectedEntity?.id ?? null}
-                        onEntitySelect={(entity) => {
-                          selectedEntity = entity;
-                        }}
-                      />
-                    </div>
+            {/if}
+            {#if showEntities}
+              {@const ents = entityMap[article.id] ?? []}
+              {#if entityLoadingByArticleId[article.id]}
+                <div class="tag-row">
+                  <span class="tag-row-label">Entities</span>
+                  <span class="entity-loading">Loading…</span>
+                </div>
+              {:else if entityErrorByArticleId[article.id]}
+                <div class="tag-row">
+                  <span class="tag-row-label">Entities</span>
+                  <span class="entity-error">{entityErrorByArticleId[article.id]}</span>
+                </div>
+              {:else if ents.length > 0}
+                <div class="tag-row">
+                  <span class="tag-row-label">Entities</span>
+                  <div class="tag-row-chips">
+                    {#each ents.slice(0, 4) as entity}
+                      <button type="button" class="story-chip story-chip--entity" on:click={() => { selectedEntity = entity; }}>{entity.entityText}</button>
+                    {/each}
+                    {#if ents.length > 4}
+                      <a href={articlePath(article.id)} class="story-chip story-chip--more" on:click={(event) => onNavigate(event, articlePath(article.id))}>+{ents.length - 4} more</a>
+                    {/if}
                   </div>
-                {:else if (entityMap[article.id] ?? []).length > 0}
-                  <div class="entity-sidebar entity-sidebar--full">
-                    <EntityStats
-                      entities={entityMap[article.id] ?? []}
-                      selectedEntityId={selectedEntity?.id ?? null}
-                      onEntitySelect={(entity) => {
-                        selectedEntity = entity;
-                      }}
-                    />
-                  </div>
-                {:else if entityMap[article.id] !== undefined}
-                  <p class="entity-empty">No named entities found</p>
-                {:else if !entityLoadingByArticleId[article.id]}
-                  <p class="entity-empty">Named entities pending</p>
-                {/if}
+                </div>
               {/if}
-            </div>
-          {/if}
-          <a href={article.url} target="_blank" rel="noreferrer">Read source</a>
+            {/if}
+          </aside>
         </div>
       </div>
     </article>
@@ -434,6 +438,28 @@
     margin-top: 10px;
   }
 
+  .article-grid--focus {
+    max-height: none;
+    overflow-y: visible;
+    overflow-x: visible;
+    padding-right: 0;
+  }
+
+  .article-grid--focus .article-head-rail {
+    position: static;
+  }
+
+  .article-date-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(88, 112, 143, 0.5);
+  }
+
+  .article-date-link:hover {
+    color: var(--accent-strong, #0a3c96);
+    border-bottom-color: currentColor;
+  }
+
   .article-entry {
     position: relative;
   }
@@ -491,7 +517,15 @@
   .article-body {
     padding: 14px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(330px, 27rem);
+    gap: 18px;
+    align-items: start;
+  }
+
+  .article-main {
+    display: grid;
     gap: 10px;
+    min-width: 0;
   }
 
   .article-body p {
@@ -500,58 +534,134 @@
     color: #34455d;
   }
 
-  .article-body a:last-child {
+  @media (max-width: 760px) {
+    .article-body {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .read-source {
     color: var(--accent-strong, #0a3c96);
     font-weight: 600;
     text-decoration: none;
+    justify-self: start;
   }
 
-  .article-body a:last-child:hover {
+  .read-source:hover {
     text-decoration: underline;
   }
 
-  .entity-section {
-    display: grid;
-    gap: 10px;
-  }
-
-  .entity-section-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
   .entity-loading,
-  .entity-error,
-  .entity-empty {
+  .entity-error {
     color: var(--muted, #58708f);
     font-size: 0.82rem;
   }
 
-  .entity-empty {
+  .placeholder-pending {
     margin: 0;
+    color: var(--muted, #58708f);
+    font-size: 0.85rem;
     font-style: italic;
   }
 
   .entity-error {
-    margin: 0;
     color: #8b1e3f;
   }
 
-  .entity-content {
-    display: grid;
-    grid-template-columns: minmax(0, 1.5fr) minmax(220px, 0.9fr);
-    gap: 12px;
-    align-items: start;
+  .article-tag-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(245, 249, 255, 0.7);
+    border: 1px solid rgba(28, 46, 73, 0.08);
+    min-width: 0;
   }
 
-  .entity-text-card,
-  .entity-sidebar--full {
-    padding: 12px;
-    border-radius: 12px;
-    border: 1px solid rgba(37, 87, 167, 0.16);
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(240, 247, 255, 0.84));
+  .tag-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tag-row-label {
+    color: var(--muted, #58708f);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  .tag-row-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .story-chip {
+    display: inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: var(--accent-soft, #dce8ff);
+    color: var(--accent-strong, #0a3c96);
+    font-size: 0.84rem;
+    font-weight: 600;
+    text-decoration: none;
+    border: 0;
+    cursor: pointer;
+    line-height: 1.2;
+    font-family: inherit;
+  }
+
+  .story-chip:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .story-chip--more {
+    background: transparent;
+    color: var(--muted, #58708f);
+    border: 1px dashed rgba(88, 112, 143, 0.4);
+  }
+
+  .story-chip--more:hover {
+    text-decoration: none;
+    border-color: var(--accent-strong, #0a3c96);
+    color: var(--accent-strong, #0a3c96);
+  }
+
+  .sentiment-pill,
+  .lang-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1.4;
+    text-transform: none;
+  }
+
+  .sentiment-pill--positive {
+    background: #dff5e1;
+    color: #1e6b3a;
+  }
+
+  .sentiment-pill--neutral {
+    background: #eef0f4;
+    color: #4a5568;
+  }
+
+  .sentiment-pill--negative {
+    background: #fde2e4;
+    color: #8b1e3f;
+  }
+
+  .lang-pill {
+    background: rgba(37, 87, 167, 0.1);
+    color: var(--accent-strong, #0a3c96);
+    border: 1px solid rgba(37, 87, 167, 0.2);
   }
 
   .entity-sidebar {

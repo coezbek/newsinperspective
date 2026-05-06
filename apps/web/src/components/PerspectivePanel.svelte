@@ -28,6 +28,12 @@
     error: string | null;
   }
 
+  interface DivergenceThresholds {
+    p25: number;
+    p75: number;
+    p90: number;
+  }
+
   interface Perspective {
     cluster_id: string;
     n_articles: number;
@@ -35,6 +41,7 @@
     n_countries: number;
     divergence_score: number | null;
     divergence_label: "low" | "moderate" | "high" | "very_high" | null;
+    divergence_thresholds?: DivergenceThresholds;
     pairwise_distance: Record<string, Record<string, number>>;
     distinctive_words: DistinctiveWords[];
     country_sentiment: CountrySentiment[];
@@ -49,13 +56,20 @@
     sourceName: string;
     domain: string;
     url: string;
+    hasFullText?: boolean;
   }
+
+  // Static fallback for the divergence thresholds — only used if the server
+  // didn't return divergence_thresholds in the perspective payload. The live
+  // values come from the perspective-calibration row in the DB.
+  const FALLBACK_THRESHOLDS = { p25: 0.08, p75: 0.15, p90: 0.25 };
 
   interface Props {
     clusterId: string;
     apiBase: string;
     articles?: ArticleRef[];
     articlePath?: (id: string) => string;
+    comparePath?: (aId: string, bId: string) => string;
     onNavigate?: (event: MouseEvent, path: string) => void;
     faviconUrl?: (domain: string) => string;
     onFaviconError?: (event: Event) => void;
@@ -66,10 +80,16 @@
     apiBase,
     articles = [],
     articlePath,
+    comparePath,
     onNavigate,
     faviconUrl,
     onFaviconError,
   }: Props = $props();
+
+  let data = $state<Perspective | null>(null);
+  let loading = $state(false);
+  let error = $state<string | null>(null);
+  let lastClusterId: string | null = null;
 
   const articlesBySource = $derived.by(() => {
     const map = new Map<string, ArticleRef[]>();
@@ -83,8 +103,38 @@
     return map;
   });
 
+  // Sources that have at least one article with extracted body text. Sources
+  // without text get filtered out of the heatmap/axis because the SBERT
+  // distance matrix is degenerate for them (and we already exclude them from
+  // sentiment/distinctive-words for the same reason).
+  const sourcesWithText = $derived.by(() => {
+    const set = new Set<string>();
+    for (const a of articles) {
+      if (!a.hasFullText) continue;
+      const key = a.sourceName || "";
+      if (key) set.add(key);
+    }
+    return set;
+  });
+
+  function hasText(sourceName: string): boolean {
+    if (sourcesWithText.size === 0) return true; // no signal — keep everything
+    return sourcesWithText.has(sourceName);
+  }
+
   function articlesForSource(sourceName: string): ArticleRef[] {
     return articlesBySource.get(sourceName.toLowerCase()) ?? [];
+  }
+
+  function representativeArticleId(sourceName: string): string | null {
+    return articlesForSource(sourceName)[0]?.id ?? null;
+  }
+
+  function handleCompareClick(event: MouseEvent, aId: string, bId: string): void {
+    if (!comparePath) return;
+    if (onNavigate) {
+      onNavigate(event, comparePath(aId, bId));
+    }
   }
 
   function handleSourceClick(event: MouseEvent, articleId: string): void {
@@ -164,7 +214,7 @@
   const axisPoints = $derived.by<AxisPoint[]>(() => {
     if (!data || !faviconUrl) return [];
     const matrix = data.pairwise_distance ?? {};
-    const sourcesInMatrix = Object.keys(matrix);
+    const sourcesInMatrix = Object.keys(matrix).filter(hasText);
     if (sourcesInMatrix.length < 2) return [];
 
     // Article counts per source (within the cluster) for ranking + label.
@@ -284,7 +334,7 @@
   const heatmap = $derived.by<HeatmapData | null>(() => {
     if (!data) return null;
     const matrix = data.pairwise_distance ?? {};
-    const all = Object.keys(matrix);
+    const all = Object.keys(matrix).filter(hasText);
     if (all.length < 2) return null;
     // Use the same top-N (by article count) ranking as the axis for consistency.
     const counts = new Map<string, number>();
@@ -298,15 +348,30 @@
     return buildHeatmap(matrix, ranked);
   });
 
-  function heatColor(value: number, min: number, max: number, isDiagonal: boolean): string {
-    if (isDiagonal) return "#f4f4f4";
-    if (max === min) return "#fff";
-    const t = (value - min) / (max - min);
-    // pale → red gradient, matching the notebook's seaborn 'Reds' cmap
-    const r = Math.round(255 - 80 * (1 - t));
-    const g = Math.round(245 - 200 * t);
-    const b = Math.round(235 - 220 * t);
-    return `rgb(${r}, ${g}, ${b})`;
+  const thresholds = $derived(data?.divergence_thresholds ?? FALLBACK_THRESHOLDS);
+
+  function classifyDistance(value: number): "low" | "moderate" | "high" | "very_high" {
+    const t = thresholds;
+    if (value < t.p25) return "low";
+    if (value < t.p75) return "moderate";
+    if (value < t.p90) return "high";
+    return "very_high";
+  }
+
+  // Same palette as the divergence pill so cell colors share semantics with
+  // the headline framing-divergence label.
+  const DIVERGENCE_COLORS: Record<"low" | "moderate" | "high" | "very_high", { bg: string; fg: string }> = {
+    low:       { bg: "#5a8a3a", fg: "#ffffff" },
+    moderate:  { bg: "#c79728", fg: "#ffffff" },
+    high:      { bg: "#c9523f", fg: "#ffffff" },
+    very_high: { bg: "#8a2424", fg: "#ffffff" },
+  };
+
+  function heatStyle(value: number, isDiagonal: boolean): string {
+    if (isDiagonal) return "background: #f4f4f4; color: transparent;";
+    const tone = classifyDistance(value);
+    const c = DIVERGENCE_COLORS[tone];
+    return `background: ${c.bg}; color: ${c.fg};`;
   }
 
   function assignRows(points: AxisPoint[], minSpacing: number): Array<AxisPoint & { row: number }> {
@@ -321,11 +386,6 @@
       return { ...p, row };
     });
   }
-
-  let data: Perspective | null = $state(null);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
-  let lastClusterId: string | null = null;
 
   $effect(() => {
     if (clusterId && clusterId !== lastClusterId) {
@@ -463,7 +523,7 @@
       <div class="perspective-block">
         <h5>Pairwise distance matrix</h5>
         <p class="perspective-note">
-          Cosine distance between mean source embeddings — top {heatmap.sources.length} sources by article count. Range: {heatmap.min.toFixed(2)} – {heatmap.max.toFixed(2)}.
+          Cosine distance between mean source embeddings — top {heatmap.sources.length} sources by article count. Cells colored by the global framing-divergence thresholds: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}. Range in cluster: {heatmap.min.toFixed(2)} – {heatmap.max.toFixed(2)}.
         </p>
         <div class="heatmap-wrap">
           <table class="heatmap" style="--n: {heatmap.sources.length}">
@@ -471,22 +531,51 @@
               <tr>
                 <th></th>
                 {#each heatmap.sources as s}
-                  <th class="heatmap-col-label" title={s}><span>{s}</span></th>
+                  {@const colDom = articlesForSource(s)[0]?.domain ?? ""}
+                  <th class="heatmap-col-label" title={s}>
+                    {#if colDom && faviconUrl}
+                      <img class="heatmap-favicon" src={faviconUrl(colDom)} alt={s} loading="lazy" width="16" height="16" onerror={onFaviconError} />
+                    {:else}
+                      <span class="heatmap-col-fallback">{s.slice(0, 2)}</span>
+                    {/if}
+                  </th>
                 {/each}
               </tr>
             </thead>
             <tbody>
               {#each heatmap.rows as row, i}
+                {@const rowDom = articlesForSource(heatmap.sources[i])[0]?.domain ?? ""}
                 <tr>
-                  <th class="heatmap-row-label" title={heatmap.sources[i]}>{heatmap.sources[i]}</th>
+                  <th class="heatmap-row-label" title={heatmap.sources[i]}>
+                    <span class="heatmap-row-name">{heatmap.sources[i]}</span>
+                    {#if rowDom && faviconUrl}
+                      <img class="heatmap-favicon" src={faviconUrl(rowDom)} alt="" loading="lazy" width="16" height="16" onerror={onFaviconError} />
+                    {/if}
+                  </th>
                   {#each row as cell, j}
+                    {@const aId = i !== j ? representativeArticleId(cell.a) : null}
+                    {@const bId = i !== j ? representativeArticleId(cell.b) : null}
+                    {@const linkable = i !== j && aId && bId && comparePath}
                     <td
                       class="heatmap-cell"
                       class:diagonal={i === j}
-                      style="background: {heatColor(cell.value, heatmap.min, heatmap.max, i === j)}"
-                      title={`${cell.a} ↔ ${cell.b}: ${cell.value.toFixed(3)}`}
+                      class:clickable={linkable}
+                      style={heatStyle(cell.value, i === j)}
+                      title={i === j
+                        ? cell.a
+                        : linkable
+                          ? `Compare ${cell.a} ↔ ${cell.b} (cosine ${cell.value.toFixed(3)}, ${classifyDistance(cell.value)})`
+                          : `${cell.a} ↔ ${cell.b}: ${cell.value.toFixed(3)} (${classifyDistance(cell.value)})`}
                     >
-                      {#if i !== j}{cell.value.toFixed(2)}{/if}
+                      {#if linkable}
+                        <a
+                          class="heatmap-cell-link"
+                          href={comparePath!(aId!, bId!)}
+                          onclick={(event) => handleCompareClick(event, aId!, bId!)}
+                        >{cell.value.toFixed(2)}</a>
+                      {:else if i !== j}
+                        {cell.value.toFixed(2)}
+                      {/if}
                     </td>
                   {/each}
                 </tr>
@@ -665,7 +754,7 @@
   .source-axis {
     position: relative;
     height: calc(2.6rem + var(--row-count, 1) * 2.4rem);
-    margin: 0.4rem 1.5rem 0.6rem;
+    margin: 0.4rem 4rem 0.6rem;
   }
   .source-axis-line {
     position: absolute;
@@ -715,7 +804,7 @@
   .source-scatter {
     position: relative;
     height: 18rem;
-    margin: 0.4rem 1.5rem 1rem;
+    margin: 0.4rem 4rem 1rem;
     background:
       linear-gradient(to right, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 25% 100%,
       linear-gradient(to bottom, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 100% 25%,
@@ -730,22 +819,28 @@
     transform: translate(-50%, -50%);
   }
   .source-axis-marker.scatter::before { display: none; }
-  .heatmap-wrap { overflow-x: auto; padding-bottom: 0.4rem; }
-  .heatmap { border-collapse: separate; border-spacing: 1px; font-size: 0.7rem; }
+  .heatmap-wrap { overflow-x: auto; padding-bottom: 0.4rem; display: flex; justify-content: center; }
+  .heatmap { border-collapse: separate; border-spacing: 1px; font-size: 0.68rem; table-layout: fixed; width: max-content; }
   .heatmap th { font-weight: 500; color: #58708f; padding: 2px 4px; }
-  .heatmap-col-label { height: 6.5rem; text-align: left; vertical-align: bottom; }
-  .heatmap-col-label span {
-    display: inline-block;
-    transform-origin: bottom left;
-    transform: rotate(-60deg) translateX(0.4rem);
-    white-space: nowrap;
-    max-width: 9rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .heatmap-row-label { text-align: right; padding-right: 0.4rem; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .heatmap-cell { width: 2.4rem; height: 1.6rem; text-align: center; color: #34455d; font-variant-numeric: tabular-nums; border-radius: 2px; }
+  .heatmap-col-label { height: 2rem; width: 2rem; text-align: center; vertical-align: middle; padding: 2px 0; }
+  .heatmap-row-label { text-align: right; padding-right: 0.4rem; width: 11rem; max-width: 11rem; white-space: nowrap; }
+  .heatmap-row-name { display: inline-block; max-width: 8.5rem; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+  .heatmap-favicon { display: inline-block; width: 16px; height: 16px; border-radius: 3px; vertical-align: middle; margin-left: 4px; }
+  .heatmap-col-label .heatmap-favicon { margin-left: 0; }
+  .heatmap-col-fallback { display: inline-block; font-size: 0.7rem; color: #58708f; text-transform: uppercase; }
+  .heatmap-cell { width: 2rem; height: 2rem; text-align: center; color: #34455d; font-variant-numeric: tabular-nums; border-radius: 2px; padding: 0; }
   .heatmap-cell.diagonal { color: transparent; }
+  .heatmap-cell.clickable { cursor: pointer; }
+  .heatmap-cell.clickable:hover { outline: 2px solid #0a3c96; outline-offset: -1px; }
+  .heatmap-cell-link {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    color: inherit;
+    text-decoration: none;
+  }
   .word-chip {
     display: inline-block;
     background: #eef3f8;
@@ -757,6 +852,7 @@
   }
   .country-list { list-style: none; padding: 0; margin: 0; }
   .country-list li { display: grid; grid-template-columns: minmax(7rem, 9rem) 3.5rem 1fr 7rem; align-items: center; gap: 0.5rem; padding: 0.2rem 0; }
+  .country-list li.country-keywords { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; grid-template-columns: none; }
   .country-name { font-weight: 500; }
   .country-n { color: #777; font-size: 0.8rem; }
   .country-bar { position: relative; height: 0.55rem; background: #ececec; border-radius: 3px; overflow: hidden; }

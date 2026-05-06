@@ -156,6 +156,10 @@ export async function runOpenRouterBacklog(options?: {
         article.summary,
         body,
         article.language,
+        {
+          onAttemptLog: (msg) =>
+            console.log(`[openrouter-backlog][article ${article.id}] ${msg}`),
+        },
       );
       await prisma.nlpFeature.update({
         where: { id: feature.id },
@@ -164,8 +168,12 @@ export async function runOpenRouterBacklog(options?: {
             ...current,
             ...next,
             aiEnrichmentStatus: "ready",
-            aiEnrichmentModel: "openrouter",
-            aiEnrichmentError: null,
+            // Persist the actual model that produced this enrichment so
+            // we can audit which OpenRouter free model carried the load,
+            // and so cache hits surface as "openrouter-cache" instead of
+            // a misleading model name.
+            aiEnrichmentModel: next.llmModel ?? "openrouter-cache",
+            aiEnrichmentError: next.llmError ?? null,
             aiEnrichedAt: new Date().toISOString(),
           }),
         },
@@ -176,6 +184,8 @@ export async function runOpenRouterBacklog(options?: {
         translatedSummary?: string;
         translatedFullText?: string;
         language?: string;
+        extractionStatus?: "FAILED";
+        extractionError?: string;
       } = {};
       if (!article.summary && next.translatedSummary) {
         articleUpdate.summary = next.translatedSummary;
@@ -194,14 +204,28 @@ export async function runOpenRouterBacklog(options?: {
       if (!article.language && typeof next.language === "string" && next.language.trim()) {
         articleUpdate.language = next.language.trim().toLowerCase();
       }
+      // When the LLM determines the input is non-newsworthy boilerplate
+      // (corporate footer, paywall, photo-credit page), mark the article as
+      // failed so cluster-perspective / entity / story listings drop it.
+      // Original `fullText` is preserved for diagnostic re-inspection.
+      if (next.isNewsworthy === false) {
+        articleUpdate.extractionStatus = "FAILED";
+        articleUpdate.extractionError = `Not newsworthy: ${next.notNewsworthyReason ?? "boilerplate"}`;
+      }
       if (Object.keys(articleUpdate).length > 0) {
         await prisma.article.update({
           where: { id: article.id },
-          data: articleUpdate,
+          data: articleUpdate as never,
         });
       }
       articleReady += 1;
-      log(`[openrouter-backlog][article] ready ${article.id}`);
+      log(
+        `[openrouter-backlog][article] ready ${article.id}${
+          next.isNewsworthy === false
+            ? ` (not newsworthy: ${next.notNewsworthyReason ?? "boilerplate"})`
+            : ""
+        }`,
+      );
     } catch (error) {
       await prisma.nlpFeature.update({
         where: { id: feature.id },
@@ -278,6 +302,10 @@ export async function runOpenRouterBacklog(options?: {
         body: article.fullText ?? article.contentSnippet,
         language: article.language ?? language,
       })),
+      {
+        onAttemptLog: (msg) =>
+          console.log(`[openrouter-backlog][cluster ${cluster.id}] ${msg}`),
+      },
     );
 
     await prisma.nlpFeature.update({

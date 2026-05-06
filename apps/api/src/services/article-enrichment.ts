@@ -91,6 +91,7 @@ async function enrichOne(
   articleId: string,
   cache: LinkCache,
 ): Promise<{ success: boolean; entitiesCount: number; error?: string }> {
+  console.log(`[enrich:${articleId}] step=findUnique`);
   const article = await prisma.article.findUnique({
     where: { id: articleId },
     select: {
@@ -104,6 +105,7 @@ async function enrichOne(
   if (!article) {
     return { success: false, entitiesCount: 0, error: `Article not found: ${articleId}` };
   }
+  console.log(`[enrich:${articleId}] step=text-picked len=${(article.translatedFullText ?? article.fullText ?? "").length}`);
 
   // spaCy uses en_core_web_sm; on non-English articles, prefer the LLM-produced
   // translatedFullText when it's available. Same convention as cluster-perspective.
@@ -117,9 +119,11 @@ async function enrichOne(
     return { success: false, entitiesCount: 0, error: "No text available for entity extraction" };
   }
 
+  console.log(`[enrich:${articleId}] step=ner-call chars=${fullText.length}`);
   let candidates: EntityCandidate[] = [];
   try {
     const nerResult = await entityRecognitionService.recognizeEntities(fullText);
+    console.log(`[enrich:${articleId}] step=ner-done entities=${nerResult.entities.length}`);
     candidates = nerResult.entities.map((entity) => ({
       entityText: entity.entityText,
       entityType: entity.entityType as EntityType,
@@ -129,8 +133,11 @@ async function enrichOne(
       context: extractContext(fullText, entity.startOffset ?? 0, 50),
     }));
   } catch (error) {
+    // NER outage / misconfiguration is a real failure — count it as such so
+    // the script's success rate reflects reality. Returning success:true here
+    // hid a missing NER_SERVICE_URL behind "25/25 succeeded, 0 mentions".
     return {
-      success: true,
+      success: false,
       entitiesCount: 0,
       error: `NER failed: ${error instanceof Error ? error.message : String(error)}`,
     };
@@ -140,35 +147,83 @@ async function enrichOne(
     return { success: true, entitiesCount: 0 };
   }
 
-  // Dedupe per article on (name, type) — multiple mentions of the same entity
-  // become one mention here; the per-mention table is for offset highlighting,
-  // not frequency counting (counts come from grouping queries).
-  const byKey = new Map<string, EntityCandidate>();
+  // Dedupe ONLY for the entity-creation/lookup pass — keep one canonical
+  // candidate per (name, type) so we make one Wikipedia call per distinct
+  // entity. The frontend needs every mention's offset to highlight all
+  // occurrences, so we still emit one EntityMention row per occurrence below.
+  const distinctByKey = new Map<string, EntityCandidate>();
   for (const c of candidates) {
     const key = linkCacheKey(c.entityText, c.entityType);
-    const prev = byKey.get(key);
-    if (!prev || c.confidence > prev.confidence) byKey.set(key, c);
+    const prev = distinctByKey.get(key);
+    if (!prev || c.confidence > prev.confidence) distinctByKey.set(key, c);
   }
-  const unique = Array.from(byKey.values());
+  const distinct = Array.from(distinctByKey.values());
 
+  console.log(`[enrich:${articleId}] step=db-lookup distinct=${distinct.length} candidates=${candidates.length}`);
   // Single round-trip lookup for entities already in DB.
-  const names = unique.map((c) => c.entityText);
+  const names = distinct.map((c) => c.entityText);
   const existing = await prisma.namedEntity.findMany({
     where: { name: { in: names } },
     select: { id: true, name: true },
   });
   const existingByName = new Map(existing.map((e) => [e.name, e.id]));
+  console.log(`[enrich:${articleId}] step=link-loop existing=${existing.length} toLink=${distinct.length - existing.length}`);
 
   // Link only the ones we don't already have, sharing the cache across articles.
   const toCreate: Array<{
     candidate: EntityCandidate;
     linked: LinkedFields;
   }> = [];
-  for (const c of unique) {
+  // Two-phase: collect uncached candidates, batch-link them, then merge with
+  // any in-flight LinkCache hits from concurrent workers. Cuts Wikipedia
+  // round-trips from N (per entity) to N searches + ⌈hits/50⌉ summaries.
+  const toLink: EntityCandidate[] = [];
+  const linkedByText = new Map<string, LinkedFields>();
+  for (const c of distinct) {
     if (existingByName.has(c.entityText)) continue;
-    const linked = await getLinkedFields(cache, c);
+    const inflight = cache.get(linkCacheKey(c.entityText, c.entityType));
+    if (inflight) {
+      const linked = await inflight;
+      linkedByText.set(c.entityText, linked);
+      continue;
+    }
+    toLink.push(c);
+  }
+  if (toLink.length > 0) {
+    console.log(`[enrich:${articleId}] step=batch-link n=${toLink.length}`);
+    const linkedEntities = await entityLinkerService.linkEntities(
+      toLink.map((c) => ({
+        entityText: c.entityText,
+        entityType: c.entityType,
+        confidence: c.confidence,
+        startOffset: c.startOffset,
+        endOffset: c.endOffset,
+        context: c.context,
+      })),
+    );
+    for (let i = 0; i < toLink.length; i++) {
+      const c = toLink[i]!;
+      const le = linkedEntities[i]!;
+      const fields: LinkedFields = {
+        wikipediaUrl: le.wikipediaUrl ?? null,
+        summary: le.summary ?? null,
+        imageUrl: le.imageUrl ?? null,
+      };
+      linkedByText.set(c.entityText, fields);
+      // Seed the in-flight cache for sibling workers covering the same name.
+      cache.set(linkCacheKey(c.entityText, c.entityType), Promise.resolve(fields));
+    }
+  }
+  for (const c of distinct) {
+    if (existingByName.has(c.entityText)) continue;
+    const linked = linkedByText.get(c.entityText) ?? {
+      wikipediaUrl: null,
+      summary: null,
+      imageUrl: null,
+    };
     toCreate.push({ candidate: c, linked });
   }
+  console.log(`[enrich:${articleId}] step=write toCreate=${toCreate.length}`);
 
   // Bulk-create new NamedEntity rows; skipDuplicates handles the race where
   // a parallel article created the same entity between our findMany and now.
@@ -190,8 +245,10 @@ async function enrichOne(
     for (const r of refreshed) existingByName.set(r.name, r.id);
   }
 
+  // Emit one EntityMention per ORIGINAL candidate (not per distinct entity)
+  // so the frontend can highlight every occurrence by its own offset.
   const mentionRows: Prisma.EntityMentionCreateManyInput[] = [];
-  for (const c of unique) {
+  for (const c of candidates) {
     const entityId = existingByName.get(c.entityText);
     if (!entityId) continue;
     mentionRows.push({
@@ -251,13 +308,16 @@ export async function enrichArticlesWithEntities(
     where.id = { in: options.articleIds };
   }
 
+  console.log(`[enrich] counting matched articles…`);
   const matched = await prisma.article.count({ where });
+  console.log(`[enrich] matched=${matched}, fetching ids…`);
   const articles = await prisma.article.findMany({
     where,
     orderBy: [{ publishedAt: "desc" }, { createdAt: "desc" }],
     select: { id: true },
     ...(options.limit ? { take: options.limit } : {}),
   });
+  console.log(`[enrich] got ${articles.length} ids`);
 
   const envConcurrency = Number.parseInt(process.env.ENRICHMENT_CONCURRENCY ?? "", 10);
   const concurrency = Math.max(
@@ -280,8 +340,10 @@ export async function enrichArticlesWithEntities(
       const idx = cursor++;
       if (idx >= articles.length) return;
       const article = articles[idx]!;
+      console.log(`[enrich] start ${idx + 1}/${articles.length} ${article.id}`);
       try {
         const result = await enrichOne(article.id, cache);
+        console.log(`[enrich] done ${idx + 1}/${articles.length} ${article.id} success=${result.success} mentions=${result.entitiesCount}${result.error ? " err=" + result.error : ""}`);
         if (result.success) {
           succeeded++;
           entitiesExtracted += result.entitiesCount;
@@ -291,6 +353,7 @@ export async function enrichArticlesWithEntities(
         }
       } catch (error) {
         failed++;
+        console.log(`[enrich] threw ${article.id}: ${error instanceof Error ? error.message : String(error)}`);
         logger.error(`Article enrichment failed for ${article.id}`, {
           error: error instanceof Error ? error.message : String(error),
         });

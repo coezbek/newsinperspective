@@ -4,6 +4,7 @@
   import EntityHighlighter from "./components/EntityHighlighter.svelte";
   import EntityPopover from "./components/EntityPopover.svelte";
   import EntityStats from "./components/EntityStats.svelte";
+  import ClusterSummary from "./components/ClusterSummary.svelte";
   import StoryDetailPanel from "./components/StoryDetailPanel.svelte";
   import PipelinePage from "./components/PipelinePage.svelte";
   import PerspectiveStatsPage from "./components/PerspectiveStatsPage.svelte";
@@ -35,9 +36,40 @@
     | { kind: "tag"; keyword: string }
     | { kind: "story"; id: string }
     | { kind: "article"; id: string }
+    | { kind: "compare"; aId: string; bId: string }
     | { kind: "about" }
     | { kind: "pipeline" }
     | { kind: "perspective" };
+
+  interface ArticleSlot {
+    id: string;
+    detail: ArticleDetail | null;
+    loading: boolean;
+    error: string;
+    entities: LinkedEntity[];
+    entitiesLoading: boolean;
+    entitiesError: string;
+    selectedEntity: LinkedEntity | null;
+    perspectiveWords: string[];
+    perspectiveLoading: boolean;
+    hoveredPerspective: string | null;
+  }
+
+  function makeArticleSlot(id = ""): ArticleSlot {
+    return {
+      id,
+      detail: null,
+      loading: false,
+      error: "",
+      entities: [],
+      entitiesLoading: false,
+      entitiesError: "",
+      selectedEntity: null,
+      perspectiveWords: [],
+      perspectiveLoading: false,
+      hoveredPerspective: null,
+    };
+  }
 
   let dates: string[] = [];
   let startDate = "";
@@ -55,19 +87,9 @@
   let storyPageComparison: StoryComparison | null = null;
   let storyPageLoading = false;
   let storyPageError = "";
-  let articlePageDetail: ArticleDetail | null = null;
-  let articlePageLoading = false;
-  let articlePageError = "";
-  let articlePageEntities: LinkedEntity[] = [];
-  let articlePageEntitiesLoading = false;
-  let articlePageEntitiesError = "";
-  let articlePageSelectedEntity: LinkedEntity | null = null;
-  let articlePagePerspectiveWords: string[] = [];
-  let articlePagePerspectiveLoading = false;
-  let articlePageHoveredPerspective: string | null = null;
-  $: articlePageActivePerspective = articlePageHoveredPerspective ? [articlePageHoveredPerspective] : [];
-  $: articlePagePublishedDate = articlePageDetail?.publishedAt.slice(0, 10) ?? "";
-  $: articlePageFeedDate = articlePageDetail?.relatedStory?.date ?? articlePagePublishedDate;
+  let articleSlot: ArticleSlot = makeArticleSlot();
+  let compareSlotA: ArticleSlot = makeArticleSlot();
+  let compareSlotB: ArticleSlot = makeArticleSlot();
   let globalError = "";
   let loadingNextDate = false;
   const HERO_ROTATING_WORDS = ["outlets", "regions", "days", "framings", "narratives"];
@@ -316,6 +338,38 @@
     return `${API_BASE}/api/favicons/${encodeURIComponent(domain)}`;
   }
 
+  async function refreshFavicon(domain: string): Promise<void> {
+    try {
+      await fetch(`${API_BASE}/api/favicons/${encodeURIComponent(domain)}?refresh=true`, { cache: "no-store" });
+    } catch (error) {
+      console.warn(`Favicon refresh failed for ${domain}`, error);
+      return;
+    }
+    const newSrc = `${API_BASE}/api/favicons/${encodeURIComponent(domain)}?v=${Date.now()}`;
+    document.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+      const src = img.getAttribute("src") ?? "";
+      const match = src.match(/\/api\/favicons\/([^?\/]+)/);
+      const imgDomain = match ? decodeURIComponent(match[1]) : img.dataset.faviconDomain;
+      if (imgDomain === domain) {
+        delete img.dataset.faviconDomain;
+        img.src = newSrc;
+      }
+    });
+  }
+
+  function handleGlobalFaviconShiftClick(event: MouseEvent): void {
+    if (!event.shiftKey) return;
+    const target = event.target;
+    if (!(target instanceof HTMLImageElement)) return;
+    const src = target.getAttribute("src") ?? "";
+    const match = src.match(/\/api\/favicons\/([^?\/]+)/);
+    const domain = match ? decodeURIComponent(match[1]) : target.dataset.faviconDomain;
+    if (!domain) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void refreshFavicon(domain);
+  }
+
   function sourcePath(domain: string): string {
     return `/newssite/${encodeURIComponent(domain)}`;
   }
@@ -334,6 +388,10 @@
 
   function articlePath(id: string): string {
     return `/articles/${encodeURIComponent(id)}`;
+  }
+
+  function comparePath(aId: string, bId: string): string {
+    return `/compare/${encodeURIComponent(aId)}/${encodeURIComponent(bId)}`;
   }
 
   function activeKeywordFilter(): string {
@@ -359,6 +417,15 @@
     const articleMatch = pathname.match(/^\/articles\/(.+)$/);
     if (articleMatch?.[1]) {
       return { kind: "article", id: decodeURIComponent(articleMatch[1]) };
+    }
+
+    const compareMatch = pathname.match(/^\/compare\/([^/]+)\/([^/]+)$/);
+    if (compareMatch?.[1] && compareMatch[2]) {
+      return {
+        kind: "compare",
+        aId: decodeURIComponent(compareMatch[1]),
+        bId: decodeURIComponent(compareMatch[2]),
+      };
     }
 
     const dateMatch = pathname.match(/^\/date\/(\d{4}-\d{2}-\d{2})$/);
@@ -409,6 +476,8 @@
     const target = event.currentTarget as HTMLImageElement | null;
     if (!target) return;
     if (target.src === FAVICON_PLACEHOLDER) return;
+    const match = target.src.match(/\/api\/favicons\/([^?\/]+)/);
+    if (match) target.dataset.faviconDomain = decodeURIComponent(match[1]);
     target.src = FAVICON_PLACEHOLDER;
   }
 
@@ -449,30 +518,13 @@
     return escaped.replace(pattern, '<mark class="perspective-word">$1</mark>');
   }
 
-  function splitParagraphs(text: string): Array<{ text: string; entities: LinkedEntity[]; offset: number }> {
+  function splitParagraphs(text: string): Array<{ text: string }> {
     if (!text) return [];
-    const out: Array<{ text: string; entities: LinkedEntity[]; offset: number }> = [];
-    const re = /\n\s*\n+/g;
-    let lastIndex = 0;
-    let match: RegExpExecArray | null;
-    const pushChunk = (start: number, end: number) => {
-      const chunk = text.slice(start, end);
-      const trimmed = chunk.trim();
-      if (!trimmed) return;
-      const trimStart = chunk.indexOf(trimmed);
-      const absStart = start + trimStart;
-      const absEnd = absStart + trimmed.length;
-      const ents = articlePageEntities
-        .filter((e) => e.startOffset >= absStart && e.endOffset <= absEnd)
-        .map((e) => ({ ...e, startOffset: e.startOffset - absStart, endOffset: e.endOffset - absStart }));
-      out.push({ text: trimmed, entities: ents, offset: absStart });
-    };
-    while ((match = re.exec(text)) !== null) {
-      pushChunk(lastIndex, match.index);
-      lastIndex = match.index + match[0].length;
-    }
-    pushChunk(lastIndex, text.length);
-    return out;
+    return text
+      .split(/\n\s*\n+/)
+      .map((chunk) => chunk.trim())
+      .filter((chunk) => chunk.length > 0)
+      .map((chunk) => ({ text: chunk }));
   }
 
   async function fetchJson<T>(path: string): Promise<T> {
@@ -696,50 +748,71 @@
     }
   }
 
-  async function loadArticlePage(id: string): Promise<void> {
-    articlePageLoading = true;
-    articlePageError = "";
-    articlePageDetail = null;
-    articlePageEntities = [];
-    articlePageEntitiesError = "";
-    articlePageSelectedEntity = null;
-    articlePagePerspectiveWords = [];
-    articlePagePerspectiveLoading = false;
+  async function loadArticleSlot(id: string, assign: (slot: ArticleSlot) => void): Promise<void> {
+    let slot: ArticleSlot = { ...makeArticleSlot(id), loading: true };
+    assign(slot);
+
+    const update = (patch: Partial<ArticleSlot>): void => {
+      slot = { ...slot, ...patch };
+      assign(slot);
+    };
 
     try {
-      articlePageDetail = await fetchJson<ArticleDetail>(`/api/articles/${id}`);
-      articlePageEntitiesLoading = true;
+      const detail = await fetchJson<ArticleDetail>(`/api/articles/${id}`);
+      update({ detail, entitiesLoading: true });
       try {
-        const entityResponse = await fetchJson<{ entities: LinkedEntity[] }>(`/api/articles/${id}/entities?minConfidence=0.2&limit=50`);
-        articlePageEntities = entityResponse.entities ?? [];
+        const entityResponse = await fetchJson<{ entities: LinkedEntity[] }>(
+          `/api/articles/${id}/entities?minConfidence=0.2`,
+        );
+        update({ entities: entityResponse.entities ?? [], entitiesLoading: false });
       } catch (value) {
-        articlePageEntitiesError = value instanceof Error ? value.message : "Failed to load entities";
-      } finally {
-        articlePageEntitiesLoading = false;
+        update({
+          entitiesError: value instanceof Error ? value.message : "Failed to load entities",
+          entitiesLoading: false,
+        });
       }
-      const clusterId = articlePageDetail?.relatedStory?.id;
-      const sourceName = articlePageDetail?.sourceName;
+      const clusterId = detail?.relatedStory?.id;
+      const sourceName = detail?.sourceName;
       if (clusterId && sourceName) {
-        articlePagePerspectiveLoading = true;
+        update({ perspectiveLoading: true });
         try {
           const perspective = await fetchJson<{ distinctive_words: { source_name: string; words: string[] }[] }>(
             `/api/clusters/${encodeURIComponent(clusterId)}/perspective`,
           );
           const target = sourceName.toLowerCase();
           const row = perspective.distinctive_words.find((r) => r.source_name.toLowerCase() === target);
-          articlePagePerspectiveWords = row?.words ?? [];
+          update({ perspectiveWords: row?.words ?? [], perspectiveLoading: false });
         } catch {
-          articlePagePerspectiveWords = [];
-        } finally {
-          articlePagePerspectiveLoading = false;
+          update({ perspectiveWords: [], perspectiveLoading: false });
         }
       }
     } catch (value) {
-      articlePageError = value instanceof Error ? value.message : "Failed to load article";
-      articlePageEntitiesLoading = false;
+      update({
+        error: value instanceof Error ? value.message : "Failed to load article",
+        entitiesLoading: false,
+      });
     } finally {
-      articlePageLoading = false;
+      update({ loading: false });
     }
+  }
+
+  async function loadArticlePage(id: string): Promise<void> {
+    await loadArticleSlot(id, (slot) => {
+      articleSlot = slot;
+    });
+  }
+
+  async function loadComparePage(aId: string, bId: string): Promise<void> {
+    compareSlotA = makeArticleSlot(aId);
+    compareSlotB = makeArticleSlot(bId);
+    await Promise.all([
+      loadArticleSlot(aId, (slot) => {
+        compareSlotA = slot;
+      }),
+      loadArticleSlot(bId, (slot) => {
+        compareSlotB = slot;
+      }),
+    ]);
   }
 
   async function syncRouteFromLocation(): Promise<void> {
@@ -763,6 +836,11 @@
 
     if (currentView.kind === "article") {
       await loadArticlePage(currentView.id);
+      return;
+    }
+
+    if (currentView.kind === "compare") {
+      await loadComparePage(currentView.aId, currentView.bId);
       return;
     }
 
@@ -878,8 +956,10 @@
         ? `${currentView.keyword} · NewsInPerspective`
         : currentView.kind === "story" && storyPageDetail
           ? `${storyPageDetail.translatedTitle ?? storyPageDetail.title} · NewsInPerspective`
-          : currentView.kind === "article" && articlePageDetail
-            ? `${articlePageDetail.title} · NewsInPerspective`
+          : currentView.kind === "article" && articleSlot.detail
+            ? `${articleSlot.detail.title} · NewsInPerspective`
+          : currentView.kind === "compare"
+            ? "Compare articles · NewsInPerspective"
           : currentView.kind === "date"
             ? `${currentView.date} · NewsInPerspective`
           : currentView.kind === "about"
@@ -889,6 +969,8 @@
               : "NewsInPerspective"}
   </title>
 </svelte:head>
+
+<svelte:window on:click|capture={handleGlobalFaviconShiftClick} />
 
 <main class="shell" use:debugComponent={componentLabel("AppShell")}>
   <section class="hero panel" use:debugComponent={componentLabel("HeroPanel")}>
@@ -928,6 +1010,8 @@
             Story pages show the full cross-source cluster detail and give each cluster a stable route.
           {:else if currentView.kind === "article"}
             Article pages focus on one source version of a story and are the best place for article-level enrichment.
+          {:else if currentView.kind === "compare"}
+            Compare two articles from the same story side by side — same enrichment, different framings.
           {:else}
             Keyword pages show where a topic appears, which sources publish it, and what other entities travel with it.
           {/if}
@@ -1216,7 +1300,7 @@
           <a
             class="article-date-link"
             href={datePath(storyPageDetail.dateFrom)}
-            on:click={(event) => handleInternalNavigation(event, datePath(storyPageDetail.dateFrom))}
+            on:click={(event) => handleInternalNavigation(event, datePath(storyPageDetail!.dateFrom))}
             title={`Open ${storyPageDetail.dateFrom} feed`}
           >{formatDateRange(storyPageDetail.dateFrom, storyPageDetail.dateUntil)}</a>
           <div class="article-header-actions">
@@ -1227,6 +1311,7 @@
           story={storyPageDetail}
           comparison={storyPageComparison}
           {articlePath}
+          {comparePath}
           {sourcePath}
           {tagPath}
           {faviconUrl}
@@ -1242,182 +1327,298 @@
       {/if}
     </section>
   {:else if currentView.kind === "article"}
-    <section class="panel focus-page article-page" use:debugComponent={componentLabel("ArticlePage", shortId(currentView.id))}>
-      {#if articlePageLoading}
-        <p class="loading" use:debugComponent={componentLabel("ArticlePageLoading")}>Loading article...</p>
-      {:else if articlePageError}
-        <p class="error" use:debugComponent={componentLabel("ArticlePageError")}>{articlePageError}</p>
-      {:else if articlePageDetail}
-        <header class="article-header-strip" use:debugComponent={componentLabel("ArticleHeaderStrip", articlePageDetail.domain)}>
-          <span class="eyebrow">Article</span>
-          <span class="article-header-sep">·</span>
-          <a class="domain-chip domain-link" href={sourcePath(articlePageDetail.domain)} on:click={(event) => handleInternalNavigation(event, sourcePath(articlePageDetail.domain))}>
-            <img class="favicon" src={faviconUrl(articlePageDetail.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
-            <span>{articlePageDetail.domain}</span>
-          </a>
-          <span class="article-header-sep">·</span>
-          <a
-            class="article-date-link"
-            href={datePath(articlePageFeedDate)}
-            on:click={(event) => handleInternalNavigation(event, datePath(articlePageFeedDate))}
-            title={articlePageFeedDate !== articlePagePublishedDate
-              ? `Published ${articlePagePublishedDate}; clustered into the ${articlePageFeedDate} feed`
-              : `Open ${articlePageFeedDate} feed`}
-          >{articlePagePublishedDate}</a>
-          {#if articlePageDetail.fullTextIsTranslated && articlePageDetail.language}
-            <span class="article-header-sep">·</span>
-            <span class="lang-pill" title="Translated from {articlePageDetail.language.toUpperCase()} to English">
-              {articlePageDetail.language.slice(0, 2).toUpperCase()} → EN
-            </span>
-          {/if}
-          <div class="article-header-actions">
-            <a class="tab tab--primary" href={articlePageDetail.url} target="_blank" rel="noreferrer">Read original ↗</a>
-            <a
-              href={articlePageDetail.relatedStory ? storyPath(articlePageDetail.relatedStory.id) : "/"}
-              class="tab back-link"
-              on:click={(event) => handleInternalNavigation(event, articlePageDetail.relatedStory ? storyPath(articlePageDetail.relatedStory.id) : "/")}
-            >
-              {articlePageDetail.relatedStory ? "Back to story" : "Back to feed"}
-            </a>
-          </div>
-        </header>
-
+    <section class="panel focus-page article-page">
+      {#if articleSlot.loading}
+        <p class="loading">Loading article...</p>
+      {:else if articleSlot.error}
+        <p class="error">{articleSlot.error}</p>
+      {:else if articleSlot.detail}
+        {@const applyPatch = (patch: Partial<ArticleSlot>) => (articleSlot = { ...articleSlot, ...patch })}
+        {@render sectionHeader(articleSlot, applyPatch)}
         <div class="article-layout">
           <div class="article-main">
-            <h2 class="article-title">{articlePageDetail.title}</h2>
-            {#if articlePageDetail.originalTitle}
-              <p class="article-original-title" lang={articlePageDetail.language ?? undefined}>
-                {articlePageDetail.originalTitle}
-              </p>
-            {/if}
-
-            {#if articlePageDetail.summary}
-              <div class="article-summary-callout" use:debugComponent={componentLabel("ArticleSummary")}>
-                <span class="article-summary-label">Summary</span>
-                <p>{@html highlightWords(articlePageDetail.summary, articlePageActivePerspective)}</p>
-                {#if articlePageDetail.relatedStory}
-                  <p class="article-summary-story" use:debugComponent={componentLabel("ArticleRelatedStory", shortId(articlePageDetail.relatedStory.id))}>
-                    Part of story:
-                    <a href={storyPath(articlePageDetail.relatedStory.id)} on:click={(event) => handleInternalNavigation(event, storyPath(articlePageDetail.relatedStory.id))}>
-                      {articlePageDetail.relatedStory.translatedTitle ?? articlePageDetail.relatedStory.title}
-                    </a>
-                  </p>
-                {/if}
-              </div>
-            {/if}
-
-            {#if articlePageDetail.fullTextIsTranslated}
-              <p class="translation-notice">
-                Translated from {(articlePageDetail.language ?? "source").toUpperCase()}.
-                <a href={articlePageDetail.url} target="_blank" rel="noreferrer">Read the original →</a>
-              </p>
-            {/if}
-
-            {#if articlePageDetail.fullText}
-              <div class="article-body-text" use:debugComponent={componentLabel("ArticleBody", shortId(currentView.id))}>
-                {#each splitParagraphs(articlePageDetail.fullText) as paragraph, i (i)}
-                  <p class="article-paragraph">
-                    <EntityHighlighter
-                      text={paragraph.text}
-                      entities={paragraph.entities}
-                      perspectiveWords={articlePageActivePerspective}
-                      on:entity-click={(event) => {
-                        articlePageSelectedEntity = event.detail.entity;
-                      }}
-                    />
-                  </p>
-                {/each}
-              </div>
-            {:else}
-              <p>{@html highlightWords(articlePageDetail.contentSnippet ?? "No body available.", articlePageActivePerspective)}</p>
-            {/if}
-
-            {#if articlePageDetail.nearDuplicatePeers.length > 0}
-              <div class="other-coverage" use:debugComponent={componentLabel("ArticleNearDuplicates")}>
-                <h4 class="other-coverage-title">Also covered by</h4>
-                <ul class="other-coverage-list">
-                  {#each articlePageDetail.nearDuplicatePeers as peer (peer.articleId)}
-                    <li class="other-coverage-item">
-                      <a class="other-coverage-link" href={articlePath(peer.articleId)} on:click={(event) => handleInternalNavigation(event, articlePath(peer.articleId))}>
-                        <img class="favicon" src={faviconUrl(peer.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
-                        <span class="other-coverage-domain">{peer.domain}</span>
-                        <span class="other-coverage-headline">{peer.title}</span>
-                      </a>
-                    </li>
-                  {/each}
-                </ul>
-              </div>
-            {/if}
-
-            {#if articlePageDetail.sentiment !== 0 || articlePageDetail.subjectivity !== 0 || articlePageDetail.biasSignals.length > 0}
-              <p class="signals" use:debugComponent={componentLabel("ArticleSentiment")}>
-                {#if articlePageDetail.sentiment !== 0}Sentiment {articlePageDetail.sentiment.toFixed(2)}{/if}
-                {#if articlePageDetail.subjectivity !== 0} · Subjectivity {articlePageDetail.subjectivity.toFixed(2)}{/if}
-              </p>
-            {/if}
+            {@render sectionTitle(articleSlot)}
+            {@render sectionSummary(articleSlot)}
+            {@render sectionTranslation(articleSlot)}
+            {@render sectionBody(articleSlot, applyPatch)}
+            {@render sectionNearDup(articleSlot)}
+            {@render sectionSentiment(articleSlot)}
           </div>
-
-          <aside class="article-aside" use:debugComponent={componentLabel("ArticleAside")}>
-            {#if articlePageDetail.keywords.length > 0}
-              <section class="aside-block" use:debugComponent={componentLabel("ArticleKeywords")}>
-                <h4 class="aside-title">Tags</h4>
-                <div class="chip-row">
-                  {#each articlePageDetail.keywords as keyword}
-                    <a href={tagPath(keyword)} class="chip" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
-                  {/each}
-                </div>
-              </section>
-            {/if}
-
-            {#if articlePagePerspectiveWords.length > 0}
-              <section class="aside-block" use:debugComponent={componentLabel("ArticlePerspectiveWords")}>
-                <h4 class="aside-title">Distinctive vs. other sources</h4>
-                <p class="aside-hint">Hover a term to highlight it in the article.</p>
-                <div class="chip-row">
-                  {#each articlePagePerspectiveWords as word}
-                    <span
-                      class="chip perspective-word-chip"
-                      class:active={articlePageHoveredPerspective === word}
-                      on:mouseenter={() => (articlePageHoveredPerspective = word)}
-                      on:mouseleave={() => (articlePageHoveredPerspective = null)}
-                      on:focus={() => (articlePageHoveredPerspective = word)}
-                      on:blur={() => (articlePageHoveredPerspective = null)}
-                      role="button"
-                      tabindex="0"
-                    >{word}</span>
-                  {/each}
-                </div>
-              </section>
-            {:else if articlePagePerspectiveLoading}
-              <section class="aside-block">
-                <p class="signals">Loading distinctive words…</p>
-              </section>
-            {/if}
-
-            <section class="aside-block" use:debugComponent={componentLabel("ArticleEntities")}>
-              {#if articlePageEntities.length > 0}
-                <EntityStats
-                  entities={articlePageEntities}
-                  selectedEntityId={articlePageSelectedEntity?.id ?? null}
-                  onEntitySelect={(entity) => {
-                    articlePageSelectedEntity = entity;
-                  }}
-                />
-              {:else if articlePageEntitiesLoading}
-                <p class="signals">Loading entities…</p>
-              {:else if articlePageEntitiesError}
-                <p class="entity-error">{articlePageEntitiesError}</p>
-              {/if}
-            </section>
+          <aside class="article-aside">
+            {@render sectionTags(articleSlot)}
+            {@render sectionPerspective(articleSlot, applyPatch)}
+            {@render sectionEntities(articleSlot, applyPatch)}
           </aside>
         </div>
-
-        <EntityPopover entity={articlePageSelectedEntity} onClose={() => {
-          articlePageSelectedEntity = null;
-        }} />
+        <EntityPopover entity={articleSlot.selectedEntity} onClose={() => applyPatch({ selectedEntity: null })} />
+      {/if}
+    </section>
+  {:else if currentView.kind === "compare"}
+    {@const compareStory = compareSlotA.detail?.relatedStory ?? compareSlotB.detail?.relatedStory ?? null}
+    <section class="panel focus-page compare-page">
+      <header class="article-header-strip">
+        <span class="eyebrow">Compare articles</span>
+        {#if compareStory}
+          <span class="article-header-sep">·</span>
+          <span>from story:</span>
+          <a
+            href={storyPath(compareStory.id)}
+            on:click={(event) => handleInternalNavigation(event, storyPath(compareStory.id))}
+          >{compareStory.translatedTitle ?? compareStory.title}</a>
+        {/if}
+        <div class="article-header-actions">
+          <a
+            href={compareStory ? storyPath(compareStory.id) : "/"}
+            class="tab back-link"
+            on:click={(event) => handleInternalNavigation(event, compareStory ? storyPath(compareStory.id) : "/")}
+          >
+            {compareStory ? "Back to story" : "Back to feed"}
+          </a>
+        </div>
+      </header>
+      {#if compareSlotA.loading || compareSlotB.loading}
+        <p class="loading">Loading articles…</p>
+      {:else if compareSlotA.error || compareSlotB.error}
+        <p class="error">{compareSlotA.error || compareSlotB.error}</p>
+      {:else if compareSlotA.detail && compareSlotB.detail}
+        {@const applyA = (patch: Partial<ArticleSlot>) => (compareSlotA = { ...compareSlotA, ...patch })}
+        {@const applyB = (patch: Partial<ArticleSlot>) => (compareSlotB = { ...compareSlotB, ...patch })}
+        <div class="compare-grid">
+          {@render sectionHeader(compareSlotA, applyA)}
+          {@render sectionHeader(compareSlotB, applyB)}
+          {@render sectionTitle(compareSlotA)}
+          {@render sectionTitle(compareSlotB)}
+          {@render sectionSummary(compareSlotA, false)}
+          {@render sectionSummary(compareSlotB, false)}
+          {@render sectionTranslation(compareSlotA)}
+          {@render sectionTranslation(compareSlotB)}
+          {@render sectionBody(compareSlotA, applyA)}
+          {@render sectionBody(compareSlotB, applyB)}
+          {@render sectionNearDup(compareSlotA)}
+          {@render sectionNearDup(compareSlotB)}
+          {@render sectionSentiment(compareSlotA)}
+          {@render sectionSentiment(compareSlotB)}
+          {@render sectionTags(compareSlotA)}
+          {@render sectionTags(compareSlotB)}
+          {@render sectionPerspective(compareSlotA, applyA)}
+          {@render sectionPerspective(compareSlotB, applyB)}
+          {@render sectionEntities(compareSlotA, applyA)}
+          {@render sectionEntities(compareSlotB, applyB)}
+        </div>
+        <EntityPopover entity={compareSlotA.selectedEntity} onClose={() => applyA({ selectedEntity: null })} />
+        <EntityPopover entity={compareSlotB.selectedEntity} onClose={() => applyB({ selectedEntity: null })} />
       {/if}
     </section>
   {/if}
+
+  {#snippet sectionHeader(slot: ArticleSlot, _applyPatch: (patch: Partial<ArticleSlot>) => void)}
+    {#if slot.detail}
+      {@const detail = slot.detail}
+      {@const publishedDate = detail.publishedAt.slice(0, 10)}
+      {@const feedDate = detail.relatedStory?.date ?? publishedDate}
+      <header class="article-header-strip compare-section">
+        <a
+          class="eyebrow article-eyebrow-link"
+          href={articlePath(detail.id)}
+          on:click={(event) => handleInternalNavigation(event, articlePath(detail.id))}
+          title="Open article page"
+        >Article →</a>
+        <span class="article-header-sep">·</span>
+        <a class="domain-chip domain-link" href={sourcePath(detail.domain)} on:click={(event) => handleInternalNavigation(event, sourcePath(detail.domain))}>
+          <img class="favicon" src={faviconUrl(detail.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
+          <span>{detail.domain}</span>
+        </a>
+        <span class="article-header-sep">·</span>
+        <a
+          class="article-date-link"
+          href={datePath(feedDate)}
+          on:click={(event) => handleInternalNavigation(event, datePath(feedDate))}
+          title={feedDate !== publishedDate
+            ? `Published ${publishedDate}; clustered into the ${feedDate} feed`
+            : `Open ${feedDate} feed`}
+        >{publishedDate}</a>
+        {#if detail.fullTextIsTranslated && detail.language}
+          <span class="article-header-sep">·</span>
+          <span class="lang-pill" title="Translated from {detail.language.toUpperCase()} to English">
+            {detail.language.slice(0, 2).toUpperCase()} → EN
+          </span>
+        {/if}
+        <div class="article-header-actions">
+          <a class="tab tab--primary" href={detail.url} target="_blank" rel="noreferrer">Read original ↗</a>
+        </div>
+      </header>
+    {/if}
+  {/snippet}
+
+  {#snippet sectionTitle(slot: ArticleSlot)}
+    <div class="compare-section article-title-section">
+      {#if slot.detail}
+        <h2 class="article-title">{slot.detail.title}</h2>
+        {#if slot.detail.originalTitle}
+          <p class="article-original-title" lang={slot.detail.language ?? undefined}>
+            {slot.detail.originalTitle}
+          </p>
+        {/if}
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sectionSummary(slot: ArticleSlot, showRelatedStory = true)}
+    {@const activePerspective = slot.hoveredPerspective ? [slot.hoveredPerspective] : []}
+    <div class="compare-section article-summary-callout">
+      <span class="article-summary-label">Summary</span>
+      {#if slot.detail?.summary}
+        <p>{@html highlightWords(slot.detail.summary, activePerspective)}</p>
+      {:else if slot.detail}
+        <p class="placeholder-pending">Summary pending</p>
+      {/if}
+      {#if showRelatedStory && slot.detail?.relatedStory}
+        <p class="article-summary-story">
+          Part of story:
+          <a href={storyPath(slot.detail.relatedStory.id)} on:click={(event) => handleInternalNavigation(event, storyPath(slot.detail!.relatedStory!.id))}>
+            {slot.detail.relatedStory.translatedTitle ?? slot.detail.relatedStory.title}
+          </a>
+        </p>
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sectionTranslation(slot: ArticleSlot)}
+    <div class="compare-section">
+      {#if slot.detail?.fullTextIsTranslated}
+        <p class="translation-notice">
+          Translated from {(slot.detail.language ?? "source").toUpperCase()}.
+          <a href={slot.detail.url} target="_blank" rel="noreferrer">Read the original →</a>
+        </p>
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sectionBody(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
+    {@const activePerspective = slot.hoveredPerspective ? [slot.hoveredPerspective] : []}
+    <div class="compare-section">
+      {#if slot.detail?.fullText}
+        <div class="article-body-text">
+          {#each splitParagraphs(slot.detail.fullText) as paragraph, i (i)}
+            <p class="article-paragraph">
+              <EntityHighlighter
+                text={paragraph.text}
+                entities={slot.entities}
+                perspectiveWords={activePerspective}
+                on:entity-click={(event) => applyPatch({ selectedEntity: event.detail.entity })}
+              />
+            </p>
+          {/each}
+        </div>
+      {:else if slot.detail?.contentSnippet}
+        <p>{@html highlightWords(slot.detail.contentSnippet, activePerspective)}</p>
+      {:else if slot.detail?.extractionStatus === "PENDING"}
+        <p class="placeholder-pending">Article body extraction pending</p>
+      {:else if slot.detail?.extractionStatus === "FAILED"}
+        <p class="placeholder-pending">Article body extraction failed</p>
+      {:else if slot.detail}
+        <p class="placeholder-pending">No body available</p>
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sectionNearDup(slot: ArticleSlot)}
+    <div class="compare-section">
+      {#if slot.detail && slot.detail.nearDuplicatePeers.length > 0}
+        <div class="other-coverage">
+          <h4 class="other-coverage-title">Also covered by</h4>
+          <ul class="other-coverage-list">
+            {#each slot.detail.nearDuplicatePeers as peer (peer.articleId)}
+              <li class="other-coverage-item">
+                <a class="other-coverage-link" href={articlePath(peer.articleId)} on:click={(event) => handleInternalNavigation(event, articlePath(peer.articleId))}>
+                  <img class="favicon" src={faviconUrl(peer.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
+                  <span class="other-coverage-domain">{peer.domain}</span>
+                  <span class="other-coverage-headline">{peer.title}</span>
+                </a>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sentimentPill(score: number)}
+    {@const tone = score > 0.01 ? "positive" : score < -0.01 ? "negative" : "neutral"}
+    {@const label = tone === "positive" ? "Positive" : tone === "negative" ? "Negative" : "Neutral"}
+    <span class={`sentiment-pill sentiment-pill--${tone}`} title={`Sentiment score ${score.toFixed(4)}`}>
+      {label}{#if tone !== "neutral"} {score.toFixed(2)}{/if}
+    </span>
+  {/snippet}
+
+  {#snippet sectionSentiment(slot: ArticleSlot)}
+    <div class="compare-section">
+      {#if slot.detail}
+        {@render sentimentPill(slot.detail.sentiment)}
+      {/if}
+    </div>
+  {/snippet}
+
+  {#snippet sectionTags(slot: ArticleSlot)}
+    <section class="aside-block compare-section">
+      <h4 class="aside-title">Tags</h4>
+      {#if slot.detail && slot.detail.keywords.length > 0}
+        <div class="chip-row">
+          {#each slot.detail.keywords as keyword}
+            <a href={tagPath(keyword)} class="chip" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+          {/each}
+        </div>
+      {:else}
+        <p class="placeholder-pending">Tags pending</p>
+      {/if}
+    </section>
+  {/snippet}
+
+  {#snippet sectionPerspective(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
+    <section class="aside-block compare-section">
+      <h4 class="aside-title">Distinctive vs. other sources</h4>
+      {#if slot.perspectiveWords.length > 0}
+        <p class="aside-hint">Hover a term to highlight it in the article.</p>
+        <div class="chip-row">
+          {#each slot.perspectiveWords as word}
+            <span
+              class="chip perspective-word-chip"
+              class:active={slot.hoveredPerspective === word}
+              on:mouseenter={() => applyPatch({ hoveredPerspective: word })}
+              on:mouseleave={() => applyPatch({ hoveredPerspective: null })}
+              on:focus={() => applyPatch({ hoveredPerspective: word })}
+              on:blur={() => applyPatch({ hoveredPerspective: null })}
+              role="button"
+              tabindex="0"
+            >{word}</span>
+          {/each}
+        </div>
+      {:else if slot.perspectiveLoading}
+        <p class="signals">Loading distinctive words…</p>
+      {:else}
+        <p class="placeholder-pending">Distinctive words pending</p>
+      {/if}
+    </section>
+  {/snippet}
+
+  {#snippet sectionEntities(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
+    <section class="aside-block compare-section">
+      <h4 class="aside-title">Named entities</h4>
+      {#if slot.entities.length > 0}
+        <EntityStats
+          entities={slot.entities}
+          selectedEntityId={slot.selectedEntity?.id ?? null}
+          onEntitySelect={(entity) => applyPatch({ selectedEntity: entity })}
+        />
+      {:else if slot.entitiesLoading}
+        <p class="signals">Loading entities…</p>
+      {:else if slot.entitiesError}
+        <p class="entity-error">{slot.entitiesError}</p>
+      {:else}
+        <p class="placeholder-pending">Named entities pending</p>
+      {/if}
+    </section>
+  {/snippet}
 
   {#if currentView.kind === "about"}
     <section class="panel focus-page about-page" use:debugComponent={componentLabel("AboutPage")}>
@@ -1604,22 +1805,23 @@
           </div>
         </div>
 
-        <section class="detail panel" use:debugComponent={componentLabel("StoryDetail", section.date)}>
+        <section class="detail panel" use:debugComponent={componentLabel("ClusterSummary", section.date)}>
           {#if section.selectedStory}
-            <div use:debugComponent={componentLabel("DetailHeader", shortId(section.selectedStory.id))}>
-              <StoryDetailPanel
+            <div use:debugComponent={componentLabel("ClusterSummaryHeader", shortId(section.selectedStory.id))}>
+              <ClusterSummary
                 story={section.selectedStory}
                 comparison={section.comparison}
                 {articlePath}
+                {storyPath}
                 {sourcePath}
                 {tagPath}
+                {datePath}
                 {faviconUrl}
                 {formatDateRange}
                 {formatScopeLabel}
                 {otherSourceCount}
                 onNavigate={handleInternalNavigation}
                 onFaviconError={handleFaviconError}
-                apiBase={API_BASE}
               />
             </div>
           {:else}
@@ -2347,6 +2549,13 @@
     font-style: italic;
   }
 
+  .placeholder-pending {
+    margin: 0;
+    color: var(--muted, #58708f);
+    font-size: 0.85rem;
+    font-style: italic;
+  }
+
   :global(mark.perspective-word) {
     background: #fff3b0;
     color: inherit;
@@ -2403,6 +2612,12 @@
     gap: 6px;
     color: var(--muted, #58708f);
     font-size: 0.88rem;
+    position: relative;
+    z-index: 11; /* sit above the next `.detail-head` so its negative margin doesn't clip the back button */
+  }
+
+  .story-page > .article-header-strip {
+    margin-bottom: 8px;
   }
 
   .article-header-strip .eyebrow {
@@ -2412,6 +2627,15 @@
     letter-spacing: 0.05em;
     font-size: 0.74rem;
     color: var(--muted, #58708f);
+  }
+
+  a.article-eyebrow-link {
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(88, 112, 143, 0.5);
+  }
+  a.article-eyebrow-link:hover {
+    color: var(--accent-strong, #0a3c96);
+    border-bottom-color: currentColor;
   }
 
   .article-header-sep {
@@ -2433,6 +2657,31 @@
     margin-left: auto;
     display: flex;
     gap: 8px;
+  }
+
+  .compare-page {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .compare-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-auto-rows: min-content;
+    gap: 14px 18px;
+    align-items: stretch;
+  }
+
+  .compare-section {
+    min-width: 0;
+    align-self: stretch;
+  }
+
+  @media (max-width: 1100px) {
+    .compare-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
   .article-layout {
@@ -2516,6 +2765,19 @@
     font-weight: 600;
     letter-spacing: 0.04em;
   }
+
+  .sentiment-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1.4;
+  }
+  .sentiment-pill--positive { background: #dff5e1; color: #1e6b3a; }
+  .sentiment-pill--neutral  { background: #eef0f4; color: #4a5568; }
+  .sentiment-pill--negative { background: #fde2e4; color: #8b1e3f; }
 
   .tab--primary {
     background: linear-gradient(135deg, var(--accent), var(--accent-strong));

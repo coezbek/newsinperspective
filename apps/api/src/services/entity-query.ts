@@ -117,10 +117,13 @@ class EntityQueryService {
     articleId: string,
     filter: ArticleEntitiesFilter = {}
   ) {
-    const limit = filter.limit ?? 50;
     const minConfidence = filter.minConfidence ?? 0;
 
-    let query = this.prisma.entityMention.findMany({
+    // Return one row per distinct entity in the article. The frontend
+    // highlighter matches surface forms client-side, so we no longer paginate
+    // per-occurrence rows or carry offsets — we only need the entity metadata
+    // (Wikipedia link, summary, image, type) plus how many times it appears.
+    const mentions = await this.prisma.entityMention.findMany({
       where: {
         articleId,
         confidence: { gte: minConfidence },
@@ -129,20 +132,28 @@ class EntityQueryService {
       include: {
         entity: true,
       },
-      orderBy: { confidence: "desc" },
-      take: limit,
+      orderBy: { startOffset: "asc" },
     });
 
-    const mentions = await query;
+    const byEntity = new Map<
+      string,
+      { mention: typeof mentions[number]; count: number }
+    >();
+    for (const mention of mentions) {
+      const existing = byEntity.get(mention.entity.id);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        byEntity.set(mention.entity.id, { mention, count: 1 });
+      }
+    }
 
-    // Map to response format (LinkedEntity-like structure)
-    return mentions.map((mention) => ({
+    return Array.from(byEntity.values()).map(({ mention, count }) => ({
       id: mention.entity.id,
       entityText: mention.entity.name,
       entityType: mention.entity.type,
       confidence: mention.confidence ?? 0,
-      startOffset: mention.startOffset,
-      endOffset: mention.endOffset,
+      mentionCount: count,
       context: mention.context,
       articleId: mention.articleId,
       wikipediaUrl: mention.entity.wikipediaUrl,
