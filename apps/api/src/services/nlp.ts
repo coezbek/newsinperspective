@@ -32,6 +32,7 @@ export function buildArticleFeatures(
     language: detectedLanguage,
     translatedTitle: null,
     translatedSummary: null,
+    translatedFullText: null,
   };
 }
 
@@ -71,6 +72,7 @@ export async function buildArticleFeaturesWithOpenRouter(
     language: openrouter.language ?? base.language,
     translatedTitle: openrouter.translatedTitle ?? base.translatedTitle,
     translatedSummary: openrouter.translatedSummary ?? base.translatedSummary,
+    translatedFullText: openrouter.translatedFullText ?? base.translatedFullText,
   };
 }
 

@@ -1,5 +1,7 @@
 import { env } from "../config/env.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
+import { callOpenAIFallback } from "./openai-fallback.js";
+import { withLlmCache } from "./llm-cache.js";
 
 interface OpenRouterKeywordInput {
   title: string;
@@ -104,6 +106,24 @@ export async function extractKeywordsWithOpenRouter(
     `Body: ${input.body ?? ""}`,
   ].join("\n");
 
+  return withLlmCache(
+    { kind: "openrouter-keywords", prompt },
+    () => runKeywordRequest(input, prompt, models, primaryModel, maxKeywords, log),
+    {
+      shouldCache: (result) => result.error === null,
+      onAttemptLog: log,
+    },
+  );
+}
+
+async function runKeywordRequest(
+  input: OpenRouterKeywordInput,
+  prompt: string,
+  models: string[],
+  primaryModel: string,
+  maxKeywords: number,
+  log: ((message: string) => void) | undefined,
+): Promise<OpenRouterKeywordResult> {
   let lastError = "OpenRouter request failed";
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
 
@@ -195,6 +215,20 @@ export async function extractKeywordsWithOpenRouter(
       `round ${round + 1}/${maxRounds}: backing off for ${Math.ceil(backoffMs / 1000)}s before retry`,
     );
     await sleep(backoffMs);
+  }
+
+  // OpenRouter exhausted — fall back to OpenAI direct if configured.
+  const fallback = await callOpenAIFallback({ prompt, onAttemptLog: log });
+  if (fallback) {
+    const keywords = parseKeywordsFromResponse(fallback.content).slice(0, maxKeywords);
+    if (keywords.length > 0) {
+      return {
+        keywords,
+        model: fallback.model,
+        error: null,
+      };
+    }
+    log?.(`openai-fallback: ${fallback.model} parse failure`);
   }
 
   return {

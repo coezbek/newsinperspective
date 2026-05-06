@@ -1,12 +1,25 @@
+// Default free-model rotation, refreshed against
+// https://openrouter.ai/collections/free-models. Ordered roughly by reliability
+// for our JSON-output workload: structured-output / function-calling models
+// first, then strong general models, then long-context fallbacks.
 const defaultFreeModels = [
-  "nvidia/nemotron-3-super-120b-a12b:free",
+  // Best JSON / structured-output support
+  "openai/gpt-oss-120b:free",
   "google/gemma-4-31b-it:free",
-  "qwen/qwen3-next-80b-a3b-instruct:free",
-  "qwen/qwen3-coder:free",
+  "google/gemma-4-26b-a4b-it:free",
+  "openai/gpt-oss-20b:free",
+  // Strong general models with tool use / reasoning
+  "tencent/hy3-preview:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "inclusionai/ling-2.6-1t:free",
+  "z-ai/glm-4.5-air:free",
+  "minimax/minimax-m2.5:free",
+  // Long context fallbacks and smaller models
   "openrouter/owl-alpha",
   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-  "poolside/laguna-xs.2:free",
+  "nvidia/nemotron-3-nano-30b-a3b:free",
   "poolside/laguna-m.1:free",
+  "poolside/laguna-xs.2:free",
 ];
 
 function positiveModulo(value: number, divisor: number): number {

@@ -1,0 +1,15 @@
+[project]
+name = "nip-perspective-sidecar"
+version = "0.1.0"
+description = "SBERT + RoBERTa + TF-IDF sidecar for News In Perspective"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "numpy>=1.26",
+    "scikit-learn>=1.5",
+    "sentence-transformers>=3.0",
+    "transformers>=4.45",
+    "torch>=2.3",
+]

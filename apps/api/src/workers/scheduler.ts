@@ -1,7 +1,7 @@
+import { PipelineTrigger } from "@prisma/client";
 import { env } from "../config/env.js";
+import { pipelineRunner } from "../services/pipeline-runner.js";
 import { getCurrentDateString } from "../lib/runtime-date.js";
-import { runIngestion } from "../services/ingestion.js";
-import { runOpenRouterBacklog } from "../services/openrouter-backlog.js";
 
 function msUntilNextRun(timeUtc: string): number {
   const [hours, minutes] = timeUtc.split(":").map(Number);
@@ -14,20 +14,39 @@ function msUntilNextRun(timeUtc: string): number {
   return next.getTime() - now.getTime();
 }
 
+export function nextScheduledRun(timeUtc: string): Date {
+  return new Date(Date.now() + msUntilNextRun(timeUtc));
+}
+
 export function startScheduler(): void {
   if (!env.AUTO_INGEST) return;
 
   const scheduleNext = () => {
     const wait = msUntilNextRun(env.AUTO_INGEST_TIME_UTC);
     setTimeout(async () => {
-      const date = getCurrentDateString();
       try {
-        await runIngestion(date);
-        void runOpenRouterBacklog({
-          date,
-          articleLimit: 25,
-          clusterLimit: 10,
-          sourceLimit: 10,
+        const snapshotDate = getCurrentDateString();
+        await pipelineRunner.enqueue({
+          kind: "kagi-ingest",
+          trigger: PipelineTrigger.SCHEDULED,
+        });
+        await pipelineRunner.enqueue({
+          kind: "openrouter-backlog",
+          target: snapshotDate,
+          trigger: PipelineTrigger.SCHEDULED,
+        });
+        await pipelineRunner.enqueue({
+          kind: "entity-re-enrich",
+          target: snapshotDate,
+          trigger: PipelineTrigger.SCHEDULED,
+        });
+        await pipelineRunner.enqueue({
+          kind: "cluster-perspective-backfill",
+          trigger: PipelineTrigger.SCHEDULED,
+        });
+        await pipelineRunner.enqueue({
+          kind: "perspective-calibrate",
+          trigger: PipelineTrigger.SCHEDULED,
         });
       } finally {
         scheduleNext();

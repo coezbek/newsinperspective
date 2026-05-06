@@ -5,6 +5,17 @@ import { Browser, chromium } from "playwright";
 import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { assessExtractedArticleText } from "./content-quality.js";
+import { DiskCache } from "./disk-cache.js";
+
+// Browser extraction is the slowest stage of ingest (~5–10s per page);
+// cache successful results keyed by URL with a 7-day TTL.
+const ARTICLE_TEXT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const articleTextCache = new DiskCache<ExtractedArticleText>({
+  namespace: "articles",
+  ttlMs: ARTICLE_TEXT_TTL_MS,
+  disableEnvVar: "ARTICLE_TEXT_CACHE_DISABLE",
+  dirEnvVar: "ARTICLE_TEXT_CACHE_DIR",
+});
 
 const MAX_TEXT_LENGTH = 100_000;
 let browserPromise: Promise<Browser> | null = null;
@@ -132,6 +143,20 @@ export async function resolveUrlWithBrowser(url: string): Promise<string> {
 }
 
 export async function extractArticleTextFromUrl(url: string): Promise<ExtractedArticleText> {
+  // Cache only successful extractions. Failures (semantic-content / no-text)
+  // throw and bypass the cache, so a flaky failure won't lock in for 7 days.
+  const cacheKey = articleTextCache.keyFor(url);
+  const cached = await articleTextCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const result = await runArticleTextExtraction(url);
+  await articleTextCache.set(cacheKey, result);
+  return result;
+}
+
+async function runArticleTextExtraction(url: string): Promise<ExtractedArticleText> {
   const browserResult = await fetchArticleHtmlWithBrowser(url);
   const browserExtracted = extractTextFromHtml(browserResult.html, browserResult.finalUrl, "browser:");
   if (browserExtracted) {

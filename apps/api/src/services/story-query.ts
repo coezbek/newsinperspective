@@ -1,5 +1,5 @@
 import { ScopeType } from "@prisma/client";
-import type { SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
+import type { ArticleDetail, SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 import { extractRegion } from "../domain/category.js";
 import { computeAuthorityStats, isGlobalTierDomain, scoreDomainAuthority } from "../domain/source-ranking.js";
 import { prisma } from "../lib/prisma.js";
@@ -464,6 +464,7 @@ export async function listStoriesByDate(
       dateUntil,
       importanceScore,
       title: row.title,
+      translatedTitle: row.translatedTitle,
       region: extractRegion(row.topCategory),
       category: row.topCategory,
       articleCount: row.articleCount,
@@ -552,18 +553,29 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       | { keywords?: string[]; sentiment?: number; subjectivity?: number; biasSignals?: string[] }
       | undefined;
 
+    const isEnglish = !article.language || article.language.toLowerCase().slice(0, 2) === "en";
+    const listFullText = !isEnglish && article.translatedFullText && article.translatedFullText.trim().length > 0
+      ? article.translatedFullText
+      : article.fullText;
+    const listTitle = !isEnglish && article.translatedTitle && article.translatedTitle.trim().length > 0
+      ? article.translatedTitle
+      : article.title;
+    const listSummary = !isEnglish && article.translatedSummary
+      ? article.translatedSummary
+      : article.summary;
+
     return {
       id: article.id,
-      title: article.title,
+      title: listTitle,
       url: article.canonicalUrl,
       domain: article.domain,
       syndicatedDomains: article.duplicateDomains,
       sourceName: article.sourceName,
       publishedAt: article.publishedAt?.toISOString() ?? new Date().toISOString(),
       summary: safeDisplaySummary({
-        summary: article.summary,
+        summary: listSummary,
         contentSnippet: article.contentSnippet,
-        fullText: article.fullText,
+        fullText: listFullText,
       }),
       contentSnippet: null,
       fullText: null,
@@ -676,6 +688,7 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
     dateUntil,
     importanceScore,
     title: row.title,
+    translatedTitle: row.translatedTitle,
     region: extractRegion(row.topCategory),
     category: row.topCategory,
     articleCount: row.articleCount,
@@ -707,9 +720,7 @@ export async function getStoryComparison(id: string): Promise<StoryComparison | 
     sharedKeywords: article.keywords.filter((keyword) => sharedKeywords.includes(keyword)),
   }));
 
-  const framingSummary = [
-    "Bias signals observed: <not yet determined>.",
-  ];
+  const framingSummary: string[] = [];
 
   return {
     storyId: detail.id,
@@ -717,11 +728,102 @@ export async function getStoryComparison(id: string): Promise<StoryComparison | 
     dateFrom: detail.dateFrom,
     dateUntil: detail.dateUntil,
     title: detail.title,
+    translatedTitle: detail.translatedTitle,
     sharedKeywords,
     commonEntities,
     domainSpread: detail.topDomains,
     framingSummary,
     articleComparisons,
+  };
+}
+
+export async function getArticleDetail(id: string): Promise<ArticleDetail | null> {
+  const article = await prisma.article.findUnique({
+    where: { id },
+    include: {
+      features: {
+        where: { scopeType: ScopeType.ARTICLE },
+        take: 1,
+      },
+      clusterLinks: {
+        include: {
+          cluster: true,
+        },
+        orderBy: [{ cluster: { storyDate: "desc" } }, { rank: "asc" }],
+        take: 1,
+      },
+    },
+  });
+
+  if (!article) return null;
+
+  // Display in English: when the source is non-English and a translation exists,
+  // return the translated body. Entity offsets were computed against this same
+  // translated text, so the highlighter stays aligned.
+  const isEnglish = !article.language || article.language.toLowerCase().slice(0, 2) === "en";
+  const hasTranslatedBody = !!(article.translatedFullText && article.translatedFullText.trim().length > 0);
+  const displayFullText = !isEnglish && hasTranslatedBody
+    ? article.translatedFullText
+    : article.fullText;
+  const fullTextIsTranslated = !isEnglish && hasTranslatedBody;
+  const hasTranslatedTitle = !!(article.translatedTitle && article.translatedTitle.trim().length > 0);
+  const displayTitle = !isEnglish && hasTranslatedTitle
+    ? article.translatedTitle!
+    : article.title;
+  const originalTitle: string | null = !isEnglish && hasTranslatedTitle ? article.title : null;
+
+  const feature = article.features[0]?.featureSet as ArticleFeaturePayload | undefined;
+  const relatedStory = article.clusterLinks[0]?.clusterId
+    ? await getStoryDetail(article.clusterLinks[0].clusterId)
+    : null;
+  const nearDuplicatePeers = relatedStory?.articles
+    .filter((peer) => peer.id !== article.id)
+    .filter((peer) => article.duplicateDomains.includes(peer.domain.trim().toLowerCase()))
+    .map((peer) => ({
+      articleId: peer.id,
+      title: peer.title,
+      domain: peer.domain,
+      url: peer.url,
+    })) ?? [];
+
+  return {
+    id: article.id,
+    title: displayTitle,
+    originalTitle,
+    language: article.language ?? null,
+    url: article.canonicalUrl,
+    domain: article.domain,
+    syndicatedDomains: article.duplicateDomains,
+    nearDuplicatePeers,
+    sourceName: article.sourceName,
+    publishedAt: article.publishedAt?.toISOString() ?? article.createdAt.toISOString(),
+    summary: safeDisplaySummary({
+      summary: !isEnglish && article.translatedSummary ? article.translatedSummary : article.summary,
+      contentSnippet: article.contentSnippet,
+      fullText: displayFullText,
+    }),
+    contentSnippet: article.contentSnippet,
+    fullText: displayFullText,
+    fullTextIsTranslated,
+    extractionStatus: article.extractionStatus,
+    keywords: feature?.keywords ?? [],
+    sentiment: feature?.sentiment ?? 0,
+    subjectivity: feature?.subjectivity ?? 0,
+    biasSignals: feature?.biasSignals ?? [],
+    relatedStory: relatedStory
+      ? {
+          id: relatedStory.id,
+          title: relatedStory.title,
+          translatedTitle: relatedStory.translatedTitle,
+          date: relatedStory.date,
+          dateFrom: relatedStory.dateFrom,
+          dateUntil: relatedStory.dateUntil,
+          region: relatedStory.region,
+          category: relatedStory.category,
+          articleCount: relatedStory.articleCount,
+          sourceCount: relatedStory.sourceCount,
+        }
+      : null,
   };
 }
 

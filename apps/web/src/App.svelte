@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
+  import EntityHighlighter from "./components/EntityHighlighter.svelte";
+  import EntityPopover from "./components/EntityPopover.svelte";
+  import EntityStats from "./components/EntityStats.svelte";
+  import StoryDetailPanel from "./components/StoryDetailPanel.svelte";
+  import PipelinePage from "./components/PipelinePage.svelte";
+  import PerspectiveStatsPage from "./components/PerspectiveStatsPage.svelte";
+  import type { ArticleDetail, LinkedEntity, SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 
   const API_BASE =
     typeof window !== "undefined"
@@ -9,7 +15,6 @@
   const STORIES_PER_DAY = 10;
   const DEVTOOLS_LABEL_CLASS = "debug-component-labels";
   const DEVTOOLS_OVERLAY_CLASS = "debug-component-overlay";
-  const DEVTOOLS_OPEN_THRESHOLD = 160;
 
   interface DaySection {
     date: string;
@@ -24,8 +29,14 @@
 
   type ViewState =
     | { kind: "feed" }
+    | { kind: "date"; date: string }
     | { kind: "source"; domain: string }
-    | { kind: "tag"; keyword: string };
+    | { kind: "tag"; keyword: string }
+    | { kind: "story"; id: string }
+    | { kind: "article"; id: string }
+    | { kind: "about" }
+    | { kind: "pipeline" }
+    | { kind: "perspective" };
 
   let dates: string[] = [];
   let startDate = "";
@@ -39,6 +50,23 @@
   let tagProfile: TagProfileDto | null = null;
   let tagLoading = false;
   let tagError = "";
+  let storyPageDetail: StoryDetail | null = null;
+  let storyPageComparison: StoryComparison | null = null;
+  let storyPageLoading = false;
+  let storyPageError = "";
+  let articlePageDetail: ArticleDetail | null = null;
+  let articlePageLoading = false;
+  let articlePageError = "";
+  let articlePageEntities: LinkedEntity[] = [];
+  let articlePageEntitiesLoading = false;
+  let articlePageEntitiesError = "";
+  let articlePageSelectedEntity: LinkedEntity | null = null;
+  let articlePagePerspectiveWords: string[] = [];
+  let articlePagePerspectiveLoading = false;
+  let articlePageHoveredPerspective: string | null = null;
+  $: articlePageActivePerspective = articlePageHoveredPerspective ? [articlePageHoveredPerspective] : [];
+  $: articlePagePublishedDate = articlePageDetail?.publishedAt.slice(0, 10) ?? "";
+  $: articlePageFeedDate = articlePageDetail?.relatedStory?.date ?? articlePagePublishedDate;
   let globalError = "";
   let loadingNextDate = false;
   let nextDateCursor = 0;
@@ -57,10 +85,9 @@
     requestDebugRender();
   }
 
-  function devtoolsAreOpen(): boolean {
+  function debugFlagEnabled(): boolean {
     if (typeof window === "undefined") return false;
-    return window.outerWidth - window.innerWidth > DEVTOOLS_OPEN_THRESHOLD
-      || window.outerHeight - window.innerHeight > DEVTOOLS_OPEN_THRESHOLD;
+    return new URLSearchParams(window.location.search).get("debug") === "1";
   }
 
   function shortId(value: string, max = 10): string {
@@ -282,6 +309,18 @@
     return `/tag/${encodeURIComponent(keyword)}`;
   }
 
+  function storyPath(id: string): string {
+    return `/stories/${encodeURIComponent(id)}`;
+  }
+
+  function datePath(date: string): string {
+    return `/date/${encodeURIComponent(date)}`;
+  }
+
+  function articlePath(id: string): string {
+    return `/articles/${encodeURIComponent(id)}`;
+  }
+
   function activeKeywordFilter(): string {
     return currentView.kind === "tag" ? currentView.keyword : "";
   }
@@ -295,6 +334,33 @@
     const tagMatch = pathname.match(/^\/tag\/(.+)$/);
     if (tagMatch?.[1]) {
       return { kind: "tag", keyword: decodeURIComponent(tagMatch[1]) };
+    }
+
+    const storyMatch = pathname.match(/^\/stories\/(.+)$/);
+    if (storyMatch?.[1]) {
+      return { kind: "story", id: decodeURIComponent(storyMatch[1]) };
+    }
+
+    const articleMatch = pathname.match(/^\/articles\/(.+)$/);
+    if (articleMatch?.[1]) {
+      return { kind: "article", id: decodeURIComponent(articleMatch[1]) };
+    }
+
+    const dateMatch = pathname.match(/^\/date\/(\d{4}-\d{2}-\d{2})$/);
+    if (dateMatch?.[1]) {
+      return { kind: "date", date: dateMatch[1] };
+    }
+
+    if (pathname === "/about") {
+      return { kind: "about" };
+    }
+
+    if (pathname === "/pipeline") {
+      return { kind: "pipeline" };
+    }
+
+    if (pathname === "/perspective") {
+      return { kind: "perspective" };
     }
 
     return { kind: "feed" };
@@ -332,6 +398,54 @@
 
   function getSection(date: string): DaySection | undefined {
     return daySections.find((section) => section.date === date);
+  }
+
+  function escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function highlightWords(text: string, words: string[]): string {
+    const escaped = escapeHtml(text);
+    if (!words || words.length === 0) return escaped;
+    const sorted = [...new Set(words.filter((w) => w.trim().length > 0))].sort((a, b) => b.length - a.length);
+    if (sorted.length === 0) return escaped;
+    const pattern = new RegExp(`\\b(${sorted.map(escapeRegex).join("|")})\\b`, "gi");
+    return escaped.replace(pattern, '<mark class="perspective-word">$1</mark>');
+  }
+
+  function splitParagraphs(text: string): Array<{ text: string; entities: LinkedEntity[]; offset: number }> {
+    if (!text) return [];
+    const out: Array<{ text: string; entities: LinkedEntity[]; offset: number }> = [];
+    const re = /\n\s*\n+/g;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    const pushChunk = (start: number, end: number) => {
+      const chunk = text.slice(start, end);
+      const trimmed = chunk.trim();
+      if (!trimmed) return;
+      const trimStart = chunk.indexOf(trimmed);
+      const absStart = start + trimStart;
+      const absEnd = absStart + trimmed.length;
+      const ents = articlePageEntities
+        .filter((e) => e.startOffset >= absStart && e.endOffset <= absEnd)
+        .map((e) => ({ ...e, startOffset: e.startOffset - absStart, endOffset: e.endOffset - absStart }));
+      out.push({ text: trimmed, entities: ents, offset: absStart });
+    };
+    while ((match = re.exec(text)) !== null) {
+      pushChunk(lastIndex, match.index);
+      lastIndex = match.index + match[0].length;
+    }
+    pushChunk(lastIndex, text.length);
+    return out;
   }
 
   async function fetchJson<T>(path: string): Promise<T> {
@@ -535,6 +649,72 @@
     }
   }
 
+  async function loadStoryPage(id: string): Promise<void> {
+    storyPageLoading = true;
+    storyPageError = "";
+    storyPageDetail = null;
+    storyPageComparison = null;
+
+    try {
+      const [detail, comparison] = await Promise.all([
+        fetchJson<StoryDetail>(`/api/stories/${id}`),
+        fetchJson<StoryComparison>(`/api/stories/${id}/comparison`),
+      ]);
+      storyPageDetail = detail;
+      storyPageComparison = comparison;
+    } catch (value) {
+      storyPageError = value instanceof Error ? value.message : "Failed to load story";
+    } finally {
+      storyPageLoading = false;
+    }
+  }
+
+  async function loadArticlePage(id: string): Promise<void> {
+    articlePageLoading = true;
+    articlePageError = "";
+    articlePageDetail = null;
+    articlePageEntities = [];
+    articlePageEntitiesError = "";
+    articlePageSelectedEntity = null;
+    articlePagePerspectiveWords = [];
+    articlePagePerspectiveLoading = false;
+
+    try {
+      articlePageDetail = await fetchJson<ArticleDetail>(`/api/articles/${id}`);
+      articlePageEntitiesLoading = true;
+      try {
+        const entityResponse = await fetchJson<{ entities: LinkedEntity[] }>(`/api/articles/${id}/entities?minConfidence=0.2&limit=50`);
+        articlePageEntities = entityResponse.entities ?? [];
+      } catch (value) {
+        articlePageEntitiesError = value instanceof Error ? value.message : "Failed to load entities";
+      } finally {
+        articlePageEntitiesLoading = false;
+      }
+      const clusterId = articlePageDetail?.relatedStory?.id;
+      const sourceName = articlePageDetail?.sourceName;
+      if (clusterId && sourceName) {
+        articlePagePerspectiveLoading = true;
+        try {
+          const perspective = await fetchJson<{ distinctive_words: { source_name: string; words: string[] }[] }>(
+            `/api/clusters/${encodeURIComponent(clusterId)}/perspective`,
+          );
+          const target = sourceName.toLowerCase();
+          const row = perspective.distinctive_words.find((r) => r.source_name.toLowerCase() === target);
+          articlePagePerspectiveWords = row?.words ?? [];
+        } catch {
+          articlePagePerspectiveWords = [];
+        } finally {
+          articlePagePerspectiveLoading = false;
+        }
+      }
+    } catch (value) {
+      articlePageError = value instanceof Error ? value.message : "Failed to load article";
+      articlePageEntitiesLoading = false;
+    } finally {
+      articlePageLoading = false;
+    }
+  }
+
   async function syncRouteFromLocation(): Promise<void> {
     if (typeof window === "undefined") return;
     currentView = parseViewFromPath(window.location.pathname);
@@ -549,7 +729,39 @@
       return;
     }
 
+    if (currentView.kind === "story") {
+      await loadStoryPage(currentView.id);
+      return;
+    }
+
+    if (currentView.kind === "article") {
+      await loadArticlePage(currentView.id);
+      return;
+    }
+
+    if (currentView.kind === "about") {
+      return;
+    }
+
+    if (currentView.kind === "pipeline") {
+      return;
+    }
+
     await ensureFeedDatesLoaded();
+
+    if (currentView.kind === "date") {
+      const requested = currentView.date;
+      const sig = `date:${requested}`;
+      if (loadedFeedSignature !== sig || daySections.length === 0) {
+        daySections = [];
+        nextDateCursor = dates.length; // disable infinite scroll
+        loadedFeedSignature = sig;
+        globalError = "";
+        await appendDateSection(requested);
+      }
+      return;
+    }
+
     const nextSignature = "feed";
     if ((daySections.length === 0 || loadedFeedSignature !== nextSignature) && dates[0]) {
       await resetFeed();
@@ -584,20 +796,12 @@
   }
 
   onMount(() => {
-    let devtoolsInterval: number | null = null;
-    let syncDevtools: (() => void) | null = null;
     const handlePopState = () => {
       void syncRouteFromLocation();
     };
 
-    if (import.meta.env.DEV) {
-      syncDevtools = () => {
-        setComponentLabelVisibility(devtoolsAreOpen());
-      };
-
-      syncDevtools();
-      devtoolsInterval = window.setInterval(syncDevtools, 900);
-      window.addEventListener("resize", syncDevtools);
+    if (import.meta.env.DEV && debugFlagEnabled()) {
+      setComponentLabelVisibility(true);
       window.addEventListener("resize", requestDebugRender);
       window.addEventListener("scroll", requestDebugRender, true);
       document.addEventListener("mouseover", handleDebugPointer, true);
@@ -614,12 +818,6 @@
     });
 
     return () => {
-      if (devtoolsInterval !== null) {
-        window.clearInterval(devtoolsInterval);
-      }
-      if (syncDevtools) {
-        window.removeEventListener("resize", syncDevtools);
-      }
       window.removeEventListener("resize", requestDebugRender);
       window.removeEventListener("scroll", requestDebugRender, true);
       window.removeEventListener("popstate", handlePopState);
@@ -638,18 +836,30 @@
 </script>
 
 <svelte:head>
-  <title>
-    {currentView.kind === "source"
-      ? `${currentView.domain} · NewsInPerspective`
-      : currentView.kind === "tag"
+    <title>
+      {currentView.kind === "source"
+        ? `${currentView.domain} · NewsInPerspective`
+        : currentView.kind === "tag"
         ? `${currentView.keyword} · NewsInPerspective`
-        : "NewsInPerspective"}
+        : currentView.kind === "story" && storyPageDetail
+          ? `${storyPageDetail.translatedTitle ?? storyPageDetail.title} · NewsInPerspective`
+          : currentView.kind === "article" && articlePageDetail
+            ? `${articlePageDetail.title} · NewsInPerspective`
+          : currentView.kind === "date"
+            ? `${currentView.date} · NewsInPerspective`
+          : currentView.kind === "about"
+            ? "About · NewsInPerspective"
+            : currentView.kind === "perspective"
+              ? "Perspective stats · NewsInPerspective"
+              : "NewsInPerspective"}
   </title>
 </svelte:head>
 
 <main class="shell" use:debugComponent={componentLabel("AppShell")}>
   <section class="hero panel" use:debugComponent={componentLabel("HeroPanel")}>
-    <p class="eyebrow">NewsInPerspective</p>
+    <p class="eyebrow brand-line">
+      <a href="/" class="brand-link" on:click={(event) => handleInternalNavigation(event, "/")}>NewsInPerspective</a>
+    </p>
     <div class="hero-row">
       <div>
         <h1>See how the same story moves across outlets, regions, and days.</h1>
@@ -659,16 +869,22 @@
             Scroll down to load the next day.
           {:else if currentView.kind === "source"}
             Source profiles combine outlet metadata with the stories currently associated with that domain.
+          {:else if currentView.kind === "story"}
+            Story pages show the full cross-source cluster detail and give each cluster a stable route.
+          {:else if currentView.kind === "article"}
+            Article pages focus on one source version of a story and are the best place for article-level enrichment.
           {:else}
             Keyword pages show where a topic appears, which sources publish it, and what other entities travel with it.
           {/if}
         </p>
       </div>
 
-      <button class="settings-button" type="button" on:click={() => (settingsOpen = !settingsOpen)}>
-        <span aria-hidden="true">⚙</span>
-        <span>Settings</span>
-      </button>
+      {#if currentView.kind === "feed"}
+        <button class="settings-button" type="button" on:click={() => (settingsOpen = !settingsOpen)}>
+          <span aria-hidden="true">⚙</span>
+          <span>Settings</span>
+        </button>
+      {/if}
     </div>
 
     {#if settingsOpen && currentView.kind === "feed"}
@@ -777,11 +993,10 @@
                 <span class="meta">
                   {formatCategoryLabel(story.category)} · {story.importanceScore} score · {story.sourceCount} sources
                 </span>
-                <strong>{story.title}</strong>
+                <strong><a href={storyPath(story.id)} on:click={(event) => handleInternalNavigation(event, storyPath(story.id))}>{story.translatedTitle ?? story.title}</a></strong>
                 <span class="signals">{formatDateRange(story.dateFrom, story.dateUntil)}</span>
                 <span class="story-keywords">
-                  {#each story.keywords as keyword, index}
-                    {#if index > 0}, {/if}
+                  {#each story.keywords as keyword}
                     <a href={tagPath(keyword)} on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
                   {/each}
                 </span>
@@ -843,11 +1058,336 @@
             </div>
           </section>
         </div>
+
+        <section class="panel inset-panel">
+          <p class="eyebrow">Stories Using This Keyword</p>
+          <div class="stories">
+            {#each tagProfile.stories as story}
+              <article class="story-card">
+                <span class="meta">
+                  {formatCategoryLabel(story.category)} · {story.importanceScore} score · {story.sourceCount} sources
+                </span>
+                <strong><a href={storyPath(story.id)} on:click={(event) => handleInternalNavigation(event, storyPath(story.id))}>{story.translatedTitle ?? story.title}</a></strong>
+                <span class="signals">{formatDateRange(story.dateFrom, story.dateUntil)}</span>
+                <span class="story-keywords">
+                  {#each story.keywords as keyword}
+                    <a href={tagPath(keyword)} on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                  {/each}
+                </span>
+              </article>
+            {/each}
+          </div>
+        </section>
+      {/if}
+    </section>
+  {:else if currentView.kind === "story"}
+    <section class="panel focus-page" use:debugComponent={componentLabel("StoryPage", shortId(currentView.id))}>
+      <div class="detail-head" use:debugComponent={componentLabel("StoryPageHeader", shortId(currentView.id))}>
+        <div>
+          <p class="eyebrow">Story</p>
+          <h2>{storyPageDetail?.translatedTitle ?? storyPageDetail?.title ?? "Story detail"}</h2>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+
+      {#if storyPageLoading}
+        <p class="loading" use:debugComponent={componentLabel("StoryPageLoading")}>Loading story detail...</p>
+      {:else if storyPageError}
+        <p class="error" use:debugComponent={componentLabel("StoryPageError")}>{storyPageError}</p>
+      {:else if storyPageDetail}
+        <StoryDetailPanel
+          story={storyPageDetail}
+          comparison={storyPageComparison}
+          {articlePath}
+          {sourcePath}
+          {tagPath}
+          {faviconUrl}
+          {formatDateRange}
+          {formatScopeLabel}
+          {otherSourceCount}
+          onNavigate={handleInternalNavigation}
+          onFaviconError={handleFaviconError}
+          apiBase={API_BASE}
+          showEntities={true}
+        />
+      {/if}
+    </section>
+  {:else if currentView.kind === "article"}
+    <section class="panel focus-page article-page" use:debugComponent={componentLabel("ArticlePage", shortId(currentView.id))}>
+      {#if articlePageLoading}
+        <p class="loading" use:debugComponent={componentLabel("ArticlePageLoading")}>Loading article...</p>
+      {:else if articlePageError}
+        <p class="error" use:debugComponent={componentLabel("ArticlePageError")}>{articlePageError}</p>
+      {:else if articlePageDetail}
+        <header class="article-header-strip" use:debugComponent={componentLabel("ArticleHeaderStrip", articlePageDetail.domain)}>
+          <span class="eyebrow">Article</span>
+          <span class="article-header-sep">·</span>
+          <a class="domain-chip domain-link" href={sourcePath(articlePageDetail.domain)} on:click={(event) => handleInternalNavigation(event, sourcePath(articlePageDetail.domain))}>
+            <img class="favicon" src={faviconUrl(articlePageDetail.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
+            <span>{articlePageDetail.domain}</span>
+          </a>
+          <span class="article-header-sep">·</span>
+          <a
+            class="article-date-link"
+            href={datePath(articlePageFeedDate)}
+            on:click={(event) => handleInternalNavigation(event, datePath(articlePageFeedDate))}
+            title={articlePageFeedDate !== articlePagePublishedDate
+              ? `Published ${articlePagePublishedDate}; clustered into the ${articlePageFeedDate} feed`
+              : `Open ${articlePageFeedDate} feed`}
+          >{articlePagePublishedDate}</a>
+          {#if articlePageDetail.fullTextIsTranslated && articlePageDetail.language}
+            <span class="article-header-sep">·</span>
+            <span class="lang-pill" title="Translated from {articlePageDetail.language.toUpperCase()} to English">
+              {articlePageDetail.language.slice(0, 2).toUpperCase()} → EN
+            </span>
+          {/if}
+          <div class="article-header-actions">
+            <a class="tab tab--primary" href={articlePageDetail.url} target="_blank" rel="noreferrer">Read original ↗</a>
+            <a
+              href={articlePageDetail.relatedStory ? storyPath(articlePageDetail.relatedStory.id) : "/"}
+              class="tab back-link"
+              on:click={(event) => handleInternalNavigation(event, articlePageDetail.relatedStory ? storyPath(articlePageDetail.relatedStory.id) : "/")}
+            >
+              {articlePageDetail.relatedStory ? "Back to story" : "Back to feed"}
+            </a>
+          </div>
+        </header>
+
+        <div class="article-layout">
+          <div class="article-main">
+            <h2 class="article-title">{articlePageDetail.title}</h2>
+            {#if articlePageDetail.originalTitle}
+              <p class="article-original-title" lang={articlePageDetail.language ?? undefined}>
+                {articlePageDetail.originalTitle}
+              </p>
+            {/if}
+
+            {#if articlePageDetail.summary}
+              <div class="article-summary-callout" use:debugComponent={componentLabel("ArticleSummary")}>
+                <span class="article-summary-label">Summary</span>
+                <p>{@html highlightWords(articlePageDetail.summary, articlePageActivePerspective)}</p>
+                {#if articlePageDetail.relatedStory}
+                  <p class="article-summary-story" use:debugComponent={componentLabel("ArticleRelatedStory", shortId(articlePageDetail.relatedStory.id))}>
+                    Part of story:
+                    <a href={storyPath(articlePageDetail.relatedStory.id)} on:click={(event) => handleInternalNavigation(event, storyPath(articlePageDetail.relatedStory.id))}>
+                      {articlePageDetail.relatedStory.translatedTitle ?? articlePageDetail.relatedStory.title}
+                    </a>
+                  </p>
+                {/if}
+              </div>
+            {/if}
+
+            {#if articlePageDetail.fullTextIsTranslated}
+              <p class="translation-notice">
+                Translated from {(articlePageDetail.language ?? "source").toUpperCase()}.
+                <a href={articlePageDetail.url} target="_blank" rel="noreferrer">Read the original →</a>
+              </p>
+            {/if}
+
+            {#if articlePageDetail.fullText}
+              <div class="article-body-text" use:debugComponent={componentLabel("ArticleBody", shortId(currentView.id))}>
+                {#each splitParagraphs(articlePageDetail.fullText) as paragraph, i (i)}
+                  <p class="article-paragraph">
+                    <EntityHighlighter
+                      text={paragraph.text}
+                      entities={paragraph.entities}
+                      perspectiveWords={articlePageActivePerspective}
+                      on:entity-click={(event) => {
+                        articlePageSelectedEntity = event.detail.entity;
+                      }}
+                    />
+                  </p>
+                {/each}
+              </div>
+            {:else}
+              <p>{@html highlightWords(articlePageDetail.contentSnippet ?? "No body available.", articlePageActivePerspective)}</p>
+            {/if}
+
+            {#if articlePageDetail.nearDuplicatePeers.length > 0}
+              <div class="other-coverage" use:debugComponent={componentLabel("ArticleNearDuplicates")}>
+                <h4 class="other-coverage-title">Also covered by</h4>
+                <ul class="other-coverage-list">
+                  {#each articlePageDetail.nearDuplicatePeers as peer (peer.articleId)}
+                    <li class="other-coverage-item">
+                      <a class="other-coverage-link" href={articlePath(peer.articleId)} on:click={(event) => handleInternalNavigation(event, articlePath(peer.articleId))}>
+                        <img class="favicon" src={faviconUrl(peer.domain)} alt="" loading="lazy" width="14" height="14" on:error={handleFaviconError} />
+                        <span class="other-coverage-domain">{peer.domain}</span>
+                        <span class="other-coverage-headline">{peer.title}</span>
+                      </a>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/if}
+
+            {#if articlePageDetail.sentiment !== 0 || articlePageDetail.subjectivity !== 0 || articlePageDetail.biasSignals.length > 0}
+              <p class="signals" use:debugComponent={componentLabel("ArticleSentiment")}>
+                {#if articlePageDetail.sentiment !== 0}Sentiment {articlePageDetail.sentiment.toFixed(2)}{/if}
+                {#if articlePageDetail.subjectivity !== 0} · Subjectivity {articlePageDetail.subjectivity.toFixed(2)}{/if}
+              </p>
+            {/if}
+          </div>
+
+          <aside class="article-aside" use:debugComponent={componentLabel("ArticleAside")}>
+            {#if articlePageDetail.keywords.length > 0}
+              <section class="aside-block" use:debugComponent={componentLabel("ArticleKeywords")}>
+                <h4 class="aside-title">Tags</h4>
+                <div class="chip-row">
+                  {#each articlePageDetail.keywords as keyword}
+                    <a href={tagPath(keyword)} class="chip" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                  {/each}
+                </div>
+              </section>
+            {/if}
+
+            {#if articlePagePerspectiveWords.length > 0}
+              <section class="aside-block" use:debugComponent={componentLabel("ArticlePerspectiveWords")}>
+                <h4 class="aside-title">Distinctive vs. other sources</h4>
+                <p class="aside-hint">Hover a term to highlight it in the article.</p>
+                <div class="chip-row">
+                  {#each articlePagePerspectiveWords as word}
+                    <span
+                      class="chip perspective-word-chip"
+                      class:active={articlePageHoveredPerspective === word}
+                      on:mouseenter={() => (articlePageHoveredPerspective = word)}
+                      on:mouseleave={() => (articlePageHoveredPerspective = null)}
+                      on:focus={() => (articlePageHoveredPerspective = word)}
+                      on:blur={() => (articlePageHoveredPerspective = null)}
+                      role="button"
+                      tabindex="0"
+                    >{word}</span>
+                  {/each}
+                </div>
+              </section>
+            {:else if articlePagePerspectiveLoading}
+              <section class="aside-block">
+                <p class="signals">Loading distinctive words…</p>
+              </section>
+            {/if}
+
+            <section class="aside-block" use:debugComponent={componentLabel("ArticleEntities")}>
+              {#if articlePageEntities.length > 0}
+                <EntityStats
+                  entities={articlePageEntities}
+                  selectedEntityId={articlePageSelectedEntity?.id ?? null}
+                  onEntitySelect={(entity) => {
+                    articlePageSelectedEntity = entity;
+                  }}
+                />
+              {:else if articlePageEntitiesLoading}
+                <p class="signals">Loading entities…</p>
+              {:else if articlePageEntitiesError}
+                <p class="entity-error">{articlePageEntitiesError}</p>
+              {/if}
+            </section>
+          </aside>
+        </div>
+
+        <EntityPopover entity={articlePageSelectedEntity} onClose={() => {
+          articlePageSelectedEntity = null;
+        }} />
       {/if}
     </section>
   {/if}
 
-  {#if currentView.kind !== "source"}
+  {#if currentView.kind === "about"}
+    <section class="panel focus-page about-page" use:debugComponent={componentLabel("AboutPage")}>
+      <div class="detail-head">
+        <div>
+          <p class="eyebrow">About</p>
+          <h2>About NewsInPerspective</h2>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+
+      <p>
+        This is an NLP experiment for the
+        <a href="https://coursehandbook.uts.edu.au/subject/2026/36118" target="_blank" rel="noreferrer">UTS Applied Natural Language Processing (36118)</a>
+        class, Autumn 2026.
+      </p>
+
+      <h3>Subject coordinator &amp; teachers</h3>
+      <ul>
+        <li>
+          <a href="https://www.linkedin.com/in/arnick-abdollahi-28416b80/" target="_blank" rel="noreferrer">Dr Arnick Abdollahi</a>
+          (subject coordinator) &mdash;
+          <a href="https://profiles.uts.edu.au/Arnick.Abdollahi" target="_blank" rel="noreferrer">UTS profile</a>
+        </li>
+        <li>
+          <a href="https://www.linkedin.com/in/mutazag/" target="_blank" rel="noreferrer">Mutaz Abu Ghazaleh</a>
+          (teacher, Founder of MAGTech.ai)
+        </li>
+        <li>
+          <a href="https://www.linkedin.com/in/sarah-fawcett-6b120114a/" target="_blank" rel="noreferrer">Sarah Fawcett</a>
+          (teacher)
+        </li>
+      </ul>
+
+      <h3>Authors</h3>
+      <ul>
+        <li><a href="https://www.linkedin.com/in/coezbek/" target="_blank" rel="noreferrer">Christopher Oezbek</a></li>
+        <li>Raul Perez Garcia</li>
+        <li><a href="https://www.linkedin.com/in/siqi-zhang-a785b334b/" target="_blank" rel="noreferrer">Siqi Zhang</a></li>
+        <li>Myeongjin Han</li>
+        <li>Andrew Fenelon</li>
+      </ul>
+
+      <h3>Source code</h3>
+      <p>
+        The full source code for this project is on GitHub:
+        <a href="https://github.com/coezbek/newsinperspective" target="_blank" rel="noreferrer">github.com/coezbek/newsinperspective</a>.
+      </p>
+
+      <h3>Technologies used</h3>
+      <ul>
+        <li>News data from <a href="https://kite.kagi.com/" target="_blank" rel="noreferrer">Kagi News (Kite)</a></li>
+        <li><a href="https://svelte.dev/" target="_blank" rel="noreferrer">Svelte</a> + <a href="https://vitejs.dev/" target="_blank" rel="noreferrer">Vite</a> for the web frontend</li>
+        <li><a href="https://nodejs.org/" target="_blank" rel="noreferrer">Node.js</a> + <a href="https://expressjs.com/" target="_blank" rel="noreferrer">Express</a> + <a href="https://www.typescriptlang.org/" target="_blank" rel="noreferrer">TypeScript</a> for the API</li>
+        <li><a href="https://www.prisma.io/" target="_blank" rel="noreferrer">Prisma</a> ORM with <a href="https://www.postgresql.org/" target="_blank" rel="noreferrer">PostgreSQL</a></li>
+        <li><a href="https://openrouter.ai/" target="_blank" rel="noreferrer">OpenRouter</a> for LLM-based keyword and entity enrichment</li>
+        <li>Named entity recognition and entity linking against <a href="https://www.wikidata.org/" target="_blank" rel="noreferrer">Wikidata</a></li>
+      </ul>
+    </section>
+  {/if}
+
+  {#if currentView.kind === "pipeline"}
+    <section class="panel focus-page" use:debugComponent={componentLabel("PipelinePageWrapper")}>
+      <div class="detail-head">
+        <div>
+          <p class="eyebrow">Operations</p>
+          <h2>Pipeline</h2>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+      <PipelinePage apiBase={API_BASE} />
+    </section>
+  {/if}
+
+  {#if currentView.kind === "perspective"}
+    <PerspectiveStatsPage apiBase={API_BASE} onNavigate={handleInternalNavigation} />
+  {/if}
+
+  {#if currentView.kind === "date"}
+    <section class="panel focus-page" use:debugComponent={componentLabel("DatePageHeader", currentView.date)}>
+      <div class="detail-head">
+        <div>
+          <p class="eyebrow">Day</p>
+          <h2>{currentView.date}</h2>
+        </div>
+        <div class="page-actions">
+          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+        </div>
+      </div>
+    </section>
+  {/if}
+
+  {#if currentView.kind === "feed" || currentView.kind === "tag" || currentView.kind === "date"}
     {#each daySections as section (section.date)}
     <section class="day-block panel" use:debugComponent={componentLabel("DaySection", section.date)}>
       <div class="day-separator" use:debugComponent={componentLabel("DaySeparator", section.date)}>
@@ -921,11 +1461,14 @@
                 <span class="meta">
                   {formatCategoryLabel(story.category)} · {story.importanceScore} score · {story.sourceCount} sources
                 </span>
-                <strong>{story.title}</strong>
+                <strong>
+                  <a href={storyPath(story.id)} on:click|stopPropagation={(event) => handleInternalNavigation(event, storyPath(story.id))}>
+                    {story.translatedTitle ?? story.title}
+                  </a>
+                </strong>
                 <span class="signals">{formatDateRange(story.dateFrom, story.dateUntil)}</span>
                 <span class="story-keywords">
-                  {#each story.keywords as keyword, index}
-                    {#if index > 0}, {/if}
+                  {#each story.keywords as keyword}
                     <a href={tagPath(keyword)} on:click|stopPropagation={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
                   {/each}
                 </span>
@@ -936,121 +1479,21 @@
 
         <section class="detail panel" use:debugComponent={componentLabel("StoryDetail", section.date)}>
           {#if section.selectedStory}
-            <div class="detail-head" use:debugComponent={componentLabel("DetailHeader", shortId(section.selectedStory.id))}>
-              <header use:debugComponent={componentLabel("SelectedStoryHeader", shortId(section.selectedStory.id))}>
-                <p class="eyebrow">
-                  {formatScopeLabel(section.selectedStory.region, section.selectedStory.category)}
-                </p>
-                <h3>{section.selectedStory.title}</h3>
-                <p>
-                  {section.selectedStory.articleCount} articles across
-                  {section.selectedStory.sourceCount} sources ·
-                  {formatDateRange(section.selectedStory.dateFrom, section.selectedStory.dateUntil)}
-                </p>
-                <div
-                  class="domain-strip"
-                  aria-label="Top domains"
-                  use:debugComponent={componentLabel("TopDomains", shortId(section.selectedStory.id))}
-                >
-                  {#each section.selectedStory.topDomains as domain}
-                    <a
-                      class="domain-chip domain-link"
-                      href={sourcePath(domain)}
-                      on:click={(event) => handleInternalNavigation(event, sourcePath(domain))}
-                    >
-                      <img
-                        class="favicon"
-                        src={faviconUrl(domain)}
-                        alt=""
-                        loading="lazy"
-                        width="14"
-                        height="14"
-                        on:error={handleFaviconError}
-                      />
-                      <span>{domain}</span>
-                    </a>
-                  {/each}
-                  {#if otherSourceCount(section.selectedStory) > 0}
-                    <span class="domain-more">and {otherSourceCount(section.selectedStory)} other sources</span>
-                  {/if}
-                </div>
-              </header>
-
-              <div class="comparison" use:debugComponent={componentLabel("ComparisonSummary", shortId(section.selectedStory.id))}>
-                {#if section.comparison}
-                  <div class="chip-row">
-                    {#each section.comparison.sharedKeywords as keyword}
-                    <a href={tagPath(keyword)} class="chip" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
-                    {/each}
-                  </div>
-
-                  {#each section.comparison.framingSummary as line}
-                    <p>{line}</p>
-                  {/each}
-                {/if}
-              </div>
-            </div>
-
-            <div class="article-grid" use:debugComponent={componentLabel("ArticleList", shortId(section.selectedStory.id))}>
-              {#each section.selectedStory.articles as article}
-                <article
-                  id={`article-${article.id}`}
-                  class="article-entry"
-                  use:debugComponent={componentLabel("ArticleCard", `${article.domain} / ${shortId(article.id, 8)}`)}
-                >
-                  <div class="article-head-rail">
-                    <header class="article-head" use:debugComponent={componentLabel("ArticleHeader", article.domain)}>
-                      <p class="meta article-meta">
-                        <a class="domain-chip domain-link" href={sourcePath(article.domain)} on:click={(event) => handleInternalNavigation(event, sourcePath(article.domain))}>
-                          <img
-                            class="favicon"
-                            src={faviconUrl(article.domain)}
-                            alt=""
-                            loading="lazy"
-                            width="14"
-                            height="14"
-                            on:error={handleFaviconError}
-                          />
-                          <span>{article.domain}</span>
-                        </a>
-                        <span>· {article.publishedAt.slice(0, 10)}</span>
-                      </p>
-                      <h4>{article.title}</h4>
-                    </header>
-                  </div>
-                  <div class="article-card-body">
-                    <div class="article-body">
-                      <p>{article.summary ?? "No summary available."}</p>
-                      {#if article.nearDuplicatePeers.length > 0}
-                        <p class="signals">
-                          Possible near-duplicate coverage:
-                          {#each article.nearDuplicatePeers as peer, peerIndex}
-                            {#if peerIndex > 0}, {/if}
-                            <a href={`#article-${peer.articleId}`}>{peer.domain}</a>
-                          {/each}
-                        </p>
-                      {:else if article.syndicatedDomains.length > 0}
-                        <p class="signals">
-                          Possible near-duplicate coverage on {article.syndicatedDomains.join(", ")}
-                        </p>
-                      {/if}
-                      <p class="signals">
-                        Sentiment {article.sentiment} · Subjectivity {article.subjectivity} ·
-                        Bias &lt;not yet determined&gt;
-                      </p>
-                      {#if article.keywords.length > 0}
-                        <p class="signals">
-                          {#each article.keywords as keyword, keywordIndex}
-                            {#if keywordIndex > 0}, {/if}
-                            <a href={tagPath(keyword)} on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
-                          {/each}
-                        </p>
-                      {/if}
-                      <a href={article.url} target="_blank" rel="noreferrer">Read source</a>
-                    </div>
-                  </div>
-                </article>
-              {/each}
+            <div use:debugComponent={componentLabel("DetailHeader", shortId(section.selectedStory.id))}>
+              <StoryDetailPanel
+                story={section.selectedStory}
+                comparison={section.comparison}
+                {articlePath}
+                {sourcePath}
+                {tagPath}
+                {faviconUrl}
+                {formatDateRange}
+                {formatScopeLabel}
+                {otherSourceCount}
+                onNavigate={handleInternalNavigation}
+                onFaviconError={handleFaviconError}
+                apiBase={API_BASE}
+              />
             </div>
           {:else}
             <div class="empty" use:debugComponent={componentLabel("DetailEmptyState", section.date)}>
@@ -1063,19 +1506,34 @@
     </section>
     {/each}
 
-    <div
-      class="load-anchor"
-      use:observeInfiniteScroll
-      use:debugComponent={componentLabel("InfiniteScrollAnchor")}
-    >
-      {#if loadingNextDate}
-        <p>Loading next day...</p>
-      {:else if nextDateCursor >= dates.length && daySections.length > 0}
-        <p>No more dates.</p>
-      {/if}
-    </div>
+    {#if currentView.kind !== "date"}
+      <div
+        class="load-anchor"
+        use:observeInfiniteScroll
+        use:debugComponent={componentLabel("InfiniteScrollAnchor")}
+      >
+        {#if loadingNextDate}
+          <p>Loading next day...</p>
+        {:else if nextDateCursor >= dates.length && daySections.length > 0}
+          <p>No more dates.</p>
+        {/if}
+      </div>
+    {/if}
   {/if}
-</main>
+
+  </main>
+
+<footer class="site-footer" use:debugComponent={componentLabel("SiteFooter")}>
+  <span>© {new Date().getFullYear()} <a href="/" on:click={(event) => handleInternalNavigation(event, "/")}>NewsInPerspective</a></span>
+  <span class="footer-sep" aria-hidden="true">·</span>
+  <a href="/about" on:click={(event) => handleInternalNavigation(event, "/about")}>About</a>
+  <span class="footer-sep" aria-hidden="true">·</span>
+  <a href="/pipeline" on:click={(event) => handleInternalNavigation(event, "/pipeline")}>Pipeline</a>
+  <span class="footer-sep" aria-hidden="true">·</span>
+  <a href="/perspective" on:click={(event) => handleInternalNavigation(event, "/perspective")}>Perspective stats</a>
+  <span class="footer-sep" aria-hidden="true">·</span>
+  <a href="https://github.com/coezbek/newsinperspective" target="_blank" rel="noreferrer">GitHub</a>
+</footer>
 
 <style>
   :global(:root) {
@@ -1109,7 +1567,7 @@
   .shell {
     max-width: 1320px;
     margin: 0 auto;
-    padding: 24px 20px 60px;
+    padding: 24px 20px 96px;
   }
 
   .panel {
@@ -1443,14 +1901,53 @@
     box-shadow: 0 6px 14px rgba(20, 55, 111, 0.12);
   }
 
-  .chip-link {
+  .chip-link,
+  a.chip {
     text-decoration: none;
   }
 
+  .perspective-words-block {
+    margin: 8px 0 12px;
+  }
+
+  .perspective-words-block .signals {
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .chip.perspective-word-chip {
+    background: #fff3b0;
+    color: #6b4e00;
+    cursor: default;
+    transition: box-shadow 120ms ease, transform 120ms ease;
+  }
+
+  .chip.perspective-word-chip:hover,
+  .chip.perspective-word-chip.active {
+    box-shadow: 0 0 0 2px #d9a200;
+    transform: translateY(-1px);
+  }
+
+  .aside-hint {
+    margin: -4px 0 8px;
+    color: #58708f;
+    font-size: 0.78rem;
+    font-style: italic;
+  }
+
+  :global(mark.perspective-word) {
+    background: #fff3b0;
+    color: inherit;
+    /* Zero padding so toggling the mark on hover does not reflow text. */
+    padding: 0;
+    border-radius: 2px;
+    font-weight: inherit;
+    box-shadow: 0 0 0 2px #fff3b0;
+  }
+
   .chip-link:hover,
-  .chip:hover {
-    text-decoration: underline;
-    text-underline-offset: 3px;
+  a.chip:hover {
+    text-decoration: none;
   }
 
   .domain-more {
@@ -1473,6 +1970,245 @@
     flex-wrap: wrap;
   }
 
+  .article-original-title {
+    margin: 4px 0 12px;
+    color: var(--muted, #58708f);
+    font-size: 0.95rem;
+    font-style: italic;
+    font-weight: 500;
+  }
+
+  .article-page {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .article-header-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    color: var(--muted, #58708f);
+    font-size: 0.88rem;
+  }
+
+  .article-header-strip .eyebrow {
+    margin: 0;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.74rem;
+    color: var(--muted, #58708f);
+  }
+
+  .article-header-sep {
+    color: rgba(88, 112, 143, 0.5);
+  }
+
+  .article-date-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(88, 112, 143, 0.5);
+  }
+
+  .article-date-link:hover {
+    color: var(--accent-strong, #0a3c96);
+    border-bottom-color: currentColor;
+  }
+
+  .article-header-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+  }
+
+  .article-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+    gap: 20px;
+    align-items: start;
+  }
+
+  .article-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .article-title {
+    margin: 0;
+    font-size: 1.55rem;
+    line-height: 1.25;
+    color: #142033;
+  }
+
+  .article-body-text {
+    color: #142033;
+  }
+
+  .article-aside {
+    position: sticky;
+    top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .aside-block {
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(37, 87, 167, 0.16);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(240, 247, 255, 0.84));
+  }
+
+  .aside-title {
+    margin: 0 0 8px;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #58708f;
+    font-weight: 600;
+  }
+
+  .article-summary-story {
+    margin: 8px 0 0;
+    padding-top: 8px;
+    border-top: 1px solid rgba(37, 87, 167, 0.16);
+    color: #34445c;
+    font-size: 0.9rem;
+  }
+
+  @media (max-width: 980px) {
+    .article-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .article-aside {
+      position: static;
+    }
+    .article-header-actions {
+      margin-left: 0;
+      width: 100%;
+    }
+  }
+
+  .lang-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(15, 98, 254, 0.1);
+    color: #0a3c96;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+
+  .tab--primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+    color: #fff;
+    border-color: transparent;
+    text-decoration: none;
+  }
+
+  .article-summary-callout {
+    margin: 8px 0 12px;
+    padding: 12px 14px;
+    border-left: 3px solid var(--accent, #0f62fe);
+    background: rgba(220, 232, 255, 0.45);
+    border-radius: 0 10px 10px 0;
+  }
+
+  .article-summary-callout p {
+    margin: 4px 0 0;
+    color: #142033;
+    font-size: 0.96rem;
+    line-height: 1.5;
+  }
+
+  .article-summary-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #58708f;
+    font-weight: 600;
+  }
+
+  .translation-notice {
+    margin: 0 0 10px;
+    color: #58708f;
+    font-size: 0.82rem;
+    font-style: italic;
+  }
+
+  .article-paragraph {
+    margin: 0 0 12px;
+    line-height: 1.6;
+  }
+
+  .article-paragraph:last-child {
+    margin-bottom: 0;
+  }
+
+  .other-coverage {
+    margin-top: 18px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(37, 87, 167, 0.16);
+    background: rgba(245, 249, 255, 0.6);
+  }
+
+  .other-coverage-title {
+    margin: 0 0 8px;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #58708f;
+    font-weight: 600;
+  }
+
+  .other-coverage-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .other-coverage-link {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    color: #142033;
+    text-decoration: none;
+    transition: background-color 120ms ease;
+  }
+
+  .other-coverage-link:hover {
+    background: rgba(255, 255, 255, 0.7);
+  }
+
+  .other-coverage-domain {
+    flex-shrink: 0;
+    font-weight: 600;
+    color: #0a3c96;
+    font-size: 0.85rem;
+  }
+
+  .other-coverage-headline {
+    flex: 1;
+    min-width: 0;
+    color: #34445c;
+    font-size: 0.88rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .chip-row {
     display: flex;
     flex-wrap: wrap;
@@ -1487,6 +2223,48 @@
     color: var(--accent-strong);
     font-size: 0.84rem;
     font-weight: 600;
+  }
+
+  .entity-section {
+    display: grid;
+    gap: 10px;
+  }
+
+  .entity-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .entity-loading,
+  .entity-error {
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+
+  .entity-error {
+    margin: 0;
+    color: #8b1e3f;
+  }
+
+  .entity-content {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(220px, 0.9fr);
+    gap: 12px;
+    align-items: start;
+  }
+
+  .entity-text-card,
+  .entity-sidebar--full {
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(37, 87, 167, 0.16);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(240, 247, 255, 0.84));
+  }
+
+  .entity-sidebar {
+    min-width: 0;
   }
 
   .article-grid {
@@ -1607,6 +2385,64 @@
     color: #b42318;
   }
 
+  .brand-link {
+    text-decoration: none;
+    color: inherit;
+  }
+
+  .brand-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .about-page ul {
+    margin: 6px 0 16px;
+    padding-left: 20px;
+    line-height: 1.6;
+  }
+
+  .about-page a {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+  }
+
+  .about-page a:hover {
+    text-decoration: underline;
+  }
+
+  .site-footer {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 100;
+    padding: 10px 16px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 0.82rem;
+    border-top: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.88);
+    backdrop-filter: blur(10px);
+  }
+
+  .site-footer a {
+    color: var(--accent-strong);
+    text-decoration: none;
+    font-weight: 600;
+  }
+
+  .site-footer a:hover {
+    text-decoration: underline;
+  }
+
+  .footer-sep {
+    opacity: 0.6;
+  }
+
   .load-anchor {
     min-height: 56px;
     display: grid;
@@ -1663,6 +2499,10 @@
       max-height: none;
       overflow: visible;
       padding-right: 0;
+    }
+
+    .entity-content {
+      grid-template-columns: 1fr;
     }
   }
 </style>

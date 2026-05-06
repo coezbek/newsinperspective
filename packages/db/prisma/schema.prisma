@@ -7,6 +7,13 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum EntityType {
+  PERSON
+  GPE
+  ORG
+  EVENT
+}
+
 enum RunStatus {
   PENDING
   SUCCESS
@@ -17,12 +24,26 @@ enum RunStatus {
 enum ScopeType {
   ARTICLE
   CLUSTER
+  GLOBAL
 }
 
 enum ExtractionStatus {
   PENDING
   SUCCESS
   FAILED
+}
+
+enum PipelineJobStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum PipelineTrigger {
+  MANUAL
+  SCHEDULED
 }
 
 model FeedSource {
@@ -82,6 +103,9 @@ model Article {
   contentSnippet  String?
   fullText        String?
   fullTextFormat  String?
+  translatedTitle    String?
+  translatedSummary  String?
+  translatedFullText String?
   extractionStatus ExtractionStatus @default(PENDING)
   extractedAt     DateTime?
   extractionError String?
@@ -101,6 +125,7 @@ model Article {
   raws            ArticleRaw[]
   clusterLinks    ClusterArticle[]
   features        NlpFeature[]
+  entityMentions  EntityMention[]
 
   @@index([textFingerprint])
 }
@@ -116,11 +141,12 @@ model ArticleRaw {
 }
 
 model StoryCluster {
-  id            String           @id @default(cuid())
-  clusterKey    String
-  storyDate     DateTime
-  title         String
-  topCategory   String?
+  id              String           @id @default(cuid())
+  clusterKey      String
+  storyDate       DateTime
+  title           String
+  translatedTitle String?
+  topCategory     String?
   articleCount  Int              @default(0)
   sourceCount   Int              @default(0)
   createdAt     DateTime         @default(now())
@@ -165,6 +191,71 @@ model SourceProfile {
   updatedAt          DateTime   @updatedAt
 }
 
+model NamedEntity {
+  id                String      @id @default(cuid())
+  name              String      @unique
+  type              EntityType
+  wikiId            String?     @unique
+  wikipediaUrl      String?
+  wikidataId        String?
+  summary           String?     @db.Text
+  imageUrl          String?
+  infoboxJson       Json?
+  firstSeen         DateTime    @default(now())
+  lastUpdated       DateTime    @updatedAt
+
+  mentions          EntityMention[]
+  statistics        EntityStatistics?
+  cooccurrence1     EntityCooccurrence[] @relation("entity1")
+  cooccurrence2     EntityCooccurrence[] @relation("entity2")
+
+  @@index([name])
+  @@index([type])
+}
+
+model EntityMention {
+  id                String      @id @default(cuid())
+  entityId          String
+  entity            NamedEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  articleId         String
+  article           Article     @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  startOffset       Int
+  endOffset         Int
+  context           String
+  confidence        Float?
+  createdAt         DateTime    @default(now())
+
+  @@index([entityId])
+  @@index([articleId])
+  @@index([confidence])
+}
+
+model EntityStatistics {
+  id                String      @id @default(cuid())
+  entityId          String      @unique
+  entity            NamedEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  totalMentions     Int         @default(0)
+  uniqueArticles    Int         @default(0)
+  mentions7Days     Int         @default(0)
+  mentions30Days    Int         @default(0)
+  averagePosition   Float?
+  lastUpdated       DateTime    @updatedAt
+}
+
+model EntityCooccurrence {
+  id                String      @id @default(cuid())
+  entity1Id         String
+  entity1           NamedEntity @relation("entity1", fields: [entity1Id], references: [id], onDelete: Cascade)
+  entity2Id         String
+  entity2           NamedEntity @relation("entity2", fields: [entity2Id], references: [id], onDelete: Cascade)
+  cooccurrenceCount Int         @default(0)
+  lastDate          DateTime    @default(now())
+
+  @@unique([entity1Id, entity2Id])
+  @@index([entity1Id])
+  @@index([entity2Id])
+}
+
 model NlpFeature {
   id         String      @id @default(cuid())
   scopeType  ScopeType
@@ -175,4 +266,26 @@ model NlpFeature {
   updatedAt  DateTime    @updatedAt
   article    Article?    @relation(fields: [articleId], references: [id], onDelete: Cascade)
   cluster    StoryCluster? @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+}
+
+model PipelineJob {
+  id          String            @id @default(cuid())
+  kind        String
+  target      String?
+  args        Json?
+  status      PipelineJobStatus @default(QUEUED)
+  trigger     PipelineTrigger   @default(MANUAL)
+  queuedAt    DateTime          @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  exitCode    Int?
+  pid         Int?
+  message     String?
+  progress    Json?
+  logTail     String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([status, queuedAt])
+  @@index([kind, queuedAt])
 }

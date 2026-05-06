@@ -674,6 +674,18 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
 
   await upsertSourceProfiles(sourceStats, { incremental: true, enrichMetadata: false });
 
+  // Perspective intelligence — best-effort. No LLM narrative, no LLM country
+  // resolver. Failures are logged but don't break ingestion.
+  try {
+    const { computeClusterPerspective } = await import("../services/cluster-perspective.js");
+    await computeClusterPerspective(cluster.id, { generateNarrative: false });
+  } catch (err) {
+    console.warn(
+      `[kagi:ingest] perspective compute failed for cluster ${cluster.id}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   return {
     importedArticles,
     keywordSource: "openrouter",
@@ -688,10 +700,11 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
 
 async function main() {
   const globalLimit = parsePositiveInt(process.argv[2], 10);
-  const perCategoryLimit = parsePositiveInt(process.argv[3], 5);
-  const extractionConcurrency = parsePositiveInt(process.env.KAGI_INGEST_EXTRACTION_CONCURRENCY, 8);
+  const perCategoryLimit = parseNonNegativeInt(process.argv[3], 5);
+  const extractionConcurrency = parsePositiveInt(process.env.KAGI_INGEST_EXTRACTION_CONCURRENCY, 4);
   const extractionPerDomainConcurrency = parsePositiveInt(process.env.KAGI_INGEST_EXTRACTION_PER_DOMAIN_CONCURRENCY, 2);
   const extractionMaxRetries = parseNonNegativeInt(process.env.KAGI_INGEST_EXTRACTION_RETRIES, 1);
+  const skipExisting = (process.env.KAGI_INGEST_SKIP_EXISTING ?? "true").toLowerCase() !== "false";
   const requiredCategories = parseCsv(process.argv[4], [
     "World",
     "USA",
@@ -705,7 +718,7 @@ async function main() {
 
   console.log("Selecting clusters from Kagi...");
   console.log(
-    `Extraction settings: concurrency=${extractionConcurrency}, perDomain=${extractionPerDomainConcurrency}, retries=${extractionMaxRetries}`,
+    `Extraction settings: concurrency=${extractionConcurrency}, perDomain=${extractionPerDomainConcurrency}, retries=${extractionMaxRetries}, skipExisting=${skipExisting}`,
   );
   const categoryProgressStartedAt = Date.now();
   const selection = await listClustersForIngestion({
@@ -763,19 +776,45 @@ async function main() {
   const failedUrls: FailedUrlRecord[] = [];
   const clusterProgressStartedAt = Date.now();
 
+  let skippedClusters = 0;
   for (const [index, chosen] of selected.entries()) {
     console.log("");
     console.log(`[cluster ${index + 1}/${selected.length}] ${chosen.categoryName} · ${chosen.story.title}`);
+
+    if (skipExisting) {
+      const existing = await prisma.storyCluster.findUnique({
+        where: {
+          clusterKey_storyDate: {
+            clusterKey: chosen.story.id,
+            storyDate: startOfUtcDay(snapshotDate),
+          },
+        },
+        select: { id: true },
+      });
+      if (existing) {
+        console.log(
+          `[kagi:ingest] skipping cluster (already imported, set KAGI_INGEST_SKIP_EXISTING=false to re-extract)`,
+        );
+        skippedClusters += 1;
+        continue;
+      }
+    }
+
     const exportDir = resolve(baseDir, `${index + 1}-${slugify(chosen.story.title)}`);
     await mkdir(exportDir, { recursive: true });
 
+    const maxSourcesEnv = Number.parseInt(process.env.KAGI_INGEST_MAX_SOURCES_PER_CLUSTER ?? "", 10);
+    const articlesForExtraction =
+      Number.isFinite(maxSourcesEnv) && maxSourcesEnv > 0
+        ? chosen.story.articles.slice(0, maxSourcesEnv)
+        : chosen.story.articles;
     const extracted = await extractClusterSources({
       clusterRank: index + 1,
       clusterCount: selected.length,
       storyId: chosen.story.id,
       storyTitle: chosen.story.title,
       categoryName: chosen.categoryName,
-      articles: chosen.story.articles,
+      articles: articlesForExtraction,
       maxConcurrent: extractionConcurrency,
       perDomainConcurrent: extractionPerDomainConcurrency,
       maxRetries: extractionMaxRetries,
@@ -862,6 +901,7 @@ async function main() {
     generatedAt: new Date().toISOString(),
     ingestCount: selected.length,
     importedClusters,
+    skippedClusters,
     importedArticles,
     globalLimit,
     perCategoryLimit,

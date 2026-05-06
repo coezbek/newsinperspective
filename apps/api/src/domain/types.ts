@@ -32,4 +32,5 @@ export interface ArticleFeatureSet {
   language: string | null;
   translatedTitle: string | null;
   translatedSummary: string | null;
+  translatedFullText: string | null;
 }

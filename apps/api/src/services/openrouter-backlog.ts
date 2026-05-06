@@ -26,6 +26,62 @@ function pickLanguage(values: Array<string | null | undefined>): string | null {
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 }
 
+/**
+ * For non-English clusters, look at the cluster's articles' cached
+ * NlpFeature.featureSet.translatedTitle and reuse one. Prefer an exact match
+ * to the cluster title (Kagi often picks the cluster title from one of the
+ * articles); otherwise fall back to the first non-empty translated title.
+ */
+async function pickClusterTranslatedTitle(
+  clusterId: string,
+  clusterTitle: string,
+): Promise<string | null> {
+  const features = await prisma.nlpFeature.findMany({
+    where: {
+      scopeType: ScopeType.ARTICLE,
+      article: { clusterLinks: { some: { clusterId } } },
+    },
+    select: {
+      featureSet: true,
+      article: { select: { title: true, language: true } },
+    },
+  });
+  const candidates: Array<{ original: string; translated: string }> = [];
+  for (const f of features) {
+    const set = f.featureSet as JsonObject;
+    const translated = typeof set.translatedTitle === "string" ? set.translatedTitle.trim() : "";
+    if (!translated || !f.article) continue;
+    const isEnglish =
+      !f.article.language || f.article.language.toLowerCase().slice(0, 2) === "en";
+    if (isEnglish) continue;
+    if (translated.toLowerCase() === f.article.title.toLowerCase()) continue;
+    candidates.push({ original: f.article.title, translated });
+  }
+  if (candidates.length === 0) return null;
+  const exact = candidates.find(
+    (c) => c.original.trim().toLowerCase() === clusterTitle.trim().toLowerCase(),
+  );
+  if (exact) return exact.translated;
+  // Prefer the article whose original title shares the most word tokens with
+  // the cluster title — clusters typically rephrase one of their articles, so
+  // token overlap is a decent heuristic for "this article is the cluster's
+  // canonical headline". Tie-breaker: insertion order.
+  const tokenize = (s: string): Set<string> =>
+    new Set(s.toLowerCase().match(/\p{L}{3,}/gu) ?? []);
+  const clusterTokens = tokenize(clusterTitle);
+  let best = candidates[0]!;
+  let bestScore = -1;
+  for (const c of candidates) {
+    let score = 0;
+    for (const tok of tokenize(c.original)) if (clusterTokens.has(tok)) score += 1;
+    if (score > bestScore) {
+      best = c;
+      bestScore = score;
+    }
+  }
+  return best.translated;
+}
+
 function sourceProfileNeedsEnrichment(row: {
   description: string | null;
   country: string | null;
@@ -114,10 +170,34 @@ export async function runOpenRouterBacklog(options?: {
           }),
         },
       });
+      const articleUpdate: {
+        summary?: string;
+        translatedTitle?: string;
+        translatedSummary?: string;
+        translatedFullText?: string;
+        language?: string;
+      } = {};
       if (!article.summary && next.translatedSummary) {
+        articleUpdate.summary = next.translatedSummary;
+      }
+      if (next.translatedTitle) {
+        articleUpdate.translatedTitle = next.translatedTitle;
+      }
+      if (next.translatedSummary) {
+        articleUpdate.translatedSummary = next.translatedSummary;
+      }
+      if (next.translatedFullText) {
+        articleUpdate.translatedFullText = next.translatedFullText;
+      }
+      // Persist detected language so downstream stages (entity-re-enrich) can
+      // branch on it without inspecting NlpFeature.featureSet.
+      if (!article.language && typeof next.language === "string" && next.language.trim()) {
+        articleUpdate.language = next.language.trim().toLowerCase();
+      }
+      if (Object.keys(articleUpdate).length > 0) {
         await prisma.article.update({
           where: { id: article.id },
-          data: { summary: next.translatedSummary },
+          data: articleUpdate,
         });
       }
       articleReady += 1;
@@ -149,6 +229,7 @@ export async function runOpenRouterBacklog(options?: {
         select: {
           id: true,
           title: true,
+          translatedTitle: true,
           articles: {
             orderBy: { rank: "asc" },
             include: {
@@ -219,6 +300,29 @@ export async function runOpenRouterBacklog(options?: {
     } else {
       clusterPending += 1;
       log(`[openrouter-backlog][cluster] pending ${cluster.id}`);
+    }
+  }
+
+  // Backfill cluster translatedTitle for non-English clusters that don't yet
+  // have one. Runs every backlog pass; cheap (no LLM call — just reuses the
+  // article-level translatedTitle already cached in NlpFeature).
+  const clustersMissingTranslation = await prisma.storyCluster.findMany({
+    where: {
+      translatedTitle: null,
+      ...(dateWhere ? { storyDate: dateWhere } : {}),
+    },
+    select: { id: true, title: true },
+    orderBy: { storyDate: "desc" },
+    take: 200,
+  });
+  for (const cluster of clustersMissingTranslation) {
+    const translatedTitle = await pickClusterTranslatedTitle(cluster.id, cluster.title);
+    if (translatedTitle) {
+      await prisma.storyCluster.update({
+        where: { id: cluster.id },
+        data: { translatedTitle },
+      });
+      log(`[openrouter-backlog][cluster] translatedTitle set ${cluster.id}`);
     }
   }
 

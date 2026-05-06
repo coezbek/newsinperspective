@@ -1,5 +1,7 @@
 import { env } from "../config/env.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
+import { callOpenAIFallback } from "./openai-fallback.js";
+import { withLlmCache } from "./llm-cache.js";
 
 interface OpenRouterArticleEnrichmentInput {
   title: string;
@@ -14,6 +16,7 @@ export interface OpenRouterArticleEnrichmentResult {
   keywords: string[];
   translatedTitle: string | null;
   translatedSummary: string | null;
+  translatedFullText: string | null;
   persons: string[];
   organizations: string[];
   places: string[];
@@ -21,6 +24,8 @@ export interface OpenRouterArticleEnrichmentResult {
   model: string;
   error: string | null;
 }
+
+const TRANSLATED_FULL_TEXT_MAX_CHARS = 6000;
 
 const openRouterTimeoutMs = 8_000;
 const openRouterBackoffScheduleMs = [5_000, 15_000, 60_000];
@@ -75,6 +80,7 @@ function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArticleEnr
       keywords?: unknown;
       translatedTitle?: unknown;
       translatedSummary?: unknown;
+      translatedFullText?: unknown;
       persons?: unknown;
       organizations?: unknown;
       places?: unknown;
@@ -86,6 +92,8 @@ function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArticleEnr
       translatedTitle: typeof parsed.translatedTitle === "string" ? parsed.translatedTitle.trim() || null : null,
       translatedSummary:
         typeof parsed.translatedSummary === "string" ? parsed.translatedSummary.trim() || null : null,
+      translatedFullText:
+        typeof parsed.translatedFullText === "string" ? parsed.translatedFullText.trim() || null : null,
       persons: uniqueStrings(parsed.persons),
       organizations: uniqueStrings(parsed.organizations),
       places: uniqueStrings(parsed.places),
@@ -109,6 +117,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
       keywords: [],
       translatedTitle: null,
       translatedSummary: null,
+      translatedFullText: null,
       persons: [],
       organizations: [],
       places: [],
@@ -118,10 +127,18 @@ export async function extractArticleEnrichmentWithOpenRouter(
     };
   }
 
+  // Treat "unknown language" the same as "non-English": we'd rather pay for a
+  // translation that might come back null than miss one because the heuristic
+  // language detector hadn't fired yet.
+  const isDefinitelyEnglish =
+    typeof input.language === "string" && input.language.toLowerCase().slice(0, 2) === "en";
+  const requestFullTextTranslation = !isDefinitelyEnglish && Boolean(input.body && input.body.trim());
+  const cappedBody = input.body ? input.body.slice(0, TRANSLATED_FULL_TEXT_MAX_CHARS) : "";
+
   const prompt = [
     "Analyze this news article and return strict JSON only.",
     "JSON shape:",
-    "{\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\"}",
+    "{\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"translatedFullText\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\"}",
     "Output rules:",
     `- return at most ${maxKeywords} keywords`,
     "- keywords must be concise English topical labels of 1 to 4 words",
@@ -130,6 +147,9 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- preserve proper names exactly when possible",
     "- translatedTitle and translatedSummary must be close English translations, not rewrites",
     "- translatedSummary should be 1 sentence, faithful, and plain factual prose",
+    requestFullTextTranslation
+      ? "- translatedFullText must be a faithful English translation of the Body, preserving paragraph breaks; do not summarise; if the Body is already English, return null"
+      : "- translatedFullText must be null (the article is already English or has no body)",
     "- persons, organizations, and places must be distinct arrays",
     "- language must be a lowercase ISO-639-1 code like en, fr, de, es, it, tr, el, zh, ja, ko, ru, ar",
     "- if uncertain, use null for strings and [] for arrays",
@@ -144,9 +164,46 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "",
     `Title: ${input.title}`,
     `Summary: ${input.summary ?? ""}`,
-    `Body: ${input.body ?? ""}`,
+    `Body: ${cappedBody}`,
   ].join("\n");
 
+  return withLlmCache(
+    { kind: "openrouter-article-enrichment", prompt },
+    () =>
+      runArticleEnrichmentRequest(
+        input,
+        prompt,
+        models,
+        primaryModel,
+        log,
+        requestFullTextTranslation,
+      ),
+    {
+      shouldCache: (result) => result.error === null,
+      onAttemptLog: log,
+    },
+  );
+}
+
+function isResponseComplete(
+  parsed: Omit<OpenRouterArticleEnrichmentResult, "model" | "error">,
+  requestFullTextTranslation: boolean,
+): boolean {
+  // If we asked for a translation but the model returned nothing, the
+  // response is incomplete — some smaller free models silently skip the
+  // translatedFullText field. Reject so the loop tries another model.
+  if (requestFullTextTranslation && !parsed.translatedFullText) return false;
+  return true;
+}
+
+async function runArticleEnrichmentRequest(
+  input: OpenRouterArticleEnrichmentInput,
+  prompt: string,
+  models: string[],
+  primaryModel: string,
+  log: ((message: string) => void) | undefined,
+  requestFullTextTranslation: boolean,
+): Promise<OpenRouterArticleEnrichmentResult> {
   let lastError = "OpenRouter request failed";
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
 
@@ -203,7 +260,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
       const content = payload.choices?.[0]?.message?.content ?? "";
       const parsed = parseEnrichmentFromResponse(content);
 
-      if (parsed) {
+      if (parsed && isResponseComplete(parsed, requestFullTextTranslation)) {
         return {
           ...parsed,
           model,
@@ -211,7 +268,10 @@ export async function extractArticleEnrichmentWithOpenRouter(
         };
       }
 
-      lastError = "No parseable article enrichment JSON in model response";
+      lastError = parsed
+        ? "Model returned incomplete enrichment (missing translatedFullText)"
+        : "No parseable article enrichment JSON in model response";
+      log?.(`round ${round + 1}/${maxRounds}: ${model} ${parsed ? "incomplete" : "parse failure"}`);
       sawRetryableError = true;
     }
 
@@ -222,10 +282,25 @@ export async function extractArticleEnrichmentWithOpenRouter(
     await sleep(computeBackoffMs(round, maxRetryAfterMs));
   }
 
+  // OpenRouter exhausted — try OpenAI direct as last resort.
+  const fallback = await callOpenAIFallback({ prompt, onAttemptLog: log });
+  if (fallback) {
+    const parsed = parseEnrichmentFromResponse(fallback.content);
+    if (parsed && isResponseComplete(parsed, requestFullTextTranslation)) {
+      return {
+        ...parsed,
+        model: fallback.model,
+        error: null,
+      };
+    }
+    log?.(`openai-fallback: ${fallback.model} parse failure`);
+  }
+
   return {
     keywords: [],
     translatedTitle: null,
     translatedSummary: null,
+    translatedFullText: null,
     persons: [],
     organizations: [],
     places: [],

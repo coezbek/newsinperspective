@@ -1,4 +1,5 @@
 import { env } from "../config/env.js";
+import { resolveCountryFromDomain } from "./country-from-domain.js";
 
 export interface SourceProfileEnrichmentResult {
   description: string | null;
@@ -73,11 +74,13 @@ export async function enrichSourceProfileWithOpenRouter(input: {
 }): Promise<SourceProfileEnrichmentResult> {
   const model = env.OPENROUTER_MODEL?.split(",").map((value) => value.trim()).filter(Boolean)[0] ?? defaultFreeModels[0]!;
 
+  const fastPathCountry = resolveCountryFromDomain(input.domain, input.sourceName);
+
   if (!env.OPENROUTER_API_KEY) {
     return {
       description: null,
-      country: null,
-      countryOfOrigin: null,
+      country: fastPathCountry,
+      countryOfOrigin: fastPathCountry,
       headquarters: null,
       mediaOwner: null,
       ownershipType: null,
@@ -117,8 +120,8 @@ export async function enrichSourceProfileWithOpenRouter(input: {
       const details = await response.text();
       return {
         description: null,
-        country: null,
-        countryOfOrigin: null,
+        country: fastPathCountry,
+        countryOfOrigin: fastPathCountry,
         headquarters: null,
         mediaOwner: null,
         ownershipType: null,
@@ -138,8 +141,8 @@ export async function enrichSourceProfileWithOpenRouter(input: {
     if (!parsed) {
       return {
         description: null,
-        country: null,
-        countryOfOrigin: null,
+        country: fastPathCountry,
+        countryOfOrigin: fastPathCountry,
         headquarters: null,
         mediaOwner: null,
         ownershipType: null,
@@ -153,14 +156,16 @@ export async function enrichSourceProfileWithOpenRouter(input: {
 
     return {
       ...parsed,
+      country: parsed.country ?? fastPathCountry,
+      countryOfOrigin: parsed.countryOfOrigin ?? fastPathCountry,
       model,
       error: null,
     };
   } catch (error) {
     return {
       description: null,
-      country: null,
-      countryOfOrigin: null,
+      country: fastPathCountry,
+      countryOfOrigin: fastPathCountry,
       headquarters: null,
       mediaOwner: null,
       ownershipType: null,

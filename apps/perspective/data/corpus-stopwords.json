@@ -1,0 +1,351 @@
+{
+  "generatedAt": "2026-05-05T03:52:13.923Z",
+  "articleCount": 3563,
+  "dfThreshold": 0.2,
+  "terms": [
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "from",
+    "has",
+    "was",
+    "this",
+    "have",
+    "trump",
+    "are",
+    "but",
+    "said",
+    "will",
+    "not",
+    "more",
+    "also",
+    "after",
+    "donald",
+    "been",
+    "which",
+    "his",
+    "all",
+    "over",
+    "about",
+    "they",
+    "their",
+    "iran",
+    "its",
+    "one",
+    "had",
+    "two",
+    "time",
+    "would",
+    "out",
+    "were",
+    "first",
+    "can",
+    "who",
+    "what",
+    "you",
+    "than",
+    "into",
+    "now",
+    "president",
+    "new",
+    "april",
+    "before",
+    "when",
+    "while",
+    "could",
+    "there",
+    "war",
+    "may",
+    "our",
+    "other"
+  ],
+  "details": [
+    {
+      "term": "the",
+      "df": 1860,
+      "ratio": 0.522
+    },
+    {
+      "term": "and",
+      "df": 1771,
+      "ratio": 0.4971
+    },
+    {
+      "term": "for",
+      "df": 1670,
+      "ratio": 0.4687
+    },
+    {
+      "term": "that",
+      "df": 1569,
+      "ratio": 0.4404
+    },
+    {
+      "term": "with",
+      "df": 1559,
+      "ratio": 0.4376
+    },
+    {
+      "term": "from",
+      "df": 1426,
+      "ratio": 0.4002
+    },
+    {
+      "term": "has",
+      "df": 1365,
+      "ratio": 0.3831
+    },
+    {
+      "term": "was",
+      "df": 1359,
+      "ratio": 0.3814
+    },
+    {
+      "term": "this",
+      "df": 1291,
+      "ratio": 0.3623
+    },
+    {
+      "term": "have",
+      "df": 1288,
+      "ratio": 0.3615
+    },
+    {
+      "term": "trump",
+      "df": 1229,
+      "ratio": 0.3449
+    },
+    {
+      "term": "are",
+      "df": 1221,
+      "ratio": 0.3427
+    },
+    {
+      "term": "but",
+      "df": 1202,
+      "ratio": 0.3374
+    },
+    {
+      "term": "said",
+      "df": 1193,
+      "ratio": 0.3348
+    },
+    {
+      "term": "will",
+      "df": 1184,
+      "ratio": 0.3323
+    },
+    {
+      "term": "not",
+      "df": 1181,
+      "ratio": 0.3315
+    },
+    {
+      "term": "more",
+      "df": 1104,
+      "ratio": 0.3099
+    },
+    {
+      "term": "also",
+      "df": 1096,
+      "ratio": 0.3076
+    },
+    {
+      "term": "after",
+      "df": 1076,
+      "ratio": 0.302
+    },
+    {
+      "term": "donald",
+      "df": 1042,
+      "ratio": 0.2925
+    },
+    {
+      "term": "been",
+      "df": 1025,
+      "ratio": 0.2877
+    },
+    {
+      "term": "which",
+      "df": 1020,
+      "ratio": 0.2863
+    },
+    {
+      "term": "his",
+      "df": 1008,
+      "ratio": 0.2829
+    },
+    {
+      "term": "all",
+      "df": 997,
+      "ratio": 0.2798
+    },
+    {
+      "term": "over",
+      "df": 978,
+      "ratio": 0.2745
+    },
+    {
+      "term": "about",
+      "df": 974,
+      "ratio": 0.2734
+    },
+    {
+      "term": "they",
+      "df": 965,
+      "ratio": 0.2708
+    },
+    {
+      "term": "their",
+      "df": 960,
+      "ratio": 0.2694
+    },
+    {
+      "term": "iran",
+      "df": 958,
+      "ratio": 0.2689
+    },
+    {
+      "term": "its",
+      "df": 948,
+      "ratio": 0.2661
+    },
+    {
+      "term": "one",
+      "df": 941,
+      "ratio": 0.2641
+    },
+    {
+      "term": "had",
+      "df": 931,
+      "ratio": 0.2613
+    },
+    {
+      "term": "two",
+      "df": 916,
+      "ratio": 0.2571
+    },
+    {
+      "term": "time",
+      "df": 909,
+      "ratio": 0.2551
+    },
+    {
+      "term": "would",
+      "df": 902,
+      "ratio": 0.2532
+    },
+    {
+      "term": "out",
+      "df": 892,
+      "ratio": 0.2504
+    },
+    {
+      "term": "were",
+      "df": 884,
+      "ratio": 0.2481
+    },
+    {
+      "term": "first",
+      "df": 872,
+      "ratio": 0.2447
+    },
+    {
+      "term": "can",
+      "df": 863,
+      "ratio": 0.2422
+    },
+    {
+      "term": "who",
+      "df": 859,
+      "ratio": 0.2411
+    },
+    {
+      "term": "what",
+      "df": 850,
+      "ratio": 0.2386
+    },
+    {
+      "term": "you",
+      "df": 824,
+      "ratio": 0.2313
+    },
+    {
+      "term": "than",
+      "df": 804,
+      "ratio": 0.2257
+    },
+    {
+      "term": "into",
+      "df": 789,
+      "ratio": 0.2214
+    },
+    {
+      "term": "now",
+      "df": 788,
+      "ratio": 0.2212
+    },
+    {
+      "term": "president",
+      "df": 787,
+      "ratio": 0.2209
+    },
+    {
+      "term": "new",
+      "df": 782,
+      "ratio": 0.2195
+    },
+    {
+      "term": "april",
+      "df": 781,
+      "ratio": 0.2192
+    },
+    {
+      "term": "before",
+      "df": 781,
+      "ratio": 0.2192
+    },
+    {
+      "term": "when",
+      "df": 770,
+      "ratio": 0.2161
+    },
+    {
+      "term": "while",
+      "df": 766,
+      "ratio": 0.215
+    },
+    {
+      "term": "could",
+      "df": 738,
+      "ratio": 0.2071
+    },
+    {
+      "term": "there",
+      "df": 734,
+      "ratio": 0.206
+    },
+    {
+      "term": "war",
+      "df": 727,
+      "ratio": 0.204
+    },
+    {
+      "term": "may",
+      "df": 724,
+      "ratio": 0.2032
+    },
+    {
+      "term": "our",
+      "df": 723,
+      "ratio": 0.2029
+    },
+    {
+      "term": "other",
+      "df": 718,
+      "ratio": 0.2015
+    }
+  ]
+}

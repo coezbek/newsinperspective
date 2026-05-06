@@ -88,6 +88,9 @@ async function main() {
                     orderBy: { updatedAt: "desc" },
                     take: 1,
                   },
+                  entityMentions: {
+                    include: { entity: true },
+                  },
                 },
               },
             },
@@ -111,6 +114,9 @@ async function main() {
                     where: { scopeType: ScopeType.ARTICLE },
                     orderBy: { updatedAt: "desc" },
                     take: 1,
+                  },
+                  entityMentions: {
+                    include: { entity: true },
                   },
                 },
               },
@@ -138,6 +144,30 @@ async function main() {
       const articleFeature = (article.features[0]?.featureSet ?? {}) as FeaturePayload;
       const articleKeywords = parseStringArray(articleFeature.keywords);
       const fullText = article.fullText;
+
+      const entityCounts = new Map<string, {
+        entity_id: string;
+        text: string;
+        type: string;
+        wikipedia_url: string | null;
+        count: number;
+      }>();
+      for (const mention of article.entityMentions) {
+        const key = mention.entity.id;
+        const existing = entityCounts.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          entityCounts.set(key, {
+            entity_id: mention.entity.id,
+            text: mention.entity.name,
+            type: mention.entity.type,
+            wikipedia_url: mention.entity.wikipediaUrl ?? null,
+            count: 1,
+          });
+        }
+      }
+      const entities = Array.from(entityCounts.values()).sort((a, b) => b.count - a.count);
       const analysisText = buildAnalysisText([
         article.title,
         fullText,
@@ -180,6 +210,7 @@ async function main() {
         subjectivity: asNumber(articleFeature.subjectivity, 0),
         bias_signals: parseStringArray(articleFeature.biasSignals),
         analysis_text: analysisText,
+        entities,
       });
     }
   }

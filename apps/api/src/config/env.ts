@@ -39,6 +39,11 @@ const envSchema = z.object({
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().optional(),
   OPENROUTER_MODEL_OFFSET: z.coerce.number().int().default(0),
+  // Direct OpenAI fallback used when every OpenRouter free model is exhausted.
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_FALLBACK_MODEL: z.string().default("gpt-5.4-nano"),
+  PERSPECTIVE_SIDECAR_URL: z.string().url().default("http://127.0.0.1:5710"),
+  PERSPECTIVE_SIDECAR_TIMEOUT_MS: z.coerce.number().int().default(120000),
 });
 
 export const env = envSchema.parse(process.env);

@@ -2,9 +2,37 @@
 
 Monorepo for a news-comparison project that ingests RSS feeds from Kagi's public `kite_feeds.json` catalog, stores normalized article data in Postgres, clusters same-day coverage, and exposes lightweight NLP comparison signals to a Svelte frontend.
 
+## About this project
+
+This is an NLP experiment for the [UTS Applied Natural Language Processing (36118)](https://coursehandbook.uts.edu.au/subject/2026/36118) class, Autumn 2026.
+
+Repository: https://github.com/coezbek/newsinperspective
+
+### Subject coordinator & teachers
+- [Dr Arnick Abdollahi](https://www.linkedin.com/in/arnick-abdollahi-28416b80/) (subject coordinator) — [UTS profile](https://profiles.uts.edu.au/Arnick.Abdollahi)
+- [Mutaz Abu Ghazaleh](https://www.linkedin.com/in/mutazag/) (teacher, Founder of MAGTech.ai)
+- [Sarah Fawcett](https://www.linkedin.com/in/sarah-fawcett-6b120114a/) (teacher)
+
+### Authors
+- [Christopher Oezbek](https://www.linkedin.com/in/coezbek/)
+- Raul Perez Garcia
+- [Siqi Zhang](https://www.linkedin.com/in/siqi-zhang-a785b334b/)
+- Myeongjin Han
+- Andrew Fenelon
+
+### Data & key technologies
+- News data from [Kagi News (Kite)](https://kite.kagi.com/)
+- [Svelte](https://svelte.dev/) + [Vite](https://vitejs.dev/) frontend
+- [Node.js](https://nodejs.org/) + [Express](https://expressjs.com/) + [TypeScript](https://www.typescriptlang.org/) API
+- [Prisma](https://www.prisma.io/) ORM with [PostgreSQL](https://www.postgresql.org/)
+- [OpenRouter](https://openrouter.ai/) for LLM-based keyword and entity enrichment
+- Named entity recognition and entity linking against [Wikidata](https://www.wikidata.org/)
+
 ## Workspace
 - `apps/api`: Fastify API plus ingestion jobs
 - `apps/web`: Svelte + Vite frontend
+- `apps/perspective`: Python FastAPI sidecar for SBERT framing-divergence + RoBERTa sentiment + TF-IDF
+- `apps/ner`: Python FastAPI sidecar for spaCy `en_core_web_sm` named-entity recognition
 - `packages/db`: Prisma schema and generated client
 - `packages/shared`: shared DTOs and schemas
 
@@ -52,6 +80,32 @@ Or run ingestion directly from the CLI:
 pnpm ingest 2026-03-23
 ```
 
+For long-running Kagi ingests, prefer a persistent `tmux` session with a log file so progress survives terminal disconnects:
+
+```bash
+mkdir -p logs
+tmux new-session -d -s kagi_ingest \
+  "cd /home/coezbek/2026/NewsInPerspectiveCodex && pnpm kagi:ingest 2>&1 | tee logs/kagi-ingest-$(date -u +%Y%m%dT%H%M%SZ).log"
+```
+
+Watch it live with either:
+
+```bash
+tmux attach -t kagi_ingest
+```
+
+or:
+
+```bash
+tail -f logs/kagi-ingest-*.log
+```
+
+Check whether it is still running:
+
+```bash
+tmux ls
+```
+
 Enrich publisher article text for notebook analysis:
 
 ```bash
@@ -82,6 +136,90 @@ Runtime logs are written to `logs/`, including:
 
 - `logs/api.log`
 - `logs/ingestion-YYYY-MM-DD.log`
+
+## Daily pipeline
+
+Each daily run is a chain of four jobs, executed strictly serially by the
+pipeline runner (`apps/api/src/services/pipeline-runner.ts`). The scheduler
+(`apps/api/src/workers/scheduler.ts`) enqueues them in order when
+`AUTO_INGEST=true`, and the same chain can be reproduced manually:
+
+| Stage | Job kind | Script | Produces |
+| --- | --- | --- | --- |
+| 1 | `kagi-ingest` | `src/scripts/kagi-ingest.ts` | `Article.fullText`, `StoryCluster`, `ClusterArticle` |
+| 2 | `openrouter-backlog` | `src/scripts/enrich-openrouter.ts` | `Article.translatedFullText`, `Article.language`, summary, cluster keywords |
+| 3 | `entity-re-enrich` | `src/scripts/entity-re-enrich.ts` | `NamedEntity`, `EntityMention` (spaCy NER + Wikipedia link inline) |
+| 4 | `cluster-perspective-backfill` | `src/scripts/cluster-perspective-backfill.ts` | Cluster perspective metrics |
+
+Stage 3 reads `translatedFullText` for non-English articles (falling back to
+`fullText` if translation hasn't run), so stage 2 must complete before stage 3.
+Wikipedia linking is **not** a separate stage; it runs inline per emitted
+spaCy entity inside `enrichArticleWithEntities`.
+
+Manual chain in tmux for a 100-article test (10 clusters × ≤10 articles):
+
+```bash
+mkdir -p logs
+DATE=$(date -u +%Y-%m-%d)
+tmux new-session -d -s pipeline "bash -lc '
+  cd $(pwd)
+  export NER_SERVICE_URL=http://127.0.0.1:5711 \
+         ENRICHMENT_CONCURRENCY=2 \
+         KAGI_INGEST_MAX_SOURCES_PER_CLUSTER=10 \
+         KAGI_INGEST_SKIP_EXISTING=false
+  pnpm --filter @news/api exec tsx src/scripts/kagi-ingest.ts 10 0          2>&1 | tee logs/pipeline-1-ingest.log     && \
+  pnpm --filter @news/api exec tsx src/scripts/enrich-openrouter.ts 100 50 50 '"$DATE"' 2>&1 | tee logs/pipeline-2-openrouter.log && \
+  pnpm --filter @news/api exec tsx src/scripts/entity-re-enrich.ts --date='"$DATE"'        2>&1 | tee logs/pipeline-3-entities.log
+  exec bash'"
+```
+
+Detach safely with `Ctrl+b d` (do **not** Ctrl+C — that kills the running
+job). Re-attach with `tmux attach -t pipeline`, or follow read-only with
+`tail -f logs/pipeline-*.log`.
+
+### Cluster selection knobs (kagi-ingest)
+
+`pnpm --filter @news/api exec tsx src/scripts/kagi-ingest.ts <globalLimit> <perCategoryLimit>`
+
+- `globalLimit` (argv[2]) — top-N clusters by source count picked from the
+  whole snapshot.
+- `perCategoryLimit` (argv[3]) — top-N **additional** clusters from each of
+  the seven required categories (World, USA, Business, Technology, Sports,
+  Science, Gaming). The two sets are unioned and deduplicated.
+
+To select **exactly** N clusters, pass `<N> 0`. Example: `10 0` picks the
+global top 10 and skips the per-category top-up.
+
+- `KAGI_INGEST_MAX_SOURCES_PER_CLUSTER` — hard cap on sources extracted per
+  cluster. Applied **before** browser extraction, so unused sources cost
+  nothing.
+- `KAGI_INGEST_SKIP_EXISTING` (default `true`) — set to `false` to re-extract
+  clusters already imported for the same `storyDate`.
+
+### NER sidecar
+
+`apps/ner/` is a FastAPI service running spaCy `en_core_web_sm`. Bring it up
+alongside Postgres:
+
+```bash
+docker compose up -d ner
+curl http://127.0.0.1:5711/health
+```
+
+`apps/api/src/services/entity-recognition.ts` is a thin client that maps
+spaCy labels to `EntityType` (`PERSON/ORG/GPE/EVENT`; `LOC→GPE`; `DATE`
+dropped). Configure with `NER_SERVICE_URL` and `NER_SERVICE_TIMEOUT_MS`.
+
+### Cluster/domain entity views
+
+Once stage 3 has populated `EntityMention`, three endpoints surface the
+"framing differences across outlets" data the notebook explored:
+
+- `GET /api/clusters/:clusterId/entities` — top entities in a cluster.
+- `GET /api/clusters/:clusterId/entities/by-domain` — same, grouped by
+  source domain.
+- `GET /api/domains/:domain/entities` — top entities for a single source
+  across the corpus.
 
 Then inspect:
 

@@ -29,6 +29,10 @@ notebooks/.venv/
 notebooks/exports/
 __pycache__/
 *.py[cod]
+*.egg-info/
+
+# Generated .py exports of notebooks (the .ipynb is the source of truth)
+notebook-input/*.py
 
 # OS/editor noise
 .DS_Store

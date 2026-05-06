@@ -16,5 +16,20 @@ services:
       timeout: 5s
       retries: 10
 
+  ner:
+    build:
+      context: ./apps/ner
+    container_name: news-in-perspective-ner
+    environment:
+      NER_SPACY_MODEL: en_core_web_sm
+      NER_MAX_CHARS: "50000"
+    ports:
+      - "5711:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
