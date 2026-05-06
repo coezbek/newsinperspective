@@ -26,6 +26,15 @@ export const storyListItemSchema = z.object({
   articleCount: z.number().int(),
   sourceCount: z.number().int(),
   topDomains: z.array(z.string()),
+  topDomainArticles: z
+    .array(
+      z.object({
+        domain: z.string(),
+        articleId: z.string(),
+        url: z.string().url(),
+      }),
+    )
+    .optional(),
   keywords: z.array(z.string()),
 });
 

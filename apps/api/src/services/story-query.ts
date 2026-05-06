@@ -136,6 +136,32 @@ function buildTopDomainsForDisplay(
   return [...known, ...unknown].slice(0, limit).map((item) => item.domain);
 }
 
+function pickRepresentativeArticles(
+  articles: Array<{
+    article: { id: string; canonicalUrl: string; domain: string; duplicateDomains: string[]; publishedAt: Date | null };
+  }>,
+  domains: string[],
+): Array<{ domain: string; articleId: string; url: string }> {
+  const result: Array<{ domain: string; articleId: string; url: string }> = [];
+  for (const domain of domains) {
+    const key = domain.trim().toLowerCase();
+    const matches = articles
+      .filter(({ article }) => uniqueDomains(article).some((value) => value.trim().toLowerCase() === key))
+      .sort((left, right) => {
+        const leftPrimary = left.article.domain.trim().toLowerCase() === key ? 0 : 1;
+        const rightPrimary = right.article.domain.trim().toLowerCase() === key ? 0 : 1;
+        if (leftPrimary !== rightPrimary) return leftPrimary - rightPrimary;
+        const leftTime = left.article.publishedAt?.getTime() ?? 0;
+        const rightTime = right.article.publishedAt?.getTime() ?? 0;
+        return rightTime - leftTime;
+      });
+    const pick = matches[0]?.article;
+    if (!pick) continue;
+    result.push({ domain, articleId: pick.id, url: pick.canonicalUrl });
+  }
+  return result;
+}
+
 function safeDisplaySummary(article: {
   summary: string | null;
   contentSnippet: string | null;
@@ -432,6 +458,7 @@ export async function listStoriesByDate(
   const scoredRows = rows.map((row) => {
     const clusterDomains = [...new Set(row.articles.flatMap((item) => uniqueDomains(item.article)))];
     const topDomains = buildTopDomainsForDisplay(row.articles, 4);
+    const topDomainArticles = pickRepresentativeArticles(row.articles, topDomains);
     const clusterFeature = row.features[0]?.featureSet as
       | { keywords?: string[]; kagiClusterNumber?: number; keywordStatus?: string }
       | undefined;
@@ -470,6 +497,7 @@ export async function listStoriesByDate(
       articleCount: row.articleCount,
       sourceCount: row.sourceCount,
       topDomains,
+      topDomainArticles,
       keywords,
       },
     };

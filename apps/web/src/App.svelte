@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { fly } from "svelte/transition";
   import EntityHighlighter from "./components/EntityHighlighter.svelte";
   import EntityPopover from "./components/EntityPopover.svelte";
   import EntityStats from "./components/EntityStats.svelte";
@@ -69,6 +70,20 @@
   $: articlePageFeedDate = articlePageDetail?.relatedStory?.date ?? articlePagePublishedDate;
   let globalError = "";
   let loadingNextDate = false;
+  const HERO_ROTATING_WORDS = ["outlets", "regions", "days", "framings", "narratives"];
+  let heroRotatingIndex = 0;
+  let heroRotateTimer: ReturnType<typeof setInterval> | null = null;
+  $: featuredCluster = daySections[0]?.stories?.[0] ?? null;
+  $: featuredDomains = (featuredCluster?.topDomains ?? []).slice(0, 6);
+  $: featuredSources = (() => {
+    const domains = featuredDomains;
+    const articles = featuredCluster?.topDomainArticles ?? [];
+    const byDomain = new Map(articles.map((entry) => [entry.domain, entry]));
+    return domains.map((domain) => {
+      const match = byDomain.get(domain);
+      return { domain, articleId: match?.articleId ?? null, url: match?.url ?? null };
+    });
+  })();
   let nextDateCursor = 0;
   let loadedFeedSignature = "";
   let infiniteObserver: IntersectionObserver | null = null;
@@ -379,10 +394,22 @@
     navigate(path);
   }
 
+  const FAVICON_PLACEHOLDER =
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+      "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>" +
+        "<rect width='16' height='16' rx='3' fill='#d4d4d8'/>" +
+        "<circle cx='8' cy='8' r='3.4' fill='none' stroke='#ffffff' stroke-width='1.1'/>" +
+        "<path d='M2.6 8h10.8M8 2.6c2.4 3 2.4 7.8 0 10.8M8 2.6c-2.4 3-2.4 7.8 0 10.8' " +
+        "stroke='#ffffff' stroke-width='0.9' fill='none'/>" +
+        "</svg>",
+    );
+
   function handleFaviconError(event: Event): void {
     const target = event.currentTarget as HTMLImageElement | null;
     if (!target) return;
-    target.style.display = "none";
+    if (target.src === FAVICON_PLACEHOLDER) return;
+    target.src = FAVICON_PLACEHOLDER;
   }
 
   function otherSourceCount(story: StoryDetail | null): number {
@@ -810,6 +837,10 @@
 
     window.addEventListener("popstate", handlePopState);
 
+    heroRotateTimer = setInterval(() => {
+      heroRotatingIndex = (heroRotatingIndex + 1) % HERO_ROTATING_WORDS.length;
+    }, 2600);
+
     (async () => {
       await ensureFeedDatesLoaded();
       await syncRouteFromLocation();
@@ -821,6 +852,10 @@
       window.removeEventListener("resize", requestDebugRender);
       window.removeEventListener("scroll", requestDebugRender, true);
       window.removeEventListener("popstate", handlePopState);
+      if (heroRotateTimer !== null) {
+        clearInterval(heroRotateTimer);
+        heroRotateTimer = null;
+      }
       document.removeEventListener("mouseover", handleDebugPointer, true);
       document.removeEventListener("mouseleave", handleDebugPointerLeave, true);
       if (debugRenderFrame !== null) {
@@ -857,12 +892,32 @@
 
 <main class="shell" use:debugComponent={componentLabel("AppShell")}>
   <section class="hero panel" use:debugComponent={componentLabel("HeroPanel")}>
+    <div class="hero-aurora" aria-hidden="true">
+      <span class="aurora-blob blob-a"></span>
+      <span class="aurora-blob blob-b"></span>
+      <span class="aurora-blob blob-c"></span>
+      <span class="aurora-grid"></span>
+    </div>
+
     <p class="eyebrow brand-line">
       <a href="/" class="brand-link" on:click={(event) => handleInternalNavigation(event, "/")}>NewsInPerspective</a>
+      <span class="brand-pulse" aria-hidden="true"></span>
     </p>
     <div class="hero-row">
-      <div>
-        <h1>See how the same story moves across outlets, regions, and days.</h1>
+      <div class="hero-copy">
+        <h1 class="hero-title">
+          See how the <span class="hero-accent">same story</span> moves across
+          <span class="hero-rotator" aria-live="polite">
+            <span class="hero-rotator-sizer" aria-hidden="true">
+              {HERO_ROTATING_WORDS.reduce((a, b) => (b.length > a.length ? b : a), "")}
+            </span>
+            {#key heroRotatingIndex}
+              <span class="hero-rotator-word" in:fly={{ y: 6, duration: 280, opacity: 0 }} out:fly={{ y: -6, duration: 200, opacity: 0 }}>
+                {HERO_ROTATING_WORDS[heroRotatingIndex]}
+              </span>
+            {/key}
+          </span>
+        </h1>
         <p class="lede">
           {#if currentView.kind === "feed"}
             Each date section shows its own category chooser, top story feed, and cluster explorer.
@@ -886,6 +941,72 @@
         </button>
       {/if}
     </div>
+
+    {#if currentView.kind === "feed"}
+      <div class="cluster-strip" use:debugComponent={componentLabel("HeroClusterStrip")}>
+        {#if featuredCluster}
+          <div class="cluster-strip-header">
+            <span class="cluster-strip-tag">Live · top cluster</span>
+            <a
+              class="cluster-strip-title"
+              href={storyPath(featuredCluster.id)}
+              on:click={(event) => handleInternalNavigation(event, storyPath(featuredCluster.id))}
+            >
+              {featuredCluster.translatedTitle ?? featuredCluster.title}
+            </a>
+            <span class="cluster-strip-meta">
+              {featuredCluster.sourceCount} sources · {featuredCluster.articleCount} articles
+            </span>
+          </div>
+          <div class="cluster-arc" role="list" aria-label="Sources covering this story">
+            <span class="cluster-arc-line" aria-hidden="true"></span>
+            {#each featuredSources as source, idx (source.domain)}
+              <a
+                class="cluster-node"
+                role="listitem"
+                href={source.articleId ? articlePath(source.articleId) : sourcePath(source.domain)}
+                on:click={(event) =>
+                  handleInternalNavigation(
+                    event,
+                    source.articleId ? articlePath(source.articleId) : sourcePath(source.domain),
+                  )}
+                style="--i: {idx}; --n: {featuredSources.length}"
+                title={source.domain}
+              >
+                <span class="cluster-node-dot">
+                  <img src={faviconUrl(source.domain)} alt="" loading="lazy" on:error={handleFaviconError} />
+                </span>
+                <span class="cluster-node-label">{source.domain}</span>
+              </a>
+            {/each}
+            {#if featuredCluster.sourceCount > featuredSources.length}
+              <a
+                class="cluster-node cluster-node-more"
+                href={storyPath(featuredCluster.id)}
+                on:click={(event) => handleInternalNavigation(event, storyPath(featuredCluster.id))}
+                style="--i: {featuredSources.length}; --n: {featuredSources.length + 1}"
+                title="See all sources"
+              >
+                <span class="cluster-node-dot cluster-node-dot-more">+{featuredCluster.sourceCount - featuredSources.length}</span>
+                <span class="cluster-node-label">more</span>
+              </a>
+            {/if}
+          </div>
+        {:else}
+          <div class="cluster-strip-skeleton" aria-hidden="true">
+            <span class="cluster-strip-tag">Live · top cluster</span>
+            <div class="cluster-arc">
+              <span class="cluster-arc-line"></span>
+              {#each Array(5) as _, idx}
+                <span class="cluster-node cluster-node-skeleton" style="--i: {idx}; --n: 5">
+                  <span class="cluster-node-dot"></span>
+                </span>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     {#if settingsOpen && currentView.kind === "feed"}
       <div class="settings-panel" use:debugComponent={componentLabel("SettingsPanel")}>
@@ -1081,22 +1202,27 @@
       {/if}
     </section>
   {:else if currentView.kind === "story"}
-    <section class="panel focus-page" use:debugComponent={componentLabel("StoryPage", shortId(currentView.id))}>
-      <div class="detail-head" use:debugComponent={componentLabel("StoryPageHeader", shortId(currentView.id))}>
-        <div>
-          <p class="eyebrow">Story</p>
-          <h2>{storyPageDetail?.translatedTitle ?? storyPageDetail?.title ?? "Story detail"}</h2>
-        </div>
-        <div class="page-actions">
-          <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
-        </div>
-      </div>
-
+    <section class="panel focus-page story-page" use:debugComponent={componentLabel("StoryPage", shortId(currentView.id))}>
       {#if storyPageLoading}
         <p class="loading" use:debugComponent={componentLabel("StoryPageLoading")}>Loading story detail...</p>
       {:else if storyPageError}
         <p class="error" use:debugComponent={componentLabel("StoryPageError")}>{storyPageError}</p>
       {:else if storyPageDetail}
+        <header class="article-header-strip" use:debugComponent={componentLabel("StoryHeaderStrip", shortId(storyPageDetail.id))}>
+          <span class="eyebrow">Story</span>
+          <span class="article-header-sep">·</span>
+          <span>{formatScopeLabel(storyPageDetail.region, storyPageDetail.category)}</span>
+          <span class="article-header-sep">·</span>
+          <a
+            class="article-date-link"
+            href={datePath(storyPageDetail.dateFrom)}
+            on:click={(event) => handleInternalNavigation(event, datePath(storyPageDetail.dateFrom))}
+            title={`Open ${storyPageDetail.dateFrom} feed`}
+          >{formatDateRange(storyPageDetail.dateFrom, storyPageDetail.dateUntil)}</a>
+          <div class="article-header-actions">
+            <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
+          </div>
+        </header>
         <StoryDetailPanel
           story={storyPageDetail}
           comparison={storyPageComparison}
@@ -1111,6 +1237,7 @@
           onFaviconError={handleFaviconError}
           apiBase={API_BASE}
           showEntities={true}
+          {datePath}
         />
       {/if}
     </section>
@@ -1346,7 +1473,7 @@
       <ul>
         <li>News data from <a href="https://kite.kagi.com/" target="_blank" rel="noreferrer">Kagi News (Kite)</a></li>
         <li><a href="https://svelte.dev/" target="_blank" rel="noreferrer">Svelte</a> + <a href="https://vitejs.dev/" target="_blank" rel="noreferrer">Vite</a> for the web frontend</li>
-        <li><a href="https://nodejs.org/" target="_blank" rel="noreferrer">Node.js</a> + <a href="https://expressjs.com/" target="_blank" rel="noreferrer">Express</a> + <a href="https://www.typescriptlang.org/" target="_blank" rel="noreferrer">TypeScript</a> for the API</li>
+        <li><a href="https://nodejs.org/" target="_blank" rel="noreferrer">Node.js</a> + <a href="https://fastify.dev/" target="_blank" rel="noreferrer">Fastify</a> + <a href="https://www.typescriptlang.org/" target="_blank" rel="noreferrer">TypeScript</a> for the API</li>
         <li><a href="https://www.prisma.io/" target="_blank" rel="noreferrer">Prisma</a> ORM with <a href="https://www.postgresql.org/" target="_blank" rel="noreferrer">PostgreSQL</a></li>
         <li><a href="https://openrouter.ai/" target="_blank" rel="noreferrer">OpenRouter</a> for LLM-based keyword and entity enrichment</li>
         <li>Named entity recognition and entity linking against <a href="https://www.wikidata.org/" target="_blank" rel="noreferrer">Wikidata</a></li>
@@ -1582,6 +1709,291 @@
   .day-block {
     padding: 20px 22px;
     margin-bottom: 16px;
+  }
+
+  .hero {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  .hero-aurora {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    overflow: hidden;
+  }
+
+  .aurora-blob {
+    position: absolute;
+    width: 420px;
+    height: 420px;
+    border-radius: 50%;
+    filter: blur(60px);
+    opacity: 0.55;
+    will-change: transform;
+  }
+
+  .aurora-blob.blob-a {
+    background: radial-gradient(circle at 30% 30%, #7aa2ff, transparent 65%);
+    top: -160px;
+    left: -120px;
+    animation: aurora-drift-a 18s ease-in-out infinite alternate;
+  }
+
+  .aurora-blob.blob-b {
+    background: radial-gradient(circle at 60% 40%, #ff9ec7, transparent 65%);
+    top: -80px;
+    right: -120px;
+    animation: aurora-drift-b 22s ease-in-out infinite alternate;
+  }
+
+  .aurora-blob.blob-c {
+    background: radial-gradient(circle at 50% 50%, #74e0c6, transparent 65%);
+    bottom: -200px;
+    left: 30%;
+    width: 480px;
+    height: 480px;
+    opacity: 0.4;
+    animation: aurora-drift-c 26s ease-in-out infinite alternate;
+  }
+
+  .aurora-grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(20, 32, 51, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(20, 32, 51, 0.05) 1px, transparent 1px);
+    background-size: 32px 32px;
+    mask-image: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.6), transparent 75%);
+  }
+
+  @keyframes aurora-drift-a {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(80px, 60px) scale(1.15); }
+  }
+  @keyframes aurora-drift-b {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-70px, 90px) scale(1.1); }
+  }
+  @keyframes aurora-drift-c {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-50px, -70px) scale(1.2); }
+  }
+
+  .brand-line {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .brand-pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #2bd49c;
+    box-shadow: 0 0 0 0 rgba(43, 212, 156, 0.55);
+    animation: brand-pulse 2.4s ease-out infinite;
+  }
+
+  @keyframes brand-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(43, 212, 156, 0.55); }
+    70% { box-shadow: 0 0 0 10px rgba(43, 212, 156, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(43, 212, 156, 0); }
+  }
+
+  .hero-title {
+    font-size: clamp(1.7rem, 2.6vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.05;
+    max-width: 22ch;
+  }
+
+  .hero-accent {
+    background: linear-gradient(95deg, #3a5cff 0%, #b045ff 55%, #ff5b8a 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: hero-accent-shift 6s ease-in-out infinite alternate;
+  }
+
+  @keyframes hero-accent-shift {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 100% 50%; }
+  }
+
+  .hero-rotator {
+    position: relative;
+    display: inline-block;
+    vertical-align: baseline;
+    line-height: inherit;
+  }
+
+  .hero-rotator-sizer {
+    visibility: hidden;
+    display: inline-block;
+    white-space: pre;
+  }
+
+  .hero-rotator-word {
+    position: absolute;
+    left: 0;
+    top: 0;
+    white-space: pre;
+    background: linear-gradient(95deg, #1aa37a, #3a5cff);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-weight: 700;
+  }
+
+  .cluster-strip {
+    position: relative;
+    margin-top: 18px;
+    padding: 14px 18px 18px;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.55);
+    border: 1px solid rgba(20, 32, 51, 0.08);
+    backdrop-filter: blur(8px);
+  }
+
+  .cluster-strip-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px 14px;
+    margin-bottom: 18px;
+  }
+
+  .cluster-strip-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: linear-gradient(95deg, rgba(58, 92, 255, 0.12), rgba(176, 69, 255, 0.12));
+    color: #3a5cff;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  .cluster-strip-title {
+    font-weight: 600;
+    font-size: 1rem;
+    color: #14202f;
+    text-decoration: none;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .cluster-strip-title:hover { text-decoration: underline; }
+
+  .cluster-strip-meta {
+    color: var(--muted);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+  }
+
+  .cluster-arc {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 8px 4px 4px;
+    min-height: 64px;
+  }
+
+  .cluster-arc-line {
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    top: 22px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(58, 92, 255, 0.35), rgba(176, 69, 255, 0.35), transparent);
+    pointer-events: none;
+  }
+
+  .cluster-node {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    color: #34455d;
+    flex: 0 0 auto;
+    transition: transform 180ms ease;
+    /* gentle staggered float */
+    animation: cluster-node-float 4.8s ease-in-out infinite;
+    animation-delay: calc(var(--i, 0) * 240ms);
+  }
+
+  .cluster-node:hover {
+    transform: translateY(-3px);
+  }
+
+  .cluster-node-dot {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #fff;
+    border: 1px solid rgba(20, 32, 51, 0.1);
+    box-shadow: 0 6px 14px rgba(20, 32, 51, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .cluster-node-dot img {
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+  }
+  .cluster-node-dot-more {
+    background: linear-gradient(135deg, #3a5cff, #b045ff);
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 600;
+    border: none;
+  }
+
+  .cluster-node-label {
+    font-size: 0.72rem;
+    color: var(--muted);
+    max-width: 22ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cluster-node-skeleton .cluster-node-dot {
+    background: linear-gradient(90deg, rgba(20,32,51,0.06), rgba(20,32,51,0.12), rgba(20,32,51,0.06));
+    background-size: 200% 100%;
+    animation: cluster-skeleton 1.4s ease-in-out infinite;
+  }
+
+  @keyframes cluster-node-float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+  }
+  @keyframes cluster-skeleton {
+    0% { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .aurora-blob,
+    .hero-accent,
+    .cluster-node,
+    .cluster-node-skeleton .cluster-node-dot,
+    .brand-pulse {
+      animation: none !important;
+    }
   }
 
   .focus-page {
