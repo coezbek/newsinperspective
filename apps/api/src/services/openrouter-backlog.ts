@@ -1,7 +1,9 @@
 import { Prisma, ScopeType } from "@prisma/client";
+import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { buildArticleFeaturesWithOpenRouter, buildClusterKeywordsWithOpenRouter } from "./nlp.js";
 import { enrichSourceProfileWithOpenRouter } from "./source-profile-enrichment.js";
+import { enrichSourceProfileFromWikidata } from "./source-profile-wikidata.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -27,10 +29,55 @@ function pickLanguage(values: Array<string | null | undefined>): string | null {
 }
 
 /**
+ * Detect whether a cluster title is plausibly already English.
+ *
+ * Heuristic: pure-ASCII titles are treated as English. Headlines are
+ * frequently telegraphic ("U.S. launches Hormuz shipping mission; Iran warns
+ * forces away") and lack common function words, so a function-word check
+ * over-flags them. The cost of mis-classifying an ASCII non-English title
+ * (e.g. unaccented Spanish) as English is that we leave it untranslated —
+ * acceptable, since populating `translatedTitle` with a different English
+ * headline would only add noise. The cost of mis-classifying an English
+ * headline as non-English is real noise in the column, which we want to avoid.
+ */
+function clusterTitleLooksEnglish(title: string): boolean {
+  return /^[\x00-\x7F]+$/.test(title);
+}
+
+/**
+ * Fallback: when no cached translation exists, borrow the title of an
+ * English-language article in the cluster. Kagi clusters often span
+ * languages — an English wire-feed item in the cluster makes a perfectly
+ * legible substitute for an unreadable Croatian/Macedonian/Romanian
+ * cluster title, even if the wording isn't a direct translation.
+ *
+ * Returns the highest-ranked (most-representative) English article's title,
+ * or null if the cluster has no English-language article.
+ */
+async function pickEnglishArticleTitleFallback(clusterId: string): Promise<string | null> {
+  const links = await prisma.clusterArticle.findMany({
+    where: {
+      clusterId,
+      article: { language: { startsWith: "en", mode: "insensitive" } },
+    },
+    select: { article: { select: { title: true } } },
+    orderBy: { rank: "asc" },
+    take: 5,
+  });
+  for (const link of links) {
+    const t = link.article?.title?.trim();
+    if (t) return t;
+  }
+  return null;
+}
+
+/**
  * For non-English clusters, look at the cluster's articles' cached
  * NlpFeature.featureSet.translatedTitle and reuse one. Prefer an exact match
  * to the cluster title (Kagi often picks the cluster title from one of the
- * articles); otherwise fall back to the first non-empty translated title.
+ * articles); otherwise fall back to the first non-empty translated title;
+ * otherwise fall back to an English-language article's title in the same
+ * cluster (free — no LLM call).
  */
 async function pickClusterTranslatedTitle(
   clusterId: string,
@@ -57,7 +104,14 @@ async function pickClusterTranslatedTitle(
     if (translated.toLowerCase() === f.article.title.toLowerCase()) continue;
     candidates.push({ original: f.article.title, translated });
   }
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    // No cached translations from foreign-language articles — try the
+    // English-article-title fallback before giving up. Skip the fallback for
+    // titles that already look English; preserving them as-is is harmless
+    // and avoids cluttering the column when no translation is needed.
+    if (clusterTitleLooksEnglish(clusterTitle)) return null;
+    return pickEnglishArticleTitleFallback(clusterId);
+  }
   const exact = candidates.find(
     (c) => c.original.trim().toLowerCase() === clusterTitle.trim().toLowerCase(),
   );
@@ -81,6 +135,13 @@ async function pickClusterTranslatedTitle(
   }
   return best.translated;
 }
+
+/**
+ * Public alias for use by the one-off cluster-translate-titles backfill
+ * script. Exposes the same logic the runtime backlog uses, without
+ * importing all of runOpenRouterBacklog.
+ */
+export const pickClusterTranslatedTitleForBackfill = pickClusterTranslatedTitle;
 
 function sourceProfileNeedsEnrichment(row: {
   description: string | null;
@@ -175,42 +236,56 @@ export async function runOpenRouterBacklog(options?: {
             aiEnrichmentModel: next.llmModel ?? "openrouter-cache",
             aiEnrichmentError: next.llmError ?? null,
             aiEnrichedAt: new Date().toISOString(),
+            // Truncation signals from the enrichment call. `inputTruncated`
+            // tells us whether WE sliced the body before sending it to the
+            // model — true means downstream consumers should prioritise this
+            // article for re-extraction with longer source text.
+            // `bodyAppearsTruncated` is the model's own judgment of whether
+            // the body it received looked cut off. Stored alongside the
+            // enrichment so future re-extraction / quality dashboards can
+            // surface partial-content articles without recomputing.
+            aiEnrichmentInputTruncated: next.inputTruncated,
+            aiEnrichmentBodyAppearsTruncated: next.bodyAppearsTruncated,
           }),
         },
       });
+      // When the LLM determines the input is non-newsworthy boilerplate, we
+      // explicitly null stance-bearing fields so a re-classification (or a
+      // model upgrade that newly recognises boilerplate) clears stale values
+      // instead of leaving them stuck at whatever the previous enrichment
+      // produced. Same goes for re-classification in the other direction:
+      // when isNewsworthy is true we always write the latest values, even if
+      // they're null (model couldn't extract a usable framing summary etc.).
       const articleUpdate: {
         summary?: string;
-        translatedTitle?: string;
-        translatedSummary?: string;
-        translatedFullText?: string;
+        translatedTitle?: string | null;
+        translatedSummary?: string | null;
+        translatedFullText?: string | null;
+        framingSummary?: string | null;
         language?: string;
         extractionStatus?: "FAILED";
         extractionError?: string;
       } = {};
-      if (!article.summary && next.translatedSummary) {
-        articleUpdate.summary = next.translatedSummary;
-      }
-      if (next.translatedTitle) {
+      if (next.isNewsworthy === false) {
+        articleUpdate.translatedTitle = null;
+        articleUpdate.translatedSummary = null;
+        articleUpdate.translatedFullText = null;
+        articleUpdate.framingSummary = null;
+        articleUpdate.extractionStatus = "FAILED";
+        articleUpdate.extractionError = `Not newsworthy: ${next.notNewsworthyReason ?? "boilerplate"}`;
+      } else {
+        if (!article.summary && next.translatedSummary) {
+          articleUpdate.summary = next.translatedSummary;
+        }
         articleUpdate.translatedTitle = next.translatedTitle;
-      }
-      if (next.translatedSummary) {
         articleUpdate.translatedSummary = next.translatedSummary;
-      }
-      if (next.translatedFullText) {
         articleUpdate.translatedFullText = next.translatedFullText;
+        articleUpdate.framingSummary = next.framingSummary;
       }
       // Persist detected language so downstream stages (entity-re-enrich) can
       // branch on it without inspecting NlpFeature.featureSet.
       if (!article.language && typeof next.language === "string" && next.language.trim()) {
         articleUpdate.language = next.language.trim().toLowerCase();
-      }
-      // When the LLM determines the input is non-newsworthy boilerplate
-      // (corporate footer, paywall, photo-credit page), mark the article as
-      // failed so cluster-perspective / entity / story listings drop it.
-      // Original `fullText` is preserved for diagnostic re-inspection.
-      if (next.isNewsworthy === false) {
-        articleUpdate.extractionStatus = "FAILED";
-        articleUpdate.extractionError = `Not newsworthy: ${next.notNewsworthyReason ?? "boilerplate"}`;
       }
       if (Object.keys(articleUpdate).length > 0) {
         await prisma.article.update({
@@ -373,11 +448,83 @@ export async function runOpenRouterBacklog(options?: {
   let sourceEnriched = 0;
   let sourceFailed = 0;
 
-  for (const profile of pendingSources) {
-    const enrichment = await enrichSourceProfileWithOpenRouter({
-      domain: profile.domain,
-      sourceName: profile.sourceName,
+  // First pass: parallel-fetch Wikidata for every pending source. WDQS
+  // tolerates a small fan-out, and the long-tail enrichment loop was
+  // previously serial — turning it parallel collapses minutes of wall-clock
+  // into seconds for the common case where Wikidata has the answer.
+  // Filter out rows already fully resolved by Wikidata before spending
+  // the round-trip.
+  const wikidataConcurrency = env.SOURCE_ENRICHMENT_WIKIDATA_CONCURRENCY;
+  const wikidataResults = new Map<
+    string,
+    Awaited<ReturnType<typeof enrichSourceProfileFromWikidata>>
+  >();
+  const candidates = pendingSources.filter((profile) => {
+    if (profile.enrichmentModel === "wikidata" && profile.description) {
+      return false;
+    }
+    return true;
+  });
+  for (let i = 0; i < candidates.length; i += wikidataConcurrency) {
+    const batch = candidates.slice(i, i + wikidataConcurrency);
+    const settled = await Promise.allSettled(
+      batch.map((profile) =>
+        enrichSourceProfileFromWikidata({
+          domain: profile.domain,
+          sourceName: profile.sourceName,
+        }),
+      ),
+    );
+    settled.forEach((s, idx) => {
+      const profile = batch[idx]!;
+      wikidataResults.set(
+        profile.id,
+        s.status === "fulfilled" ? s.value : null,
+      );
     });
+  }
+
+  for (const profile of pendingSources) {
+    // Skip rows already enriched from Wikidata that have a description —
+    // re-running won't pull anything new from WDQS.
+    if (profile.enrichmentModel === "wikidata" && profile.description) {
+      continue;
+    }
+
+    let enrichment: Awaited<ReturnType<typeof enrichSourceProfileWithOpenRouter>> | null = null;
+    let nextWikidataId: string | null = profile.wikidataId ?? null;
+
+    const wd = wikidataResults.get(profile.id) ?? null;
+    if (wd) {
+      const { wikidataId: qid, ...rest } = wd;
+      enrichment = rest;
+      nextWikidataId = qid;
+    }
+
+    if (!enrichment) {
+      // Wikidata had no entry for this domain. Niche / regional / blog
+      // sources frequently fall here. With SOURCE_ENRICHMENT_WIKIDATA_ONLY
+      // the LLM fallback is skipped — preferable when running budget-
+      // sensitive batches, since the LLM otherwise hallucinates plausible
+      // but unverifiable values for unknown outlets. We still mark the row
+      // as "attempted" via lastEnrichedAt so it doesn't get re-picked on
+      // every drain-loop iteration; the previous behaviour left
+      // lastEnrichedAt unchanged on failure, which kept the same niche
+      // sources looping forever and burned LLM credits each round.
+      if (env.SOURCE_ENRICHMENT_WIKIDATA_ONLY) {
+        await prisma.sourceProfile.update({
+          where: { id: profile.id },
+          data: { lastEnrichedAt: new Date() },
+        });
+        sourceFailed += 1;
+        log(`[openrouter-backlog][source] skipped ${profile.domain} (no wikidata, LLM disabled)`);
+        continue;
+      }
+      enrichment = await enrichSourceProfileWithOpenRouter({
+        domain: profile.domain,
+        sourceName: profile.sourceName,
+      });
+    }
 
     await prisma.sourceProfile.update({
       where: { id: profile.id },
@@ -391,8 +538,16 @@ export async function runOpenRouterBacklog(options?: {
         employeeCount: profile.employeeCount ?? enrichment.employeeCount ?? null,
         wikipediaUrl: profile.wikipediaUrl ?? enrichment.wikipediaUrl ?? null,
         associatedEntities: [...new Set([...profile.associatedEntities, ...enrichment.associatedEntities])].slice(0, 8),
-        lastEnrichedAt: enrichment.error ? profile.lastEnrichedAt : new Date(),
+        // Always advance lastEnrichedAt — even on enrichment failure. The
+        // pendingSources query orders by updatedAt asc so an unchanged
+        // timestamp would put failed niche sources back at the front of the
+        // queue every drain-loop round, burning LLM credits on the same
+        // un-enrichable rows. Recording the attempt ensures the next round
+        // picks fresh candidates first; a separate periodic re-attempt job
+        // can revisit failures later if their Wikidata coverage improves.
+        lastEnrichedAt: new Date(),
         enrichmentModel: enrichment.model ?? profile.enrichmentModel,
+        wikidataId: nextWikidataId,
       },
     });
 
@@ -401,7 +556,7 @@ export async function runOpenRouterBacklog(options?: {
       log(`[openrouter-backlog][source] failed ${profile.domain}`);
     } else {
       sourceEnriched += 1;
-      log(`[openrouter-backlog][source] ready ${profile.domain}`);
+      log(`[openrouter-backlog][source] ready ${profile.domain} (${enrichment.model ?? "?"})`);
     }
   }
 

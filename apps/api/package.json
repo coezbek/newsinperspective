@@ -13,8 +13,8 @@
     "enrich:openrouter": "tsx src/scripts/enrich-openrouter.ts",
     "enrich:text": "tsx src/scripts/enrich-text.ts",
     "export:news-jsonl": "tsx src/scripts/export-news-jsonl.ts",
-    "ingest": "tsx src/scripts/ingest.ts",
     "kagi:ingest": "tsx src/scripts/kagi-ingest.ts",
+    "pipeline:run": "tsx src/scripts/pipeline-run.ts",
     "kagi:backfill-redirects": "tsx src/scripts/kagi-backfill-redirects.ts",
     "kagi:backfill-dedupe": "tsx src/scripts/kagi-backfill-dedupe.ts",
     "kagi:dedupe-status": "tsx src/scripts/kagi-dedupe-status.ts",
@@ -22,7 +22,7 @@
     "kagi:random-cluster": "tsx src/scripts/kagi-random-cluster.ts",
     "kagi:top-clusters": "tsx src/scripts/kagi-top-clusters.ts",
     "source:sync-quality": "tsx src/scripts/sync-domain-quality.ts",
-    "status": "tsx src/scripts/status.ts",
+    "source:wikidata-backfill": "tsx src/scripts/source-profile-wikidata-backfill.ts",
     "start": "node dist/src/index.js",
     "test": "vitest run",
     "lint": "tsc -p tsconfig.json --noEmit",
@@ -31,6 +31,7 @@
     "entity:test-linker": "tsx src/scripts/entity-test-linker.ts",
     "entity:test-flow": "tsx src/scripts/entity-test-flow.ts",
     "entity:re-enrich": "tsx src/scripts/entity-re-enrich.ts",
+    "entity:backfill-links": "tsx src/scripts/entity-link-backfill.ts",
     "perspective:cluster": "tsx src/scripts/cluster-perspective.ts",
     "perspective:backfill": "tsx src/scripts/cluster-perspective-backfill.ts",
     "perspective:evaluation": "tsx src/scripts/perspective-evaluation.ts",
@@ -39,7 +40,9 @@
     "perspective:clean-narratives": "tsx src/scripts/cluster-perspective-clean-narratives.ts",
     "perspective:resolve-countries": "tsx src/scripts/perspective-resolve-countries.ts",
     "perspective:narrative": "tsx src/scripts/perspective-narrative.ts",
-    "perspective:verify-wikidata": "tsx src/scripts/perspective-verify-wikidata.ts"
+    "perspective:verify-wikidata": "tsx src/scripts/perspective-verify-wikidata.ts",
+    "cluster:translate-titles": "tsx src/scripts/cluster-translate-titles.ts",
+    "cluster:translate-titles-llm": "tsx src/scripts/cluster-translate-titles-llm.ts"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",

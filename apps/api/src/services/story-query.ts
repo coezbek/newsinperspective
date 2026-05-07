@@ -670,7 +670,10 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       if (!peer) continue;
       addPeer(article.id, {
         articleId: peer.id,
-        title: peer.title,
+        // Article.title is nullable in the schema; coalesce so the peer
+        // entry's `title: string` contract holds. An empty title still renders
+        // — the URL is what the user clicks on.
+        title: peer.title ?? "",
         domain: peer.domain,
         url: peer.url,
       });
@@ -683,7 +686,7 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
     for (const peer of peers.values()) {
       addPeer(peer.articleId, {
         articleId: source.id,
-        title: source.title,
+        title: source.title ?? "",
         domain: source.domain,
         url: source.url,
       });
@@ -698,6 +701,9 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
     });
     return {
       ...article,
+      // Same Article.title-is-nullable issue as above; the API contract
+      // promises a string. Empty string is the safe default.
+      title: article.title ?? "",
       nearDuplicatePeers,
     };
   });
@@ -1031,6 +1037,14 @@ export async function getTagProfile(keyword: string): Promise<TagProfileDto | nu
   if (matchedStoryIds.size === 0 && matchedArticleIds.size === 0) return null;
   const sortedDates = matchedDates.filter(Boolean).sort((left, right) => left.localeCompare(right));
 
+  const orderedStoryIds = rows
+    .filter((row) => matchedStoryIds.has(row.id))
+    .slice(0, 20)
+    .map((row) => row.id);
+  const stories = (await Promise.all(orderedStoryIds.map((id) => getStoryDetail(id)))).filter(
+    (value): value is StoryDetail => Boolean(value),
+  );
+
   return {
     keyword,
     normalizedKeyword,
@@ -1043,7 +1057,7 @@ export async function getTagProfile(keyword: string): Promise<TagProfileDto | nu
     topCategories: collectTopCounts(topCategories, 8),
     relatedKeywords: collectUniqueKeywords(relatedKeywords.filter((value) => !matchesKeyword(value, normalizedKeyword)), 12),
     relatedEntities: collectUniqueKeywords(relatedEntities, 12),
-    stories: [],
+    stories,
     articles: [],
   };
 }

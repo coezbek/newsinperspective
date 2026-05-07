@@ -122,6 +122,40 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
     let perspective = !query.refresh ? await getStoredClusterPerspective(params.id) : null;
     if (!perspective) {
+      // Readiness guard: the lazy compute persists its result, so calling
+      // it before stage 2 (LLM enrichment) has populated translations gives
+      // SBERT a mix of empty strings (non-English articles, no translation)
+      // and uncleaned English bodies, then locks that garbage divergence
+      // score in until someone forces ?refresh=true. Refuse to compute when
+      // <50% of the cluster's articles have a populated translatedFullText
+      // OR framingSummary; surface 425 Too Early so the UI can show a
+      // "pipeline still running" state instead of caching a wrong score.
+      const { prisma } = await import("../lib/prisma.js");
+      const links = await prisma.clusterArticle.findMany({
+        where: { clusterId: params.id },
+        select: {
+          article: {
+            select: { translatedFullText: true, framingSummary: true },
+          },
+        },
+      });
+      const total = links.length;
+      const enriched = links.filter(
+        (l) => l.article?.translatedFullText || l.article?.framingSummary,
+      ).length;
+      if (total === 0) {
+        reply.code(404);
+        return { message: `Cluster ${params.id} has no articles` };
+      }
+      if (enriched / total < 0.5) {
+        reply.code(425);
+        return {
+          message:
+            "Perspective unavailable: cluster enrichment in progress. Try again after the LLM enrichment stage completes.",
+          enriched,
+          total,
+        };
+      }
       try {
         perspective = await computeClusterPerspective(params.id, { persist: true });
       } catch (err) {

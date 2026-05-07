@@ -33,6 +33,7 @@ export function buildArticleFeatures(
     translatedTitle: null,
     translatedSummary: null,
     translatedFullText: null,
+    framingSummary: null,
     isNewsworthy: null,
     notNewsworthyReason: null,
   };
@@ -47,7 +48,14 @@ export async function buildArticleFeaturesWithOpenRouter(
     maxKeywords?: number;
     onAttemptLog?: (message: string) => void;
   },
-): Promise<ArticleFeatureSet & { llmModel: string | null; llmError: string | null }> {
+): Promise<
+  ArticleFeatureSet & {
+    llmModel: string | null;
+    llmError: string | null;
+    inputTruncated: boolean;
+    bodyAppearsTruncated: boolean | null;
+  }
+> {
   const base = buildArticleFeatures(title, summary, body, language);
   const openrouter = await extractArticleEnrichmentWithOpenRouter({
     title,
@@ -75,10 +83,13 @@ export async function buildArticleFeaturesWithOpenRouter(
     translatedTitle: openrouter.translatedTitle ?? base.translatedTitle,
     translatedSummary: openrouter.translatedSummary ?? base.translatedSummary,
     translatedFullText: openrouter.translatedFullText ?? base.translatedFullText,
+    framingSummary: openrouter.framingSummary ?? base.framingSummary,
     isNewsworthy: openrouter.error ? base.isNewsworthy : openrouter.isNewsworthy,
     notNewsworthyReason: openrouter.notNewsworthyReason ?? base.notNewsworthyReason,
     llmModel: openrouter.error ? null : openrouter.model,
     llmError: openrouter.error,
+    inputTruncated: openrouter.inputTruncated,
+    bodyAppearsTruncated: openrouter.bodyAppearsTruncated,
   };
 }
 

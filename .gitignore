@@ -37,3 +37,6 @@ notebook-input/*.py
 # OS/editor noise
 .DS_Store
 .playwright-cli/*
+
+# Log files:
+*.log

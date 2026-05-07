@@ -68,9 +68,13 @@ If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a
 ## Ingestion
 
 The current ingestion path is the cluster-based Kagi News pipeline
-(`pnpm kagi:ingest` → `src/scripts/kagi-ingest.ts`). For the original
-RSS-catalog ingestion (`pnpm ingest <date>` / `POST /internal/ingest/run`),
-see [LEGACY.md](./LEGACY.md).
+(`pnpm kagi:ingest` → `src/scripts/kagi-ingest.ts`). The original
+RSS-catalog ingestion has been retired from `package.json`; see
+[LEGACY.md](./LEGACY.md) for historical context.
+
+For a complete daily run (ingest + LLM enrichment + entities + perspective
++ calibration in one process), use `pnpm pipeline:run` — see the
+[Daily pipeline](#daily-pipeline) section below.
 
 For long-running Kagi ingests, prefer a persistent `tmux` session with a log file so progress survives terminal disconnects:
 
@@ -118,16 +122,10 @@ Run a small verification sample:
 pnpm verify:text-enrichment 2026-03-23 3
 ```
 
-Inspect dataset status:
-
-```bash
-pnpm data:status
-```
-
 Runtime logs are written to `logs/`, including:
 
 - `logs/api.log`
-- `logs/ingestion-YYYY-MM-DD.log`
+- `logs/pipeline-*.log` (one per pipeline stage, see `pnpm pipeline:run`)
 
 ## Daily pipeline
 
@@ -153,33 +151,42 @@ Running `pnpm kagi:ingest` on its own only completes **stage 1**. It runs an
 inline best-effort `computeClusterPerspective` per cluster, but leaves
 keywords as `keywords_pending` and emits no translations, entities,
 narratives, or recalibration. To get a full daily slice you need to run
-stages 2–5 too (either via `AUTO_INGEST=true` or the manual chain below).
-LLM narrative generation (`perspective-narrative`) and the LLM country
-resolver (`perspective-resolve-countries`) are **explicit, out-of-band**
-batch scripts and are intentionally not part of the chain.
+stages 2–5 too. LLM narrative generation (`perspective-narrative`) and
+the LLM country resolver (`perspective-resolve-countries`) are
+**explicit, out-of-band** batch scripts and are intentionally not part
+of the chain.
 
-Manual chain in tmux for a 100-article test (10 clusters × ≤10 articles):
+### Single-command pipeline run
+
+The canonical chain is wrapped by `pnpm pipeline:run`
+(`src/scripts/pipeline-run.ts`). One process runs all five stages
+serially, mirrors each stage's output to `logs/pipeline-<n>-<name>.log`,
+loops the OpenRouter enrichment until the article backlog drains, and
+prints a token-usage summary at the end.
 
 ```bash
-mkdir -p logs
-DATE=$(date -u +%Y-%m-%d)
-tmux new-session -d -s pipeline "bash -lc '
-  cd $(pwd)
-  export NER_SERVICE_URL=http://127.0.0.1:5711 \
-         ENRICHMENT_CONCURRENCY=2 \
-         KAGI_INGEST_MAX_SOURCES_PER_CLUSTER=10 \
-         KAGI_INGEST_SKIP_EXISTING=false
-  pnpm --filter @news/api exec tsx src/scripts/kagi-ingest.ts 10 0                              2>&1 | tee logs/pipeline-1-ingest.log         && \
-  pnpm --filter @news/api exec tsx src/scripts/enrich-openrouter.ts 100 50 50 '"$DATE"'         2>&1 | tee logs/pipeline-2-openrouter.log     && \
-  pnpm --filter @news/api exec tsx src/scripts/entity-re-enrich.ts --date='"$DATE"'             2>&1 | tee logs/pipeline-3-entities.log       && \
-  pnpm --filter @news/api exec tsx src/scripts/cluster-perspective-backfill.ts                  2>&1 | tee logs/pipeline-4-perspective.log    && \
-  pnpm --filter @news/api exec tsx src/scripts/perspective-calibrate.ts                         2>&1 | tee logs/pipeline-5-calibrate.log
-  exec bash'"
+# Default: today (UTC), 10 clusters x <=10 articles per cluster.
+pnpm pipeline:run
+
+# Explicit options:
+pnpm pipeline:run --date=2026-05-07 --clusters=10 --articles-per-cluster=10
+
+# With paid OpenRouter fallback enabled (used only after the free pool fails):
+OPENROUTER_PAID_FALLBACK_MODEL=deepseek/deepseek-v4-flash \
+  pnpm pipeline:run
 ```
 
-Detach safely with `Ctrl+b d` (do **not** Ctrl+C — that kills the running
-job). Re-attach with `tmux attach -t pipeline`, or follow read-only with
-`tail -f logs/pipeline-*.log`.
+For long runs, wrap the command in `tmux` so it survives disconnects:
+
+```bash
+tmux new-session -d -s pipeline "pnpm pipeline:run 2>&1 | tee logs/pipeline-run.log"
+tmux attach -t pipeline   # detach with Ctrl+b d
+```
+
+If a stage fails the runner stops and exits non-zero; rerun
+`pnpm pipeline:run` to resume — earlier stages are idempotent
+(`KAGI_INGEST_SKIP_EXISTING=false` is set so a re-run refreshes article
+bodies for the same date).
 
 ### Cluster selection knobs (kagi-ingest)
 
@@ -199,6 +206,46 @@ global top 10 and skips the per-category top-up.
   nothing.
 - `KAGI_INGEST_SKIP_EXISTING` (default `true`) — set to `false` to re-extract
   clusters already imported for the same `storyDate`.
+
+### Article enrichment & framing summary
+
+`apps/api/src/services/openrouter-article-enrichment.ts` calls an OpenRouter
+free-tier model per article and produces five text fields:
+
+- `translatedTitle` / `translatedSummary` — short English versions for display.
+- `translatedFullText` — the chrome-stripped, English-translated body. Used
+  by the UI (article view, story-detail panel). Capped on input at 25K chars
+  before the LLM call; bounded on output by `ENRICHMENT_MAX_OUTPUT_TOKENS`
+  (4096) — both truncations are flagged on the result.
+- **`framingSummary`** — an abstractive 4-6 sentence summary written
+  specifically to capture *what makes this source's framing distinctive*
+  (stance, emphasis, attribution patterns). This is the field SBERT embeds
+  for the cluster framing-divergence score; the full body is no longer the
+  primary embedding input.
+- `keywords` / `persons` / `organizations` / `places` — entity lists.
+
+Why a separate `framingSummary` instead of just embedding `translatedFullText`:
+
+- **Output-token caps no longer corrupt the divergence signal.** Free models
+  often default to 1024-2048 output tokens — long enough to truncate
+  `translatedFullText` mid-sentence on real articles. SBERT then embeds the
+  truncated body, polluting the score. `framingSummary` is short by design.
+- **Higher signal-to-noise.** Wire-service stories share verbatim quotes
+  across many outlets; embedding those drags every source's vector toward
+  the same centroid. The summary is asked to *exclude* shared content and
+  keep what each outlet does differently.
+
+The result also carries two truncation flags downstream consumers can use:
+
+- `inputTruncated` — `true` when the original body exceeded
+  `TRANSLATED_FULL_TEXT_MAX_CHARS` and we sliced before sending. Always known.
+- `bodyAppearsTruncated` — the model's own assessment of whether the body
+  it received looked cut off. `null` when the model omitted the field.
+
+When SBERT input is selected (`cluster-perspective.ts:pickArticleText`),
+preference order is: `framingSummary` → `translatedFullText` → raw English
+`fullText`. Older articles without `framingSummary` still work via the
+fallback; running `pnpm entity:re-enrich --force` repopulates them.
 
 ### NER sidecar
 

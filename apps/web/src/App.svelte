@@ -1212,11 +1212,14 @@
       {/if}
     </section>
   {:else if currentView.kind === "tag"}
-    <section class="panel focus-page" use:debugComponent={componentLabel("TagPage", currentView.keyword)}>
-      <div class="detail-head">
-        <div>
+    <section class="panel focus-page tag-page" use:debugComponent={componentLabel("TagPage", currentView.keyword)}>
+      <div class="tag-hero">
+        <div class="tag-hero-main">
           <p class="eyebrow">Keyword</p>
-          <h2>{currentView.keyword}</h2>
+          <h1 class="tag-hero-title"># {currentView.keyword}</h1>
+          {#if tagProfile}
+            <p class="tag-hero-range">{tagProfile.dateFrom ?? "n/a"} → {tagProfile.dateUntil ?? "n/a"}</p>
+          {/if}
         </div>
         <div class="page-actions">
           <a href="/" class="tab back-link" on:click={(event) => handleInternalNavigation(event, "/")}>Back to feed</a>
@@ -1228,39 +1231,74 @@
       {:else if tagError}
         <p class="error">{tagError}</p>
       {:else if tagProfile}
-        <div class="focus-grid">
-          <section class="panel inset-panel">
-            <p class="eyebrow">Overview</p>
-            <div class="inline-stats">
-              <div class="inline-stat"><span class="stat-label">Stories</span><strong>{tagProfile.storyCount}</strong></div>
-              <div class="inline-stat"><span class="stat-label">Articles</span><strong>{tagProfile.articleCount}</strong></div>
-              <div class="inline-stat"><span class="stat-label">Sources</span><strong>{tagProfile.sourceCount}</strong></div>
+        <div class="tag-stat-row">
+          <div class="tag-stat-card"><span class="stat-label">Stories</span><strong>{tagProfile.storyCount}</strong></div>
+          <div class="tag-stat-card"><span class="stat-label">Articles</span><strong>{tagProfile.articleCount}</strong></div>
+          <div class="tag-stat-card"><span class="stat-label">Sources</span><strong>{tagProfile.sourceCount}</strong></div>
+          {#if tagProfile.topCategories[0]}
+            <div class="tag-stat-card tag-stat-card--wide">
+              <span class="stat-label">Top category</span>
+              <strong>{tagProfile.topCategories[0].label}</strong>
             </div>
-            <p>{tagProfile.dateFrom ?? "n/a"} to {tagProfile.dateUntil ?? "n/a"}</p>
-            <div class="facet-list">
-              {#each tagProfile.topDomains as facet}
-                <a href={sourcePath(facet.label)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, sourcePath(facet.label))}>{facet.label} · {facet.count}</a>
-              {/each}
-            </div>
-            <div class="facet-list">
-              {#each tagProfile.topCategories as facet}
-                <span class="chip">{facet.label} · {facet.count}</span>
-              {/each}
-            </div>
+          {/if}
+        </div>
+
+        <div class="focus-grid tag-grid">
+          <section class="panel inset-panel top-sources-panel">
+            <p class="eyebrow">Most covered by</p>
+            {#if tagProfile.topDomains.length === 0}
+              <p class="placeholder-pending">No source coverage yet.</p>
+            {:else}
+              {@const topFive = tagProfile.topDomains.slice(0, 5)}
+              {@const maxCount = Math.max(...topFive.map((d) => d.count), 1)}
+              <ol class="top-sources-list">
+                {#each topFive as facet, idx}
+                  <li class="top-source-row">
+                    <span class="top-source-rank">{idx + 1}</span>
+                    <a
+                      class="top-source-link"
+                      href={sourcePath(facet.label)}
+                      on:click={(event) => handleInternalNavigation(event, sourcePath(facet.label))}
+                    >
+                      <img class="favicon top-source-favicon" src={faviconUrl(facet.label)} alt="" loading="lazy" width="20" height="20" on:error={handleFaviconError} />
+                      <span class="top-source-name">{facet.label}</span>
+                    </a>
+                    <div class="top-source-bar" aria-hidden="true">
+                      <div class="top-source-bar-fill" style="width: {(facet.count / maxCount) * 100}%"></div>
+                    </div>
+                    <span class="top-source-count">{facet.count}</span>
+                  </li>
+                {/each}
+              </ol>
+            {/if}
+            {#if tagProfile.topCategories.length > 0}
+              <div class="facet-list facet-list--tight">
+                {#each tagProfile.topCategories as facet}
+                  <span class="chip">{facet.label} · {facet.count}</span>
+                {/each}
+              </div>
+            {/if}
           </section>
 
           <section class="panel inset-panel">
             <p class="eyebrow">Related Terms</p>
-            <div class="facet-list">
-              {#each tagProfile.relatedKeywords as keyword}
-                <a href={tagPath(keyword)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
-              {/each}
-            </div>
-            <div class="facet-list">
-              {#each tagProfile.relatedEntities as entity}
-                <span class="chip">{entity}</span>
-              {/each}
-            </div>
+            {#if tagProfile.relatedKeywords.length === 0 && tagProfile.relatedEntities.length === 0}
+              <p class="placeholder-pending">No related terms yet.</p>
+            {/if}
+            {#if tagProfile.relatedKeywords.length > 0}
+              <div class="facet-list">
+                {#each tagProfile.relatedKeywords as keyword}
+                  <a href={tagPath(keyword)} class="chip chip-link" on:click={(event) => handleInternalNavigation(event, tagPath(keyword))}>{keyword}</a>
+                {/each}
+              </div>
+            {/if}
+            {#if tagProfile.relatedEntities.length > 0}
+              <div class="facet-list">
+                {#each tagProfile.relatedEntities as entity}
+                  <span class="chip">{entity}</span>
+                {/each}
+              </div>
+            {/if}
           </section>
         </div>
 
@@ -1725,7 +1763,6 @@
       <div class="day-head" use:debugComponent={componentLabel("DayHeader", section.date)}>
         <div>
           <p class="eyebrow">Top Stories</p>
-          <h2>{section.date}</h2>
         </div>
         <div class="inline-stats">
           <div class="inline-stat">
@@ -2114,7 +2151,7 @@
     position: absolute;
     left: 16px;
     right: 16px;
-    top: 22px;
+    top: 32px;
     height: 1px;
     background: linear-gradient(90deg, transparent, rgba(58, 92, 255, 0.35), rgba(176, 69, 255, 0.35), transparent);
     pointer-events: none;
@@ -2219,6 +2256,154 @@
     flex-wrap: wrap;
     gap: 10px;
     margin-top: 12px;
+  }
+
+  .facet-list--tight {
+    gap: 6px;
+    margin-top: 14px;
+  }
+
+  .tag-page .tag-hero {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 4px 4px 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 18px;
+  }
+
+  .tag-hero-title {
+    margin: 6px 0 6px;
+    font-size: clamp(1.8rem, 3vw, 2.6rem);
+    line-height: 1.04;
+    background: linear-gradient(135deg, var(--accent-strong, #1d4ed8), #6f3ad9);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .tag-hero-range {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    letter-spacing: 0.02em;
+  }
+
+  .tag-stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .tag-stat-card {
+    padding: 14px 16px;
+    border-radius: 16px;
+    border: 1px solid var(--border-strong);
+    background: linear-gradient(135deg, var(--panel-strong), rgba(220, 232, 255, 0.62));
+    display: grid;
+    gap: 4px;
+  }
+
+  .tag-stat-card strong {
+    font-size: 1.5rem;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+  }
+
+  .tag-stat-card--wide strong {
+    font-size: 1.05rem;
+    line-height: 1.2;
+  }
+
+  .top-sources-panel {
+    background: linear-gradient(160deg, rgba(255, 255, 255, 0.95), rgba(232, 240, 255, 0.7));
+  }
+
+  .top-sources-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0;
+    display: grid;
+    gap: 10px;
+  }
+
+  .top-source-row {
+    display: grid;
+    grid-template-columns: 22px minmax(120px, 1fr) minmax(80px, 2fr) auto;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .top-source-rank {
+    font-weight: 700;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.95rem;
+  }
+
+  .top-source-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    color: var(--text);
+    min-width: 0;
+  }
+
+  .top-source-link:hover .top-source-name {
+    text-decoration: underline;
+  }
+
+  .top-source-favicon {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    flex: 0 0 auto;
+  }
+
+  .top-source-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .top-source-bar {
+    height: 8px;
+    background: rgba(20, 55, 111, 0.08);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .top-source-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-strong, #1d4ed8), #6f3ad9);
+    border-radius: 999px;
+    transition: width 200ms ease;
+  }
+
+  .top-source-count {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: #2f435e;
+    min-width: 2ch;
+    text-align: right;
+  }
+
+  @media (max-width: 720px) {
+    .tag-stat-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .top-source-row {
+      grid-template-columns: 20px minmax(100px, 1fr) auto;
+    }
+
+    .top-source-bar {
+      grid-column: 1 / -1;
+    }
   }
 
   .hero-row,

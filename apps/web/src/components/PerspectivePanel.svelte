@@ -1,4 +1,60 @@
 <script lang="ts">
+  /**
+   * Tiny markdown renderer for the LLM narrative blocks.
+   * Handles only what the model actually emits: paragraphs, ordered lists,
+   * **bold**, *italic* / _italic_, inline `code`. HTML in the input is escaped
+   * first so this is safe for `{@html}`.
+   */
+  function escapeHtml(text: string): string {
+    return text.replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    } as Record<string, string>)[ch]!);
+  }
+
+  function renderInline(text: string): string {
+    let out = escapeHtml(text);
+    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    out = out.replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, "$1<em>$2</em>");
+    return out;
+  }
+
+  function renderMarkdown(input: string | null | undefined): string {
+    if (!input) return "";
+    const blocks = input.replace(/\r\n/g, "\n").trim().split(/\n{2,}/);
+    return blocks
+      .map((block) => {
+        const trimmed = block.trim();
+        if (!trimmed) return "";
+        const lines = trimmed.split(/\n/);
+        const isOrderedList = lines.every((line) => /^\s*\d+\.\s+/.test(line));
+        if (isOrderedList) {
+          const items = lines
+            .map((line) => line.replace(/^\s*\d+\.\s+/, ""))
+            .map((item) => `<li>${renderInline(item)}</li>`)
+            .join("");
+          return `<ol>${items}</ol>`;
+        }
+        const isBulletList = lines.every((line) => /^\s*[-*]\s+/.test(line));
+        if (isBulletList) {
+          const items = lines
+            .map((line) => line.replace(/^\s*[-*]\s+/, ""))
+            .map((item) => `<li>${renderInline(item)}</li>`)
+            .join("");
+          return `<ul>${items}</ul>`;
+        }
+        return `<p>${renderInline(trimmed.replace(/\n/g, " "))}</p>`;
+      })
+      .join("");
+  }
+
+  import { pickTopSourcesByExtremity } from "../lib/perspective-picker.js";
+
   interface DistinctiveWords {
     source_name: string;
     words: string[];
@@ -57,6 +113,7 @@
     domain: string;
     url: string;
     hasFullText?: boolean;
+    sentiment?: number | null;
   }
 
   // Static fallback for the divergence thresholds — only used if the server
@@ -128,6 +185,40 @@
 
   function representativeArticleId(sourceName: string): string | null {
     return articlesForSource(sourceName)[0]?.id ?? null;
+  }
+
+  // Mean sentiment across all articles from this source in this cluster.
+  // Returns null when no article has a sentiment score.
+  function sourceSentiment(sourceName: string): number | null {
+    const list = articlesForSource(sourceName);
+    let sum = 0;
+    let n = 0;
+    for (const a of list) {
+      if (typeof a.sentiment === "number" && isFinite(a.sentiment)) {
+        sum += a.sentiment;
+        n += 1;
+      }
+    }
+    return n === 0 ? null : sum / n;
+  }
+
+  // Same ±0.05 threshold as StoryDetailPanel's sentiment-pill labelling.
+  function sentimentTone(score: number): "positive" | "neutral" | "negative" {
+    if (score > 0.05) return "positive";
+    if (score < -0.05) return "negative";
+    return "neutral";
+  }
+
+  const SENTIMENT_COLORS: Record<"positive" | "neutral" | "negative", { bg: string; fg: string }> = {
+    positive: { bg: "#dff5e1", fg: "#1e6b3a" },
+    neutral:  { bg: "#eef0f4", fg: "#4a5568" },
+    negative: { bg: "#fde2e4", fg: "#8b1e3f" },
+  };
+
+  function diagonalCellStyle(score: number | null): string {
+    if (score === null) return "background: #f4f4f4; color: #aaa;";
+    const c = SENTIMENT_COLORS[sentimentTone(score)];
+    return `background: ${c.bg}; color: ${c.fg};`;
   }
 
   function handleCompareClick(event: MouseEvent, aId: string, bId: string): void {
@@ -217,7 +308,7 @@
     const sourcesInMatrix = Object.keys(matrix).filter(hasText);
     if (sourcesInMatrix.length < 2) return [];
 
-    // Article counts per source (within the cluster) for ranking + label.
+    // Article counts per source (within the cluster) for tie-break + label/badge.
     const counts = new Map<string, { count: number; domain: string; articleId: string }>();
     for (const a of articles) {
       const key = a.sourceName || a.domain || "";
@@ -230,17 +321,26 @@
       }
     }
 
-    // Pick top-N sources by article count, restricted to those present in the matrix.
-    // Larger top-N for 2D since we have screen real estate.
+    // Pick top-N sources by EXTREMITY (mean distance to other sources), not by
+    // article count. Wire services like Reuters/AP show up in every cluster but
+    // frame neutrally — picking by article count promoted exactly the sources
+    // with the *least* divergence to display. Larger top-N for 2D since the
+    // scatter plot has more screen real estate.
     const topN = useScatter2D ? 16 : 10;
-    const ranked = sourcesInMatrix
-      .map((s) => ({
-        sourceName: s,
-        ...(counts.get(s) ?? { count: 0, domain: "", articleId: "" }),
+    const articleCountsForPicker = new Map<string, number>();
+    for (const [s, info] of counts) articleCountsForPicker.set(s, info.count);
+    const picked = pickTopSourcesByExtremity({
+      matrix,
+      sources: sourcesInMatrix,
+      articleCounts: articleCountsForPicker,
+      n: topN,
+    });
+    const ranked = picked
+      .map((p) => ({
+        sourceName: p.sourceName,
+        ...(counts.get(p.sourceName) ?? { count: 0, domain: "", articleId: "" }),
       }))
-      .filter((s) => s.domain)
-      .sort((a, b) => b.count - a.count)
-      .slice(0, topN);
+      .filter((s) => s.domain);
 
     if (ranked.length < 2) return [];
 
@@ -336,14 +436,18 @@
     const matrix = data.pairwise_distance ?? {};
     const all = Object.keys(matrix).filter(hasText);
     if (all.length < 2) return null;
-    // Use the same top-N (by article count) ranking as the axis for consistency.
+    // Pick by extremity (mean distance to other sources), tie-break by
+    // article count. Same picker as the source axis so the two views stay
+    // consistent — and so wire services that frame neutrally don't crowd
+    // the most-divergent ones out of the matrix.
     const counts = new Map<string, number>();
     for (const a of articles) counts.set(a.sourceName, (counts.get(a.sourceName) ?? 0) + 1);
-    const ranked = all
-      .map((s) => ({ s, c: counts.get(s) ?? 0 }))
-      .sort((a, b) => b.c - a.c)
-      .slice(0, 12)
-      .map((r) => r.s);
+    const ranked = pickTopSourcesByExtremity({
+      matrix,
+      sources: all,
+      articleCounts: counts,
+      n: 16,
+    }).map((p) => p.sourceName);
     if (ranked.length < 2) return null;
     return buildHeatmap(matrix, ranked);
   });
@@ -431,30 +535,111 @@
   }
 </script>
 
-<section class="perspective-panel">
-  <header class="perspective-header">
-    <h4>Perspective intelligence</h4>
-    <button class="refresh-btn" disabled={loading} onclick={() => load(true)}>
-      {loading ? "Computing…" : "Recompute"}
-    </button>
-  </header>
-
-  {#if error}
+<div class="perspective-stack">
+{#if error}
     <p class="perspective-error">{error}</p>
   {/if}
 
   {#if loading && !data}
     <p class="perspective-loading">Loading perspective…</p>
   {:else if data}
-    <div class="perspective-summary">
-      <div class={divergenceClass(data.divergence_label)}>
-        <span class="divergence-label">Framing divergence</span>
-        <span class="divergence-score">{divergencePct(data.divergence_score)}</span>
-        <span class="divergence-sublabel">{data.divergence_label ?? "n/a"}</span>
+    <div class="perspective-row perspective-row--top">
+      <div class="perspective-block divergence-block">
+        <h5>Framing divergence</h5>
+        <div class="divergence-summary">
+          <div class={divergenceClass(data.divergence_label)}>
+            <span class="divergence-score">{divergencePct(data.divergence_score)}</span>
+            <span class="divergence-sublabel">{data.divergence_label ?? "n/a"}</span>
+          </div>
+          <p class="perspective-meta">
+            {data.n_articles} articles · {data.n_sources} sources · {data.n_countries} countries
+          </p>
+        </div>
+        <p class="perspective-note">
+          Mean cosine distance between sources, scaled to a percentile of all clusters analysed.
+          Bands: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}.
+        </p>
       </div>
-      <p class="perspective-meta">
-        {data.n_articles} articles · {data.n_sources} sources · {data.n_countries} countries
-      </p>
+
+      {#if heatmap}
+        <div class="perspective-block">
+          <h5>Pairwise distance matrix</h5>
+          <p class="perspective-note">
+            Cosine distance between mean source embeddings — top {heatmap.sources.length} most-divergent sources (mean distance to others). Cells colored by the global framing-divergence thresholds: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}. Range in cluster: {heatmap.min.toFixed(2)} – {heatmap.max.toFixed(2)}.
+          </p>
+          <div class="heatmap-wrap">
+            <table class="heatmap" style="--n: {heatmap.sources.length}">
+              <thead>
+                <tr>
+                  <th></th>
+                  {#each heatmap.sources as s}
+                    {@const colDom = articlesForSource(s)[0]?.domain ?? ""}
+                    <th class="heatmap-col-label" title={s}>
+                      {#if colDom && faviconUrl}
+                        <img class="heatmap-favicon" src={faviconUrl(colDom)} alt={s} loading="lazy" width="16" height="16" onerror={onFaviconError} />
+                      {:else}
+                        <span class="heatmap-col-fallback">{s.slice(0, 2)}</span>
+                      {/if}
+                    </th>
+                  {/each}
+                </tr>
+              </thead>
+              <tbody>
+                {#each heatmap.rows as row, i}
+                  {@const rowDom = articlesForSource(heatmap.sources[i])[0]?.domain ?? ""}
+                  <tr>
+                    <th class="heatmap-row-label" title={heatmap.sources[i]}>
+                      <span class="heatmap-row-name">{heatmap.sources[i]}</span>
+                      {#if rowDom && faviconUrl}
+                        <img class="heatmap-favicon" src={faviconUrl(rowDom)} alt="" loading="lazy" width="16" height="16" onerror={onFaviconError} />
+                      {/if}
+                    </th>
+                    {#each row as cell, j}
+                      {@const aId = i !== j ? representativeArticleId(cell.a) : null}
+                      {@const bId = i !== j ? representativeArticleId(cell.b) : null}
+                      {@const linkable = i !== j && aId && bId && comparePath}
+                      {@const diagSent = i === j ? sourceSentiment(cell.a) : null}
+                      {@const diagArticleId = i === j ? representativeArticleId(cell.a) : null}
+                      {@const diagLinkable = i === j && diagArticleId && articlePath}
+                      <td
+                        class="heatmap-cell"
+                        class:diagonal={i === j}
+                        class:clickable={linkable || diagLinkable}
+                        style={i === j ? diagonalCellStyle(diagSent) : heatStyle(cell.value, false)}
+                        title={i === j
+                          ? diagSent !== null
+                            ? `${cell.a} — sentiment ${diagSent.toFixed(2)} (${sentimentTone(diagSent)})`
+                            : `${cell.a} — sentiment unavailable`
+                          : linkable
+                            ? `Compare ${cell.a} ↔ ${cell.b} (cosine ${cell.value.toFixed(3)}, ${classifyDistance(cell.value)})`
+                            : `${cell.a} ↔ ${cell.b}: ${cell.value.toFixed(3)} (${classifyDistance(cell.value)})`}
+                      >
+                        {#if linkable}
+                          <a
+                            class="heatmap-cell-link"
+                            href={comparePath!(aId!, bId!)}
+                            onclick={(event) => handleCompareClick(event, aId!, bId!)}
+                          >{cell.value.toFixed(2)}</a>
+                        {:else if i !== j}
+                          {cell.value.toFixed(2)}
+                        {:else if diagLinkable && diagSent !== null}
+                          <a
+                            class="heatmap-cell-link"
+                            href={articlePath!(diagArticleId!)}
+                            onclick={(event) => handleSourceClick(event, diagArticleId!)}
+                          >{diagSent.toFixed(2)}</a>
+                        {:else if diagSent !== null}
+                          {diagSent.toFixed(2)}
+                        {/if}
+                      </td>
+                    {/each}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      {/if}
     </div>
 
     {#if axisPoints.length >= 2 && faviconUrl}
@@ -462,7 +647,7 @@
         <h5>Source positioning</h5>
         {#if useScatter2D}
           <p class="perspective-note source-axis-help">
-            Top {axisPoints.length} sources by article count, projected from the SBERT distance matrix to two dimensions (classical MDS). Closer favicons frame the story more similarly. Axes are unitless.
+            Top {axisPoints.length} most-divergent sources (mean distance to others), projected from the SBERT distance matrix to two dimensions (classical MDS). Closer favicons frame the story more similarly. Axes are unitless.
           </p>
           <div class="source-scatter">
             {#each axisPoints as p}
@@ -490,7 +675,7 @@
           {@const placed = assignRows(axisPoints, 0.07)}
           {@const rowCount = Math.max(...placed.map((p) => p.row)) + 1}
           <p class="perspective-note source-axis-help">
-            Top {axisPoints.length} sources by article count, projected to one dimension (classical MDS). Closer favicons frame the story more similarly.
+            Top {axisPoints.length} most-divergent sources (mean distance to others), projected to one dimension (classical MDS). Closer favicons frame the story more similarly.
           </p>
           <div class="source-axis" style="--row-count: {rowCount}">
             <div class="source-axis-line"></div>
@@ -519,73 +704,7 @@
       </div>
     {/if}
 
-    {#if heatmap}
-      <div class="perspective-block">
-        <h5>Pairwise distance matrix</h5>
-        <p class="perspective-note">
-          Cosine distance between mean source embeddings — top {heatmap.sources.length} sources by article count. Cells colored by the global framing-divergence thresholds: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}. Range in cluster: {heatmap.min.toFixed(2)} – {heatmap.max.toFixed(2)}.
-        </p>
-        <div class="heatmap-wrap">
-          <table class="heatmap" style="--n: {heatmap.sources.length}">
-            <thead>
-              <tr>
-                <th></th>
-                {#each heatmap.sources as s}
-                  {@const colDom = articlesForSource(s)[0]?.domain ?? ""}
-                  <th class="heatmap-col-label" title={s}>
-                    {#if colDom && faviconUrl}
-                      <img class="heatmap-favicon" src={faviconUrl(colDom)} alt={s} loading="lazy" width="16" height="16" onerror={onFaviconError} />
-                    {:else}
-                      <span class="heatmap-col-fallback">{s.slice(0, 2)}</span>
-                    {/if}
-                  </th>
-                {/each}
-              </tr>
-            </thead>
-            <tbody>
-              {#each heatmap.rows as row, i}
-                {@const rowDom = articlesForSource(heatmap.sources[i])[0]?.domain ?? ""}
-                <tr>
-                  <th class="heatmap-row-label" title={heatmap.sources[i]}>
-                    <span class="heatmap-row-name">{heatmap.sources[i]}</span>
-                    {#if rowDom && faviconUrl}
-                      <img class="heatmap-favicon" src={faviconUrl(rowDom)} alt="" loading="lazy" width="16" height="16" onerror={onFaviconError} />
-                    {/if}
-                  </th>
-                  {#each row as cell, j}
-                    {@const aId = i !== j ? representativeArticleId(cell.a) : null}
-                    {@const bId = i !== j ? representativeArticleId(cell.b) : null}
-                    {@const linkable = i !== j && aId && bId && comparePath}
-                    <td
-                      class="heatmap-cell"
-                      class:diagonal={i === j}
-                      class:clickable={linkable}
-                      style={heatStyle(cell.value, i === j)}
-                      title={i === j
-                        ? cell.a
-                        : linkable
-                          ? `Compare ${cell.a} ↔ ${cell.b} (cosine ${cell.value.toFixed(3)}, ${classifyDistance(cell.value)})`
-                          : `${cell.a} ↔ ${cell.b}: ${cell.value.toFixed(3)} (${classifyDistance(cell.value)})`}
-                    >
-                      {#if linkable}
-                        <a
-                          class="heatmap-cell-link"
-                          href={comparePath!(aId!, bId!)}
-                          onclick={(event) => handleCompareClick(event, aId!, bId!)}
-                        >{cell.value.toFixed(2)}</a>
-                      {:else if i !== j}
-                        {cell.value.toFixed(2)}
-                      {/if}
-                    </td>
-                  {/each}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    {/if}
-
+    <div class="perspective-row perspective-row--bottom">
     {#if data.distinctive_words.length > 0}
       <div class="perspective-block">
         <h5>What each source emphasises</h5>
@@ -641,7 +760,6 @@
             </li>
             {#if c.top_keywords && c.top_keywords.length > 0}
               <li class="country-keywords">
-                <span class="country-keyword-label">framing:</span>
                 {#each c.top_keywords as kw}
                   <span class="word-chip">{kw}</span>
                 {/each}
@@ -654,31 +772,32 @@
         </p>
       </div>
     {/if}
+    </div>
 
-    {#if data.narrative?.framingAngles || data.narrative?.countryNarrative || data.narrative?.error}
-      <div class="perspective-block narrative-block">
-        <header class="narrative-header">
-          <h5>LLM narrative</h5>
-        </header>
-        {#if data.narrative.error}
-          <p class="perspective-error">{data.narrative.error}</p>
-        {/if}
+    {#if data.narrative?.error}
+      <div class="perspective-block">
+        <p class="perspective-error">{data.narrative.error}</p>
+      </div>
+    {/if}
+
+    {#if data.narrative?.framingAngles || data.narrative?.countryNarrative}
+      <div class="perspective-row perspective-row--narrative">
         {#if data.narrative.framingAngles}
-          <article class="narrative-text">
-            <h6>Editorial angles</h6>
-            <p>{data.narrative.framingAngles}</p>
-          </article>
+          <div class="perspective-block narrative-block">
+            <h5>Editorial angles</h5>
+            <div class="narrative-body">{@html renderMarkdown(data.narrative.framingAngles)}</div>
+          </div>
         {/if}
         {#if data.narrative.countryNarrative}
-          <article class="narrative-text">
-            <h6>National narratives</h6>
-            <p>{data.narrative.countryNarrative}</p>
-          </article>
-        {/if}
-        {#if data.narrative.model}
-          <p class="perspective-note">Generated by {data.narrative.model}</p>
+          <div class="perspective-block narrative-block">
+            <h5>National narratives</h5>
+            <div class="narrative-body">{@html renderMarkdown(data.narrative.countryNarrative)}</div>
+          </div>
         {/if}
       </div>
+      {#if data.narrative.model}
+        <p class="perspective-note narrative-credit">Generated by {data.narrative.model}</p>
+      {/if}
     {/if}
 
     <p class="perspective-footer">
@@ -693,17 +812,9 @@
   {:else if !loading}
     <p class="perspective-loading">No perspective data yet.</p>
   {/if}
-</section>
+</div>
 
 <style>
-  .perspective-panel {
-    margin-top: 1.5rem;
-    padding: 1rem 1.25rem;
-    border: 1px solid #e2e2e2;
-    border-radius: 8px;
-    background: #fafafa;
-    font-size: 0.9rem;
-  }
   .perspective-header {
     display: flex;
     align-items: center;
@@ -724,6 +835,38 @@
   }
   .refresh-btn:disabled { opacity: 0.6; cursor: wait; }
   .perspective-summary { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+
+  .perspective-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .perspective-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  @media (min-width: 880px) {
+    .perspective-row {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      align-items: stretch;
+    }
+  }
+
+  .divergence-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+
+  .divergence-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+  }
+
   .divergence-pill {
     display: inline-flex;
     flex-direction: column;
@@ -742,7 +885,14 @@
   .divergence-score { font-size: 1.4rem; font-weight: 600; line-height: 1.1; }
   .divergence-sublabel { font-size: 0.75rem; text-transform: capitalize; }
   .perspective-meta { color: #555; margin: 0; }
-  .perspective-block { margin-top: 1rem; }
+  .perspective-block {
+    background: rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(28, 46, 73, 0.1);
+    border-radius: 12px;
+    padding: 0.9rem 1rem;
+    box-shadow: 0 1px 2px rgba(20, 55, 111, 0.04);
+    overflow: hidden;
+  }
   .perspective-block h5 { margin: 0 0 0.5rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: #444; }
   .distinctive-table { width: 100%; border-collapse: collapse; }
   .distinctive-table th, .distinctive-table td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid #eee; vertical-align: top; }
@@ -754,7 +904,7 @@
   .source-axis {
     position: relative;
     height: calc(2.6rem + var(--row-count, 1) * 2.4rem);
-    margin: 0.4rem 4rem 0.6rem;
+    margin: 0.4rem 4rem 1.5rem;
   }
   .source-axis-line {
     position: absolute;
@@ -804,7 +954,7 @@
   .source-scatter {
     position: relative;
     height: 18rem;
-    margin: 0.4rem 4rem 1rem;
+    margin: 0.4rem 4rem 3rem;
     background:
       linear-gradient(to right, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 25% 100%,
       linear-gradient(to bottom, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 100% 25%,
@@ -819,17 +969,19 @@
     transform: translate(-50%, -50%);
   }
   .source-axis-marker.scatter::before { display: none; }
-  .heatmap-wrap { overflow-x: auto; padding-bottom: 0.4rem; display: flex; justify-content: center; }
-  .heatmap { border-collapse: separate; border-spacing: 1px; font-size: 0.68rem; table-layout: fixed; width: max-content; }
-  .heatmap th { font-weight: 500; color: #58708f; padding: 2px 4px; }
+  .heatmap-wrap { overflow: auto; padding-bottom: 0.4rem; max-height: 26rem; max-width: 100%; }
+  .heatmap { border-collapse: separate; border-spacing: 1px; font-size: 0.68rem; table-layout: fixed; width: max-content; margin: 0 auto; }
+  .heatmap th { font-weight: 500; color: #58708f; padding: 2px 4px; background: #fff; }
+  .heatmap thead th { position: sticky; top: 0; z-index: 2; }
+  .heatmap thead th:first-child { left: 0; z-index: 3; }
   .heatmap-col-label { height: 2rem; width: 2rem; text-align: center; vertical-align: middle; padding: 2px 0; }
-  .heatmap-row-label { text-align: right; padding-right: 0.4rem; width: 11rem; max-width: 11rem; white-space: nowrap; }
+  .heatmap-row-label { position: sticky; left: 0; z-index: 1; text-align: right; padding-right: 0.4rem; width: 11rem; max-width: 11rem; white-space: nowrap; }
   .heatmap-row-name { display: inline-block; max-width: 8.5rem; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
   .heatmap-favicon { display: inline-block; width: 16px; height: 16px; border-radius: 3px; vertical-align: middle; margin-left: 4px; }
   .heatmap-col-label .heatmap-favicon { margin-left: 0; }
   .heatmap-col-fallback { display: inline-block; font-size: 0.7rem; color: #58708f; text-transform: uppercase; }
   .heatmap-cell { width: 2rem; height: 2rem; text-align: center; color: #34455d; font-variant-numeric: tabular-nums; border-radius: 2px; padding: 0; }
-  .heatmap-cell.diagonal { color: transparent; }
+  .heatmap-cell.diagonal { font-weight: 600; }
   .heatmap-cell.clickable { cursor: pointer; }
   .heatmap-cell.clickable:hover { outline: 2px solid #0a3c96; outline-offset: -1px; }
   .heatmap-cell-link {
@@ -873,8 +1025,14 @@
   .perspective-footer code { font-size: 0.75rem; }
   .perspective-error { color: #a33; }
   .perspective-loading { color: #555; font-style: italic; }
-  .narrative-header { display: flex; justify-content: space-between; align-items: center; }
-  .narrative-text { background: #fff; border: 1px solid #e8e8e8; padding: 0.6rem 0.8rem; border-radius: 6px; margin-top: 0.5rem; }
-  .narrative-text h6 { margin: 0 0 0.3rem; font-size: 0.78rem; text-transform: uppercase; color: #555; letter-spacing: 0.04em; }
-  .narrative-text p { margin: 0; white-space: pre-wrap; line-height: 1.45; }
+  .narrative-credit { text-align: right; margin-top: 0.4rem; }
+  .narrative-body { line-height: 1.5; color: #2f3a52; }
+  .narrative-body :global(p) { margin: 0 0 0.6rem; }
+  .narrative-body :global(p:last-child) { margin-bottom: 0; }
+  .narrative-body :global(strong) { color: #142033; font-weight: 600; }
+  .narrative-body :global(em) { font-style: italic; color: #34455d; }
+  .narrative-body :global(code) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: #f1f4f9; padding: 1px 5px; border-radius: 3px; }
+  .narrative-body :global(ol), .narrative-body :global(ul) { margin: 0 0 0.4rem; padding-left: 1.4rem; }
+  .narrative-body :global(li) { margin-bottom: 0.5rem; }
+  .narrative-body :global(li:last-child) { margin-bottom: 0; }
 </style>

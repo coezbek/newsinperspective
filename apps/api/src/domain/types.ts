@@ -34,6 +34,14 @@ export interface ArticleFeatureSet {
   translatedSummary: string | null;
   translatedFullText: string | null;
   /**
+   * Abstractive summary of the article's distinctive framing — written by
+   * the LLM at enrichment time, intended for SBERT embedding rather than
+   * display. Bounded length (~600-1000 chars) so it never trips the
+   * output-token cap that truncates `translatedFullText`. Falls back to
+   * `translatedFullText` when null (heuristic-only enrichment, older rows).
+   */
+  framingSummary: string | null;
+  /**
    * `false` when the LLM determines the text is not a real article
    * (corporate boilerplate, paywall page, photo-credit page, etc).
    * Downstream stages should treat non-newsworthy articles like

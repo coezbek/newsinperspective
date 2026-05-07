@@ -183,7 +183,11 @@ function readabilityTextWithBoundaries(contentHtml: string, baseUrl: string): st
     // missing-space artifact from Readability flattening sibling block
     // elements. Real currency / decimals like "$11.9" are unaffected
     // because the next char is a digit, not an uppercase letter.
-    .replace(/([.!?])([A-Z])/g, "$1 $2")
+    // Preserve abbreviations like "U.S.", "L.A.", "P.M." by requiring at
+    // least 2 lowercase letters before the period (so "U.S" → no insertion,
+    // "videos.G" → still gets the space because "ideos" has > 2 lowercase).
+    .replace(/([a-z]{2,})([.!?])([A-Z])/g, "$1$2 $3")
+    .replace(/(\d{2,})([.!?])([A-Z])/g, "$1$2 $3")
     // "ByAlex Bitter" — bylines often render as <span>By</span><span>Name</span>
     // with no whitespace between. Insert a space after a leading "By" when
     // it's directly followed by another capital letter.

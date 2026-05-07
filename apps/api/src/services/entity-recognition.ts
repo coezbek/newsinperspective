@@ -64,9 +64,18 @@ const ENTITY_STOPLIST = new Set([
 function isNoiseEntity(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length < 2) return true;
+  if (trimmed.length > 80) return true; // currency-rate / ticker dumps
   if (ENTITY_STOPLIST.has(trimmed.toLowerCase())) return true;
-  // Mid-token period like "2023.He" — extraction artifact, not a real entity.
-  if (/\w\.\w/.test(trimmed)) return true;
+  // Newlines or 3+ slashes — image credits like "AFP/Getty Images\n\n" or
+  // "Amirhossein Khorgooei/ISNA/AFP/Getty Images".
+  if (/[\r\n]/.test(trimmed)) return true;
+  if ((trimmed.match(/\//g) ?? []).length >= 2) return true;
+  // Domain-style entity names: "BBC.Egypt", "Briefing.com", "Military.com".
+  if (/\.(com|net|org|gov|edu|info|biz|io|co|uk|us)\b/i.test(trimmed)) return true;
+  // Mid-token period like "2023.He" — extraction artifact. Skip when the
+  // period is preceded by a single uppercase letter (abbreviations like
+  // "U.S.", "L.A.", "I.S.", "R.B."), since those are legitimate.
+  if (/\w\.\w/.test(trimmed) && !/(?:^|\s|\.)[A-Z]\.[A-Z]/.test(trimmed)) return true;
   // Contains any digit — entity names shouldn't (years, prices, IDs leak in).
   if (/\d/.test(trimmed)) return true;
   // No alphabetic character at all.

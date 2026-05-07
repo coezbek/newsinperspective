@@ -39,6 +39,20 @@ const envSchema = z.object({
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().optional(),
   OPENROUTER_MODEL_OFFSET: z.coerce.number().int().default(0),
+  // Paid OpenRouter model used only after every model in OPENROUTER_MODEL has
+  // failed across all retry rounds. Single model, never rotated. Empty/unset
+  // disables the paid step entirely (skips straight to the OpenAI fallback).
+  OPENROUTER_PAID_FALLBACK_MODEL: z.string().optional(),
+  // When true, source-profile enrichment uses Wikidata only — no LLM
+  // fallback. Saves money for runs where the long-tail niche sources don't
+  // have Wikidata entries (Wikipedia coverage is poor for regional blogs,
+  // small RSS feeds, etc.) and the LLM "enrichment" otherwise hallucinates
+  // plausible but unverifiable owner / country / HQ values. Big established
+  // outlets are typically resolved by Wikidata anyway.
+  SOURCE_ENRICHMENT_WIKIDATA_ONLY: z.coerce.boolean().default(false),
+  // Wikidata fetch concurrency for source enrichment. WDQS rate-limits per
+  // IP but tolerates a small fan-out; 5 in flight is the safe default.
+  SOURCE_ENRICHMENT_WIKIDATA_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(5),
   // Direct OpenAI fallback used when every OpenRouter free model is exhausted.
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_FALLBACK_MODEL: z.string().default("gpt-5.4-nano"),

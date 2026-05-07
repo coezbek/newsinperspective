@@ -106,6 +106,13 @@ model Article {
   translatedTitle    String?
   translatedSummary  String?
   translatedFullText String?
+  /// Abstractive summary written by the LLM specifically to capture the
+  /// article's distinctive framing/stance (4-6 sentences, ~600-1000 chars).
+  /// Used as the SBERT input for framing-divergence scoring; bounded length
+  /// avoids the output-token-cap truncation that corrupts embeddings when
+  /// `translatedFullText` is sliced. Falls back to translatedFullText when
+  /// null (older articles, enrichment failures).
+  framingSummary  String?
   extractionStatus ExtractionStatus @default(PENDING)
   extractedAt     DateTime?
   extractionError String?
@@ -187,8 +194,11 @@ model SourceProfile {
   commonBiasSignals  String[]
   lastEnrichedAt     DateTime?
   enrichmentModel    String?
+  wikidataId         String?
   createdAt          DateTime   @default(now())
   updatedAt          DateTime   @updatedAt
+
+  @@index([wikidataId])
 }
 
 model NamedEntity {

@@ -1,5 +1,6 @@
 import { prisma } from "../lib/prisma.js";
 import { enrichSourceProfileWithOpenRouter } from "./source-profile-enrichment.js";
+import { enrichSourceProfileFromWikidata } from "./source-profile-wikidata.js";
 
 export interface SourceStatInput {
   sourceName: string;
@@ -41,15 +42,19 @@ export async function upsertSourceProfiles(
       ]),
     ].slice(0, 8);
 
-    const enrichment =
-      options?.enrichMetadata === false
-        ? null
-        : needsSourceEnrichment(existing)
-        ? await enrichSourceProfileWithOpenRouter({
-            domain,
-            sourceName: existing?.sourceName ?? stats.sourceName,
-          })
-        : null;
+    let enrichment: Awaited<ReturnType<typeof enrichSourceProfileWithOpenRouter>> | null = null;
+    let wikidataId: string | null = existing?.wikidataId ?? null;
+    if (options?.enrichMetadata !== false && needsSourceEnrichment(existing)) {
+      const sourceName = existing?.sourceName ?? stats.sourceName;
+      const wd = await enrichSourceProfileFromWikidata({ domain, sourceName });
+      if (wd) {
+        const { wikidataId: qid, ...rest } = wd;
+        enrichment = rest;
+        wikidataId = qid;
+      } else {
+        enrichment = await enrichSourceProfileWithOpenRouter({ domain, sourceName });
+      }
+    }
 
     await prisma.sourceProfile.upsert({
       where: { domain },
@@ -71,6 +76,7 @@ export async function upsertSourceProfiles(
         commonBiasSignals: nextBiasSignals,
         lastEnrichedAt: enrichment?.error ? existing?.lastEnrichedAt ?? null : enrichment ? new Date() : existing?.lastEnrichedAt ?? null,
         enrichmentModel: enrichment?.model ?? existing?.enrichmentModel ?? null,
+        wikidataId,
       },
       create: {
         domain,
@@ -89,6 +95,7 @@ export async function upsertSourceProfiles(
         commonBiasSignals: [...new Set([...stats.biasSignals])].slice(0, 8),
         lastEnrichedAt: enrichment?.error ? null : enrichment ? new Date() : null,
         enrichmentModel: enrichment?.model ?? null,
+        wikidataId,
       },
     });
   }

@@ -1,8 +1,14 @@
 # NER sidecar
 
-FastAPI service that runs spaCy `en_core_web_sm` and exposes a small JSON
+FastAPI service that runs spaCy `en_core_web_lg` and exposes a small JSON
 API used by `apps/api` for entity recognition. Kept as a separate process
 so we don't drag a Python runtime into the Node app.
+
+The default model was upgraded from `en_core_web_sm` (~50 MB) to
+`en_core_web_lg` (~600 MB) to fix recall on camelCase brand names that the
+small model misses (`GameStop`, `PayPal`, `eBay` is borderline). If disk
+space is tight, pin `NER_SPACY_MODEL=en_core_web_sm` and download the
+small model instead — accept the recall hit.
 
 ## Run with docker compose
 
@@ -17,7 +23,7 @@ curl http://localhost:8000/health
 cd apps/ner
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
+python -m spacy download en_core_web_lg
 uvicorn main:app --reload
 ```
 
@@ -34,5 +40,5 @@ The Node side maps `LOC → GPE` and drops `DATE` (not emitted here).
 
 | Env var          | Default            | Purpose                                  |
 | ---------------- | ------------------ | ---------------------------------------- |
-| `NER_SPACY_MODEL`| `en_core_web_sm`   | spaCy model name loaded at startup.      |
+| `NER_SPACY_MODEL`| `en_core_web_lg`   | spaCy model name loaded at startup.      |
 | `NER_MAX_CHARS`  | `50000`            | Per-document truncation before parsing.  |

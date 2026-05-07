@@ -374,9 +374,14 @@ class EntityLinkerService {
           }
 
           const data = (await response.json()) as {
-            query: { search: WikipediaSearchResult[] };
+            query?: { search?: WikipediaSearchResult[] };
+            error?: { code?: string; info?: string };
           };
-          return data.query.search || [];
+          // The API returns {error:{...}} (no `query` field) for malformed queries
+          // — currency tables and other extraction-noise entity names hit this.
+          // Treat any non-shape response as "no results" rather than crashing.
+          if (data.error || !data.query) return [];
+          return data.query.search ?? [];
         } finally {
           clearTimeout(timeout);
         }
@@ -453,8 +458,8 @@ class EntityLinkerService {
           }
 
           const data = (await response.json()) as {
-            query: {
-              pages: Record<
+            query?: {
+              pages?: Record<
                 string,
                 {
                   extract?: string;
@@ -464,8 +469,10 @@ class EntityLinkerService {
                 }
               >;
             };
+            error?: { code?: string; info?: string };
           };
 
+          if (data.error || !data.query?.pages) return {};
           const page = data.query.pages[String(pageId)];
           if (!page) {
             return {};

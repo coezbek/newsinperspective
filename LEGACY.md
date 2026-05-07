@@ -27,10 +27,12 @@ curl -X POST http://localhost:4400/internal/ingest/run \
   -d '{"date":"2026-03-23"}'
 ```
 
-Or run it directly from the CLI:
+Or run it directly via `tsx` (the `pnpm ingest` alias has been retired
+from `package.json` to keep the surface limited to the Kagi-cluster
+pipeline):
 
 ```bash
-pnpm ingest 2026-03-23
+pnpm --filter @news/api exec tsx src/scripts/ingest.ts 2026-03-23
 ```
 
 `INGEST_FEED_LIMIT` in `.env` caps how many feeds the legacy path pulls per

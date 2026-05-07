@@ -161,7 +161,7 @@
 <PerspectivePanel
   clusterId={story.id}
   {apiBase}
-  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText }))}
+  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText, sentiment: a.sentiment }))}
   {articlePath}
   {comparePath}
   {onNavigate}
@@ -327,10 +327,16 @@
     margin: -2px -2px 12px;
     padding: 2px 2px 0;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(255, 255, 255, 0.95));
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
     align-items: start;
-    justify-content: space-between;
-    gap: 16px;
+    gap: 24px;
+  }
+
+  @media (max-width: 760px) {
+    .detail-head {
+      grid-template-columns: 1fr;
+    }
   }
 
   .page-actions {

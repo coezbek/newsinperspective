@@ -87,23 +87,33 @@ async function callSidecar(payload: {
 function pickArticleText(article: {
   fullText: string | null;
   translatedFullText: string | null;
+  framingSummary: string | null;
   contentSnippet: string | null;
   summary: string | null;
   language: string | null;
 }): string {
-  // Prefer the LLM-cleaned English version when present (now produced for
-  // both English and non-English articles — strips chrome / image captions
-  // / boilerplate). Falls back to the raw English fullText, then content
-  // snippets. The `translatedFullText IS NULL → not-newsworthy` filter
-  // applied by the caller already excludes boilerplate articles.
+  // Preference order for SBERT input:
+  //   1. framingSummary — abstractive, written specifically to capture this
+  //      source's distinctive framing. Higher signal-to-noise than the full
+  //      body (the body usually shares verbatim wire-service quotes across
+  //      sources, which drag embeddings together) and short enough that it
+  //      never trips the LLM output-token cap that truncates translatedFullText.
+  //   2. translatedFullText — the LLM-cleaned full body. Used for older rows
+  //      that predate framingSummary, or when the model failed to produce one.
+  //   3. raw fullText — only safe for English-language articles (feeding raw
+  //      Cyrillic / Korean / etc. into the SBERT stack pollutes distinctive-word
+  //      output and gives noisy embeddings).
+  // The `translatedFullText IS NULL → not-newsworthy` filter applied by the
+  // caller already excludes boilerplate articles.
+  if (article.framingSummary && article.framingSummary.trim()) {
+    return article.framingSummary.trim();
+  }
   if (article.translatedFullText && article.translatedFullText.trim()) {
     return article.translatedFullText.trim();
   }
   const isEnglish =
     !article.language || article.language.toLowerCase().slice(0, 2) === "en";
   if (!isEnglish) {
-    // Non-English without translation: skip — feeding original-language
-    // text to the SBERT/TF-IDF stack pollutes distinctive-word output.
     return "";
   }
   return (article.fullText ?? article.contentSnippet ?? article.summary ?? "").trim();
