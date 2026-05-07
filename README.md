@@ -1,6 +1,29 @@
 # News In Perspective
 
+![News In Perspective](./Hero.png)
+
 Monorepo for a news-comparison project that ingests RSS feeds from Kagi's public `kite_feeds.json` catalog, stores normalized article data in Postgres, clusters same-day coverage, and exposes lightweight NLP comparison signals to a Svelte frontend.
+
+## Contents
+- [About this project](#about-this-project)
+- [Workspace](#workspace)
+- [Local setup](#local-setup)
+  - [Prerequisites](#prerequisites)
+  - [Steps](#steps)
+  - [Defaults & ports](#defaults--ports)
+  - [Configuration notes](#configuration-notes)
+  - [Troubleshooting](#troubleshooting)
+- [Ingestion](#ingestion)
+- [Daily pipeline](#daily-pipeline)
+  - [Single-command pipeline run](#single-command-pipeline-run)
+  - [Cluster selection knobs (kagi-ingest)](#cluster-selection-knobs-kagi-ingest)
+  - [Article enrichment & framing summary](#article-enrichment--framing-summary)
+- [Sidecar services](#sidecar-services)
+  - [Perspective sidecar](#perspective-sidecar)
+  - [NER sidecar](#ner-sidecar)
+- [API endpoints](#api-endpoints)
+- [Validation](#validation)
+- [Notebook workflow](#notebook-workflow)
 
 ## About this project
 
@@ -37,13 +60,16 @@ Repository: https://github.com/coezbek/newsinperspective
 - `packages/shared`: shared DTOs and schemas
 
 ## Local setup
-Prerequisites (Linux/macOS):
+
+### Prerequisites
+Linux/macOS, with:
 - `git`
 - `nvm`
 - Docker + Docker Compose
 - Python 3.12+ (for notebooks)
 - `uv` (for notebook workflow)
 
+### Steps
 1. Select and install the repo Node version: `nvm install && nvm use`
 2. Enable Corepack and install the pinned package manager: `corepack enable && corepack install`
 3. Create env file: `cp .env.example .env`
@@ -56,24 +82,30 @@ Prerequisites (Linux/macOS):
 
 `package.json` pins `pnpm@10.32.1`, so once Corepack is enabled it will provision the correct `pnpm` version for this repo. If `nvm` is not already installed on your machine, install it first and then run `nvm use`.
 
-API defaults to `http://localhost:4400`, the frontend defaults to `http://localhost:5317`, and Postgres is exposed on `localhost:55432`.
-Logical run dates default to `UTC` via `APP_DATE_TIMEZONE`, while stored timestamps remain UTC instants in Postgres.
+### Defaults & ports
+- API: `http://localhost:4400`
+- Frontend: `http://localhost:5317`
+- Postgres: `localhost:55432`
 
-If `pnpm db:start` fails with a Docker container-name conflict, you already have an existing
-`news-in-perspective-postgres` container from another checkout. Reuse that container or stop/remove it before retrying.
+### Configuration notes
+- Logical run dates default to `UTC` via `APP_DATE_TIMEZONE`; stored timestamps remain UTC instants in Postgres.
+- For the first few runs, the default `.env` sets `INGEST_FEED_LIMIT=50` so ingestion completes quickly while you validate the pipeline. Remove or increase that limit once you are ready for broader collection.
+- If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a broader comma-separated `OPENROUTER_MODEL` list.
 
-For the first few runs, the default `.env` sets `INGEST_FEED_LIMIT=50` so ingestion completes quickly while you validate the pipeline. Remove or increase that limit once you are ready for broader collection.
-If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a broader comma-separated `OPENROUTER_MODEL` list.
+### Troubleshooting
+- If `pnpm db:start` fails with a Docker container-name conflict, you already have an existing `news-in-perspective-postgres` container from another checkout. Reuse that container or stop/remove it before retrying.
 
 ## Ingestion
 
 The current ingestion path is the cluster-based Kagi News pipeline
-(`pnpm kagi:ingest` → `src/scripts/kagi-ingest.ts`). The original
-RSS-catalog ingestion has been retired from `package.json`; see
-[LEGACY.md](./LEGACY.md) for historical context.
+(`pnpm kagi:ingest` → `src/scripts/kagi-ingest.ts`). It pulls cluster
+snapshots from Kagi News and extracts article bodies via a headless
+browser. The original RSS-catalog ingestion has been retired from
+`package.json`; see [LEGACY.md](./LEGACY.md) for historical context.
 
-For a complete daily run (ingest + LLM enrichment + entities + perspective
-+ calibration in one process), use `pnpm pipeline:run` — see the
+`pnpm kagi:ingest` runs only stage 1 of the daily flow. For a complete
+daily run (ingest + LLM enrichment + entities + perspective +
+calibration in one process), use `pnpm pipeline:run` — see the
 [Daily pipeline](#daily-pipeline) section below.
 
 For long-running Kagi ingests, prefer a persistent `tmux` session with a log file so progress survives terminal disconnects:
@@ -82,23 +114,12 @@ For long-running Kagi ingests, prefer a persistent `tmux` session with a log fil
 mkdir -p logs
 tmux new-session -d -s kagi_ingest \
   "cd /home/coezbek/2026/NewsInPerspectiveCodex && pnpm kagi:ingest 2>&1 | tee logs/kagi-ingest-$(date -u +%Y%m%dT%H%M%SZ).log"
-```
 
-Watch it live with either:
-
-```bash
-tmux attach -t kagi_ingest
-```
-
-or:
-
-```bash
+# Watch live:
+tmux attach -t kagi_ingest          # detach with Ctrl+b d
 tail -f logs/kagi-ingest-*.log
-```
 
-Check whether it is still running:
-
-```bash
+# Check whether it is still running:
 tmux ls
 ```
 
@@ -247,6 +268,8 @@ preference order is: `framingSummary` → `translatedFullText` → raw English
 `fullText`. Older articles without `framingSummary` still work via the
 fallback; running `pnpm entity:re-enrich --force` repopulates them.
 
+## Sidecar services
+
 ### Perspective sidecar
 
 `apps/perspective/` is a FastAPI service that computes the cluster framing-divergence
@@ -282,23 +305,24 @@ curl http://127.0.0.1:5711/health
 spaCy labels to `EntityType` (`PERSON/ORG/GPE/EVENT`; `LOC→GPE`; `DATE`
 dropped). Configure with `NER_SERVICE_URL` and `NER_SERVICE_TIMEOUT_MS`.
 
-### Cluster/domain entity views
+## API endpoints
 
-Once stage 3 has populated `EntityMention`, three endpoints surface the
-"framing differences across outlets" data the notebook explored:
+Date and story browsing:
+
+- `GET /api/dates`
+- `GET /api/stories?date=2026-03-23`
+- `GET /api/stories/:id`
+- `GET /api/stories/:id/comparison`
+
+Cluster/domain entity views — once stage 3 has populated
+`EntityMention`, these surface the "framing differences across outlets"
+data the notebook explored:
 
 - `GET /api/clusters/:clusterId/entities` — top entities in a cluster.
 - `GET /api/clusters/:clusterId/entities/by-domain` — same, grouped by
   source domain.
 - `GET /api/domains/:domain/entities` — top entities for a single source
   across the corpus.
-
-Then inspect:
-
-- `GET /api/dates`
-- `GET /api/stories?date=2026-03-23`
-- `GET /api/stories/:id`
-- `GET /api/stories/:id/comparison`
 
 ## Validation
 - `pnpm lint`
