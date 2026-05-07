@@ -161,9 +161,10 @@
 <PerspectivePanel
   clusterId={story.id}
   {apiBase}
-  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText, sentiment: a.sentiment }))}
+  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText, sentiment: a.sentiment, country: a.country ?? null }))}
   {articlePath}
   {comparePath}
+  {tagPath}
   {onNavigate}
   {faviconUrl}
   {onFaviconError}

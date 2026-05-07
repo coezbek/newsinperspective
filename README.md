@@ -26,13 +26,13 @@ Repository: https://github.com/coezbek/newsinperspective
 - [Node.js](https://nodejs.org/) + [Fastify](https://fastify.dev/) + [TypeScript](https://www.typescriptlang.org/) API
 - [Prisma](https://www.prisma.io/) ORM with [PostgreSQL](https://www.postgresql.org/)
 - [OpenRouter](https://openrouter.ai/) for LLM-based keyword and entity enrichment
-- Named entity recognition and entity linking against [Wikidata](https://www.wikidata.org/)
+- Named entity recognition (spaCy) and entity linking against [Wikipedia](https://en.wikipedia.org/)
 
 ## Workspace
 - `apps/api`: Fastify API plus ingestion jobs
 - `apps/web`: Svelte + Vite frontend
 - `apps/perspective`: Python FastAPI sidecar for SBERT framing-divergence + RoBERTa sentiment + TF-IDF
-- `apps/ner`: Python FastAPI sidecar for spaCy `en_core_web_sm` named-entity recognition
+- `apps/ner`: Python FastAPI sidecar for spaCy `en_core_web_lg` named-entity recognition
 - `packages/db`: Prisma schema and generated client
 - `packages/shared`: shared DTOs and schemas
 
@@ -136,7 +136,7 @@ pipeline runner (`apps/api/src/services/pipeline-runner.ts`). The scheduler
 
 | Stage | Job kind | Script | Produces |
 | --- | --- | --- | --- |
-| 1 | `kagi-ingest` | `src/scripts/kagi-ingest.ts` | `Article.fullText`, `StoryCluster`, `ClusterArticle` |
+| 1 | `kagi-ingest` | `src/scripts/kagi-ingest.ts` | `Article.fullText`, `StoryCluster`, `ClusterArticle`, plus a best-effort `ClusterPerspective` row per cluster |
 | 2 | `openrouter-backlog` | `src/scripts/enrich-openrouter.ts` | `Article.translatedFullText`, `Article.language`, summary, cluster keywords |
 | 3 | `entity-re-enrich` | `src/scripts/entity-re-enrich.ts` | `NamedEntity`, `EntityMention` (spaCy NER + Wikipedia link inline) |
 | 4 | `cluster-perspective-backfill` | `src/scripts/cluster-perspective-backfill.ts` | Cluster perspective metrics |
@@ -172,7 +172,7 @@ pnpm pipeline:run
 pnpm pipeline:run --date=2026-05-07 --clusters=10 --articles-per-cluster=10
 
 # With paid OpenRouter fallback enabled (used only after the free pool fails):
-OPENROUTER_PAID_FALLBACK_MODEL=deepseek/deepseek-v4-flash \
+OPENROUTER_PAID_FALLBACK_MODEL=deepseek/deepseek-chat \
   pnpm pipeline:run
 ```
 
@@ -247,9 +247,30 @@ preference order is: `framingSummary` → `translatedFullText` → raw English
 `fullText`. Older articles without `framingSummary` still work via the
 fallback; running `pnpm entity:re-enrich --force` repopulates them.
 
+### Perspective sidecar
+
+`apps/perspective/` is a FastAPI service that computes the cluster framing-divergence
+score (SBERT `all-mpnet-base-v2`), per-source distinctive words (TF-IDF), and
+per-country sentiment (`cardiffnlp/twitter-roberta-base-sentiment-latest`).
+It is **not** in `docker-compose.yml`; start it locally with `uv`:
+
+```bash
+cd apps/perspective
+uv venv
+uv pip install -e .
+uv run python app.py
+```
+
+It listens on `127.0.0.1:5710` by default (`PERSPECTIVE_HOST` / `PERSPECTIVE_PORT`
+to override). First request cold-loads ~1 GB of models; `POST /warmup` preloads
+them. Stage 4 of the pipeline (`cluster-perspective-backfill`) calls this service
+— without it, divergence scores and distinctive words are not produced.
+
+See `apps/perspective/README.md` for the full API and config surface.
+
 ### NER sidecar
 
-`apps/ner/` is a FastAPI service running spaCy `en_core_web_sm`. Bring it up
+`apps/ner/` is a FastAPI service running spaCy `en_core_web_lg`. Bring it up
 alongside Postgres:
 
 ```bash

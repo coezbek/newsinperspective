@@ -27,33 +27,99 @@
   function renderMarkdown(input: string | null | undefined): string {
     if (!input) return "";
     const blocks = input.replace(/\r\n/g, "\n").trim().split(/\n{2,}/);
-    return blocks
+    type Kind = "ol" | "ul" | "p";
+    type Block = { kind: Kind; items: string[] };
+    const classified: Block[] = blocks
+      .map((block) => block.trim())
+      .filter((block) => block.length > 0)
       .map((block) => {
-        const trimmed = block.trim();
-        if (!trimmed) return "";
-        const lines = trimmed.split(/\n/);
-        const isOrderedList = lines.every((line) => /^\s*\d+\.\s+/.test(line));
-        if (isOrderedList) {
-          const items = lines
-            .map((line) => line.replace(/^\s*\d+\.\s+/, ""))
-            .map((item) => `<li>${renderInline(item)}</li>`)
-            .join("");
-          return `<ol>${items}</ol>`;
+        const lines = block.split(/\n/);
+        if (lines.every((line) => /^\s*\d+\.\s+/.test(line))) {
+          return { kind: "ol" as const, items: lines.map((line) => line.replace(/^\s*\d+\.\s+/, "")) };
         }
-        const isBulletList = lines.every((line) => /^\s*[-*]\s+/.test(line));
-        if (isBulletList) {
-          const items = lines
-            .map((line) => line.replace(/^\s*[-*]\s+/, ""))
-            .map((item) => `<li>${renderInline(item)}</li>`)
-            .join("");
-          return `<ul>${items}</ul>`;
+        if (lines.every((line) => /^\s*[-*]\s+/.test(line))) {
+          return { kind: "ul" as const, items: lines.map((line) => line.replace(/^\s*[-*]\s+/, "")) };
         }
-        return `<p>${renderInline(trimmed.replace(/\n/g, " "))}</p>`;
+        return { kind: "p" as const, items: [block.replace(/\n/g, " ")] };
+      });
+
+    // Merge consecutive list blocks of the same kind so e.g. "1. ...\n\n1. ..."
+    // (which the LLM often emits as separate paragraphs) renders as one list.
+    const merged: Block[] = [];
+    for (const block of classified) {
+      const last = merged[merged.length - 1];
+      if (last && (block.kind === "ol" || block.kind === "ul") && last.kind === block.kind) {
+        last.items.push(...block.items);
+      } else {
+        merged.push({ kind: block.kind, items: [...block.items] });
+      }
+    }
+
+    return merged
+      .map((block) => {
+        if (block.kind === "p") return `<p>${renderInline(block.items[0])}</p>`;
+        const items = block.items.map((item) => `<li>${renderInline(item)}</li>`).join("");
+        return `<${block.kind}>${items}</${block.kind}>`;
       })
       .join("");
   }
 
   import { pickTopSourcesByExtremity } from "../lib/perspective-picker.js";
+  import { countryFlagUrl } from "../lib/country-flag.js";
+  import CountryMap from "./CountryMap.svelte";
+
+  // Inject a flag image in front of bolded country names that the LLM
+  // narratives put at the start of list items (e.g. "**United States (avg_…**").
+  // Operates on the rendered HTML so it doesn't interfere with markdown parsing.
+  function injectCountryFlags(html: string): string {
+    return html.replace(
+      /<strong>([^<(]+?)(?=\s*[(:—–-])/g,
+      (match, name) => {
+        const url = countryFlagUrl(name.trim(), 40);
+        if (!url) return match;
+        return `<img class="country-flag" src="${url}" alt="" loading="lazy" /> <strong>${name}`;
+      },
+    );
+  }
+
+  // Inject a favicon and wrap bolded source names in a link to the article so
+  // editorial-angles narratives can be navigated. Mirrors injectCountryFlags
+  // but reads from articlesBySource and produces an <a class="source-inline-link">.
+  function injectSourceFavicons(html: string): string {
+    if (!articlesBySource || articlesBySource.size === 0) return html;
+    return html.replace(
+      /<strong>([^<]+?)<\/strong>/g,
+      (match, content: string) => {
+        // The LLM tends to emit "**Source Name**" or "**Source Name (extra)**".
+        // Pick the leading name segment up to the first delimiter.
+        const lead = content.match(/^([^(:—–-]+?)(?:\s*[(:—–-].*)?$/);
+        const name = (lead ? lead[1] : content).trim();
+        const key = name.toLowerCase();
+        const matches = articlesBySource.get(key) ?? articlesBySource.get(key.replace(/^the\s+/, ""));
+        if (!matches || matches.length === 0) return match;
+        const article = matches[0];
+        const favicon = faviconUrl
+          ? `<img class="source-inline-favicon" src="${faviconUrl(article.domain)}" alt="" loading="lazy" />`
+          : "";
+        if (articlePath) {
+          const href = articlePath(article.id);
+          return `${favicon}<a class="source-inline-link" href="${href}" data-article-id="${article.id}"><strong>${content}</strong></a>`;
+        }
+        return `${favicon}<strong>${content}</strong>`;
+      },
+    );
+  }
+
+  // Click delegate: the narrative HTML is rendered via {@html}, so Svelte's
+  // event bindings don't attach. We catch clicks on injected source links and
+  // route them through onNavigate for client-side navigation.
+  function handleNarrativeClick(event: MouseEvent): void {
+    const target = (event.target as HTMLElement | null)?.closest("a[data-article-id]") as HTMLAnchorElement | null;
+    if (!target || !onNavigate) return;
+    const href = target.getAttribute("href");
+    if (!href) return;
+    onNavigate(event, href);
+  }
 
   interface DistinctiveWords {
     source_name: string;
@@ -114,6 +180,7 @@
     url: string;
     hasFullText?: boolean;
     sentiment?: number | null;
+    country?: string | null;
   }
 
   // Static fallback for the divergence thresholds — only used if the server
@@ -127,6 +194,7 @@
     articles?: ArticleRef[];
     articlePath?: (id: string) => string;
     comparePath?: (aId: string, bId: string) => string;
+    tagPath?: (keyword: string) => string;
     onNavigate?: (event: MouseEvent, path: string) => void;
     faviconUrl?: (domain: string) => string;
     onFaviconError?: (event: Event) => void;
@@ -138,6 +206,7 @@
     articles = [],
     articlePath,
     comparePath,
+    tagPath,
     onNavigate,
     faviconUrl,
     onFaviconError,
@@ -715,8 +784,20 @@
           <tbody>
             {#each data.distinctive_words as row}
               {@const matches = articlesForSource(row.source_name)}
+              {@const sourceDom = matches[0]?.domain ?? ""}
               <tr>
                 <td class="source-cell">
+                  {#if sourceDom && faviconUrl}
+                    <img
+                      class="source-cell-favicon"
+                      src={faviconUrl(sourceDom)}
+                      alt=""
+                      width="18"
+                      height="18"
+                      loading="lazy"
+                      onerror={onFaviconError}
+                    />
+                  {/if}
                   {#if matches.length > 0 && articlePath}
                     <a
                       class="source-link"
@@ -751,8 +832,13 @@
         <ul class="country-list">
           {#each data.country_sentiment as c}
             <li>
-              <span class="country-name">{c.country}</span>
-              <span class="country-n">n={c.n_articles}</span>
+              <span class="country-name">
+                {#if countryFlagUrl(c.country)}
+                  <img class="country-flag" src={countryFlagUrl(c.country, 40)} alt="" loading="lazy" />
+                {/if}
+                <span class="country-name-text">{c.country}</span>
+                <span class="country-n">n={c.n_articles}</span>
+              </span>
               <span class="country-bar" style={sentimentBarStyle(c.avg_sentiment)}>
                 <span class="country-bar-fill"></span>
               </span>
@@ -761,7 +847,15 @@
             {#if c.top_keywords && c.top_keywords.length > 0}
               <li class="country-keywords">
                 {#each c.top_keywords as kw}
-                  <span class="word-chip">{kw}</span>
+                  {#if tagPath}
+                    <a
+                      class="word-chip word-chip-link"
+                      href={tagPath(kw)}
+                      onclick={(event) => onNavigate && tagPath && onNavigate(event, tagPath(kw))}
+                    >{kw}</a>
+                  {:else}
+                    <span class="word-chip">{kw}</span>
+                  {/if}
                 {/each}
               </li>
             {/if}
@@ -785,19 +879,27 @@
         {#if data.narrative.framingAngles}
           <div class="perspective-block narrative-block">
             <h5>Editorial angles</h5>
-            <div class="narrative-body">{@html renderMarkdown(data.narrative.framingAngles)}</div>
+            <div class="narrative-body" onclick={handleNarrativeClick}>{@html injectSourceFavicons(renderMarkdown(data.narrative.framingAngles))}</div>
           </div>
         {/if}
         {#if data.narrative.countryNarrative}
           <div class="perspective-block narrative-block">
             <h5>National narratives</h5>
-            <div class="narrative-body">{@html renderMarkdown(data.narrative.countryNarrative)}</div>
+            <div class="narrative-body" onclick={handleNarrativeClick}>{@html injectCountryFlags(renderMarkdown(data.narrative.countryNarrative))}</div>
           </div>
         {/if}
       </div>
       {#if data.narrative.model}
         <p class="perspective-note narrative-credit">Generated by {data.narrative.model}</p>
       {/if}
+    {/if}
+
+    {#if articles && articles.length > 0}
+      <div class="perspective-block country-map-block">
+        <CountryMap
+          articles={articles.map((a) => ({ domain: a.domain, country: a.country ?? null }))}
+        />
+      </div>
     {/if}
 
     <p class="perspective-footer">
@@ -897,6 +999,49 @@
   .distinctive-table { width: 100%; border-collapse: collapse; }
   .distinctive-table th, .distinctive-table td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid #eee; vertical-align: top; }
   .source-cell { font-weight: 500; white-space: nowrap; }
+  .source-cell-favicon {
+    display: inline-block;
+    vertical-align: -4px;
+    width: 18px;
+    height: 18px;
+    margin-right: 6px;
+    border-radius: 4px;
+    object-fit: cover;
+    background: #fff;
+  }
+  .country-flag {
+    display: inline-block;
+    width: 1.4em;
+    height: auto;
+    vertical-align: -0.2em;
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(20, 32, 51, 0.08);
+  }
+  .narrative-body :global(.country-flag) {
+    width: auto;
+    height: 1em;
+    margin-right: 0.3rem;
+    vertical-align: -0.1em;
+  }
+  .narrative-body :global(.source-inline-favicon) {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    margin-right: 0.3rem;
+    vertical-align: -0.15em;
+    border-radius: 3px;
+    object-fit: cover;
+    background: #fff;
+  }
+  .narrative-body :global(.source-inline-link) {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(10, 60, 150, 0.45);
+  }
+  .narrative-body :global(.source-inline-link:hover) {
+    color: #0a3c96;
+    border-bottom-color: currentColor;
+  }
   .source-link { color: #1c4566; text-decoration: none; border-bottom: 1px dotted #9bb1c7; }
   .source-link:hover { color: #0a3c96; border-bottom-color: #0a3c96; }
   .source-count { color: #888; font-weight: 400; font-size: 0.75rem; margin-left: 0.2rem; }
@@ -1002,10 +1147,13 @@
     font-size: 0.78rem;
     margin: 0.1rem 0.2rem 0.1rem 0;
   }
+  .word-chip-link { text-decoration: none; cursor: pointer; }
+  .word-chip-link:hover { background: #dde7f1; color: #0a3c96; }
   .country-list { list-style: none; padding: 0; margin: 0; }
-  .country-list li { display: grid; grid-template-columns: minmax(7rem, 9rem) 3.5rem 1fr 7rem; align-items: center; gap: 0.5rem; padding: 0.2rem 0; }
+  .country-list li { display: grid; grid-template-columns: minmax(11rem, 14rem) 1fr 7rem; align-items: center; gap: 0.5rem; padding: 0.2rem 0; }
   .country-list li.country-keywords { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; grid-template-columns: none; }
-  .country-name { font-weight: 500; }
+  .country-name { font-weight: 500; display: inline-flex; align-items: center; gap: 0.4rem; min-width: 0; }
+  .country-name-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .country-n { color: #777; font-size: 0.8rem; }
   .country-bar { position: relative; height: 0.55rem; background: #ececec; border-radius: 3px; overflow: hidden; }
   .country-bar-fill {

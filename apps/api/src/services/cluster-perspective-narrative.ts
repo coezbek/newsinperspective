@@ -5,6 +5,9 @@ import { prisma } from "../lib/prisma.js";
 import { withLlmCache } from "./llm-cache.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 import type { SidecarAnalyzeResponse } from "./cluster-perspective.js";
+import { logLlmRequest, logLlmResponse } from "../lib/llm-trace.js";
+
+const NARRATIVE_TRACE_KIND = "cluster-perspective-narrative";
 
 type CallResult = { content: string; model: string } | { error: string };
 
@@ -119,6 +122,7 @@ async function callOpenRouterUncached(prompt: string, seed: string): Promise<Cal
 
   let lastError = "OpenRouter request failed";
   for (const model of models) {
+    const trace = logLlmRequest({ kind: NARRATIVE_TRACE_KIND, model, contextId: seed, prompt });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
     try {
@@ -143,15 +147,39 @@ async function callOpenRouterUncached(prompt: string, seed: string): Promise<Cal
         signal: controller.signal,
       });
       if (!res.ok) {
+        const details = await res.text().catch(() => "");
         lastError = `OpenRouter ${model}: HTTP ${res.status}`;
+        logLlmResponse({
+          id: trace.id, kind: NARRATIVE_TRACE_KIND, model, contextId: seed, startedAt: trace.startedAt,
+          ok: false, httpStatus: res.status, content: details, error: lastError,
+        });
         continue;
       }
-      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-      const content = stripModelReasoning(data.choices?.[0]?.message?.content ?? "");
-      if (content.length > 0) return { content, model };
+      const data = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      };
+      const rawContent = data.choices?.[0]?.message?.content ?? "";
+      const finishReason = data.choices?.[0]?.finish_reason;
+      const content = stripModelReasoning(rawContent);
+      if (content.length > 0) {
+        logLlmResponse({
+          id: trace.id, kind: NARRATIVE_TRACE_KIND, model, contextId: seed, startedAt: trace.startedAt,
+          ok: true, content: rawContent, finishReason, usage: data.usage ?? null,
+        });
+        return { content, model };
+      }
       lastError = `OpenRouter ${model}: empty response`;
+      logLlmResponse({
+        id: trace.id, kind: NARRATIVE_TRACE_KIND, model, contextId: seed, startedAt: trace.startedAt,
+        ok: false, content: rawContent, finishReason, usage: data.usage ?? null, error: lastError,
+      });
     } catch (err) {
       lastError = `OpenRouter ${model}: ${err instanceof Error ? err.message : String(err)}`;
+      logLlmResponse({
+        id: trace.id, kind: NARRATIVE_TRACE_KIND, model, contextId: seed, startedAt: trace.startedAt,
+        ok: false, error: lastError,
+      });
     } finally {
       clearTimeout(timer);
     }

@@ -7,7 +7,7 @@
  * on (the underlying script processes a fixed batch per call).
  *
  * Usage:
- *   pnpm pipeline:run [--date=YYYY-MM-DD] [--clusters=10] [--articles-per-cluster=10]
+ *   pnpm pipeline:run [--date=YYYY-MM-DD] [--clusters=10] [--articles-per-cluster=10] [--narrative]
  *
  * Defaults reproduce the README's "100-article test (10 clusters x <=10
  * articles)" scenario for the current UTC day. Each stage's stdout/stderr
@@ -35,6 +35,10 @@ function getCliArg(name: string): string | undefined {
     if (arg.startsWith(`--${name}=`)) return arg.slice(name.length + 3);
   }
   return undefined;
+}
+
+function hasCliFlag(name: string): boolean {
+  return process.argv.slice(2).some((arg) => arg === `--${name}`);
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -185,6 +189,7 @@ async function main(): Promise<void> {
   const topClusters = parsePositiveInt(getCliArg("clusters"), 10);
   const maxArticlesPerCluster = parsePositiveInt(getCliArg("articles-per-cluster"), 10);
   const enrichmentMaxRounds = parsePositiveInt(getCliArg("enrichment-rounds"), 20);
+  const wantNarrative = hasCliFlag("narrative");
 
   const logsDir = resolve(process.cwd(), "logs");
   await mkdir(logsDir, { recursive: true });
@@ -193,17 +198,25 @@ async function main(): Promise<void> {
   console.log(`  Date:                       ${date}`);
   console.log(`  Top clusters:               ${topClusters}`);
   console.log(`  Max articles per cluster:   ${maxArticlesPerCluster}`);
+  console.log(`  Narrative generation:       ${wantNarrative ? "enabled (--narrative)" : "disabled (default; pass --narrative to enable)"}`);
   console.log(`  Paid fallback model:        ${process.env.OPENROUTER_PAID_FALLBACK_MODEL ?? "(unset)"}`);
   console.log(`  OpenRouter API key set:     ${process.env.OPENROUTER_API_KEY ? "yes" : "no"}`);
   console.log(`  Logs directory:             ${logsDir}`);
   console.log("==============================================");
 
   // Stage env: cap source extraction to the requested per-cluster article
-  // count, and force re-extraction so a re-run on the same date refreshes
-  // article bodies instead of skipping them.
+  // count, and (by default) force re-extraction so a re-run on the same
+  // date refreshes article bodies instead of skipping them. Defaults are
+  // applied only when the parent shell hasn't already exported the var,
+  // so an additive run (e.g. "add 5 more clusters at 20 articles each
+  // without disturbing yesterday's 10x10") can be invoked with
+  // `KAGI_INGEST_SKIP_EXISTING=true pnpm pipeline:run --clusters=15
+  //   --articles-per-cluster=20`.
   const stageEnv: NodeJS.ProcessEnv = {
-    KAGI_INGEST_MAX_SOURCES_PER_CLUSTER: String(maxArticlesPerCluster),
-    KAGI_INGEST_SKIP_EXISTING: "false",
+    KAGI_INGEST_MAX_SOURCES_PER_CLUSTER:
+      process.env.KAGI_INGEST_MAX_SOURCES_PER_CLUSTER ?? String(maxArticlesPerCluster),
+    KAGI_INGEST_SKIP_EXISTING:
+      process.env.KAGI_INGEST_SKIP_EXISTING ?? "false",
     ENRICHMENT_CONCURRENCY: process.env.ENRICHMENT_CONCURRENCY ?? "2",
   };
 
@@ -289,6 +302,24 @@ async function main(): Promise<void> {
       logsDir,
     ),
   );
+
+  // -- Stage 6: Cluster narrative (opt-in) ----------------------------------
+  // Per-cluster LLM prose summary of distinctive framing angles + per-country
+  // narrative — out-of-band by default because each cluster spends extra
+  // tokens on top of stage 2's enrichment. Use `--narrative` to enable.
+  // Scoped to today's date via `--from-date`; the underlying script also
+  // skips clusters that already have a narrative unless --force is passed.
+  if (wantNarrative) {
+    results.push(
+      await runStage(
+        "6-narrative",
+        "src/scripts/perspective-narrative.ts",
+        ["--from-date", date],
+        stageEnv,
+        logsDir,
+      ),
+    );
+  }
 
   return finalize(results, logsDir);
 }

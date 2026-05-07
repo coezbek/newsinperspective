@@ -2,6 +2,8 @@ import { env } from "../config/env.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 import { callOpenAIFallback } from "./openai-fallback.js";
 import { withLlmCache } from "./llm-cache.js";
+import { logLlmRequest, logLlmResponse } from "../lib/llm-trace.js";
+import { isProbablyEnglish } from "../lib/language-check.js";
 
 interface OpenRouterArticleEnrichmentInput {
   title: string;
@@ -10,6 +12,8 @@ interface OpenRouterArticleEnrichmentInput {
   language: string | null;
   maxKeywords?: number;
   onAttemptLog?: (message: string) => void;
+  /** Optional correlation id (article DB id) for the LLM trace log. */
+  contextId?: string;
 }
 
 export interface OpenRouterArticleEnrichmentResult {
@@ -303,7 +307,11 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- if cleanup leaves < 30 words, set isNewsworthy=false and translatedFullText=null",
     "Keyword/entity rules:",
     `- return at most ${maxKeywords} keywords`,
-    "- keywords must be concise English topical labels of 1 to 4 words",
+    "- keywords must be concise English topical labels of 1 to 3 words",
+    "- aim for a balanced mix across these slots when applicable: 1 location/region, 1-2 key people, 1 organization or named event, 1-2 broad topical themes",
+    "- prefer reusable, high-value labels that group related stories: \"Ukraine conflict\", \"Trump\", \"UEFA Cup\", \"ceasefire\", \"AI regulation\"",
+    "- do NOT combine a person/place with an action into one keyword — split them: use \"Kramatorsk\" + \"air strike\", not \"Kramatorsk air strike\"; use \"Zelenskyy\" + \"ceasefire proposal\", not \"Zelenskyy ceasefire proposal\"",
+    "- avoid hyper-specific event compounds tied to a single article — prefer the underlying concept that other articles would also use",
     "- use specific topical concepts, not generic labels",
     "- do not output vague keywords such as: news, article, report, issue, attack, company milestone, analysis, story, update, release, event",
     "- preserve proper names exactly when possible",
@@ -331,7 +339,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- avoid terms like: \"released\", \"new\", \"cyber attack\" unless the text is explicitly about an attack campaign and no more specific label exists",
     "Examples:",
     "Example 1 input title: The 'S' in Zoom, Stands for Security",
-    "Example 1 output: {\"isNewsworthy\":true,\"notNewsworthyReason\":null,\"keywords\":[\"Zoom security\",\"privilege escalation\",\"macOS vulnerability\",\"webcam access\",\"microphone access\"],\"translatedTitle\":\"The 'S' in Zoom, Stands for Security\",\"translatedSummary\":\"The article describes two local security flaws in Zoom's macOS client, including privilege escalation and covert webcam and microphone access.\",\"translatedFullText\":\"<cleaned body>\",\"framingSummary\":\"The piece treats Zoom's macOS client as a recurring offender, framing the two new flaws as predictable rather than surprising. The author emphasises that both issues stem from the same architectural pattern — Zoom's reliance on auxiliary helper processes — and reads as a critique of Apple's review process for Mac App Store distribution. Quotes from the disclosing researcher dominate; Zoom's response is summarised in one line and characterised as 'minimal'. The framing centres on vendor accountability rather than user mitigation.\",\"persons\":[],\"organizations\":[\"Zoom\"],\"places\":[],\"language\":\"en\",\"bodyAppearsTruncated\":false}",
+    "Example 1 output: {\"isNewsworthy\":true,\"notNewsworthyReason\":null,\"keywords\":[\"Zoom\",\"macOS\",\"privilege escalation\",\"webcam access\",\"cybersecurity\"],\"translatedTitle\":\"The 'S' in Zoom, Stands for Security\",\"translatedSummary\":\"The article describes two local security flaws in Zoom's macOS client, including privilege escalation and covert webcam and microphone access.\",\"translatedFullText\":\"<cleaned body>\",\"framingSummary\":\"The piece treats Zoom's macOS client as a recurring offender, framing the two new flaws as predictable rather than surprising. The author emphasises that both issues stem from the same architectural pattern — Zoom's reliance on auxiliary helper processes — and reads as a critique of Apple's review process for Mac App Store distribution. Quotes from the disclosing researcher dominate; Zoom's response is summarised in one line and characterised as 'minimal'. The framing centres on vendor accountability rather than user mitigation.\",\"persons\":[],\"organizations\":[\"Zoom\"],\"places\":[],\"language\":\"en\",\"bodyAppearsTruncated\":false}",
     "Example 2 (non-newsworthy): Body is 'JTBC Co., Ltd. CEO: Jeon Jin-bae, address: 38 Sangam-san-ro... business registration number: 104-86-33995... All Rights Reserved.'",
     "Example 2 output: {\"isNewsworthy\":false,\"notNewsworthyReason\":\"corporate boilerplate\",\"keywords\":[],\"translatedTitle\":null,\"translatedSummary\":null,\"translatedFullText\":null,\"framingSummary\":null,\"persons\":[],\"organizations\":[\"JTBC\"],\"places\":[],\"language\":\"en\",\"bodyAppearsTruncated\":false}",
     "",
@@ -420,6 +428,17 @@ function isResponseComplete(
   ) {
     return false;
   }
+  // Reject responses where the model echoed the source language back into
+  // translatedFullText instead of translating it. franc-min on 30+ char input
+  // is reliable enough to reject confident non-English without false-rejecting
+  // English-with-loanwords. Short bodies are skipped (returns true).
+  if (
+    parsed.translatedFullText &&
+    parsed.translatedFullText.length >= 200 &&
+    !isProbablyEnglish(parsed.translatedFullText)
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -434,6 +453,7 @@ async function performOpenRouterRequest(params: {
   bodyHasContent: boolean;
   inputTruncated: boolean;
   timeoutMs: number;
+  contextId?: string;
 }): Promise<
   | {
       ok: true;
@@ -447,7 +467,9 @@ async function performOpenRouterRequest(params: {
       finishReasonLength: boolean;
     }
 > {
-  const { model, prompt, bodyHasContent, inputTruncated, timeoutMs } = params;
+  const { model, prompt, bodyHasContent, inputTruncated, timeoutMs, contextId } = params;
+  const traceKind = "openrouter-article-enrichment";
+  const trace = logLlmRequest({ kind: traceKind, model, contextId, prompt });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response: Response;
@@ -473,13 +495,12 @@ async function performOpenRouterRequest(params: {
       signal: controller.signal,
     });
   } catch (error) {
-    return {
-      ok: false,
-      error: `OpenRouter request failed: ${error instanceof Error ? error.message : String(error)}`,
-      retryable: true,
-      retryAfterMs: null,
-      finishReasonLength: false,
-    };
+    const msg = `OpenRouter request failed: ${error instanceof Error ? error.message : String(error)}`;
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+      ok: false, error: msg,
+    });
+    return { ok: false, error: msg, retryable: true, retryAfterMs: null, finishReasonLength: false };
   } finally {
     clearTimeout(timeout);
   }
@@ -487,9 +508,14 @@ async function performOpenRouterRequest(params: {
   if (!response.ok) {
     const details = await response.text().catch(() => "");
     const retryable = isRetryableStatus(response.status);
+    const msg = `OpenRouter error ${response.status}: ${details.slice(0, 240)}`;
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+      ok: false, httpStatus: response.status, error: msg, content: details,
+    });
     return {
       ok: false,
-      error: `OpenRouter error ${response.status}: ${details.slice(0, 240)}`,
+      error: msg,
       retryable,
       retryAfterMs: retryable ? parseRetryAfterMs(response.headers.get("retry-after")) : null,
       finishReasonLength: false,
@@ -518,9 +544,14 @@ async function performOpenRouterRequest(params: {
   // parsed reply rather than burning the rotation. When we didn't slice,
   // it's a genuine output overflow and we retry the next model.
   if (finishReason === "length" && !inputTruncated) {
+    const msg = `Model ${model} hit output token cap (finish_reason=length)`;
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+      ok: false, content, finishReason, usage: payload.usage ?? null, error: msg,
+    });
     return {
       ok: false,
-      error: `Model ${model} hit output token cap (finish_reason=length)`,
+      error: msg,
       retryable: true,
       retryAfterMs: null,
       finishReasonLength: true,
@@ -529,23 +560,46 @@ async function performOpenRouterRequest(params: {
 
   const parsed = parseEnrichmentFromResponse(content);
   if (!parsed) {
+    const msg = "No parseable article enrichment JSON in model response";
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+      ok: false, content, finishReason, usage: payload.usage ?? null, error: msg,
+    });
     return {
       ok: false,
-      error: "No parseable article enrichment JSON in model response",
+      error: msg,
       retryable: true,
       retryAfterMs: null,
       finishReasonLength: false,
     };
   }
   if (!isResponseComplete(parsed, bodyHasContent, inputTruncated)) {
+    let reason = "Model returned incomplete enrichment (missing translatedFullText)";
+    if (parsed.translatedFullText && looksTruncated(parsed.translatedFullText)) {
+      reason = "Model returned truncated translatedFullText";
+    } else if (
+      parsed.translatedFullText &&
+      parsed.translatedFullText.length >= 200 &&
+      !isProbablyEnglish(parsed.translatedFullText)
+    ) {
+      reason = "Model echoed non-English source into translatedFullText instead of translating";
+    }
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+      ok: false, content, finishReason, usage: payload.usage ?? null, error: reason,
+    });
     return {
       ok: false,
-      error: "Model returned incomplete enrichment (missing translatedFullText)",
+      error: reason,
       retryable: true,
       retryAfterMs: null,
       finishReasonLength: false,
     };
   }
+  logLlmResponse({
+    id: trace.id, kind: traceKind, model, contextId, startedAt: trace.startedAt,
+    ok: true, content, finishReason, usage: payload.usage ?? null,
+  });
   return { ok: true, parsed };
 }
 
@@ -575,6 +629,7 @@ async function runArticleEnrichmentRequest(
         bodyHasContent,
         inputTruncated,
         timeoutMs: openRouterTimeoutMs,
+        contextId: input.contextId ?? input.title.slice(0, 80),
       });
       if (result.ok) {
         return { ...result.parsed, inputTruncated, model, error: null };
@@ -611,6 +666,7 @@ async function runArticleEnrichmentRequest(
       bodyHasContent,
       inputTruncated,
       timeoutMs: openRouterTimeoutMs * 4,
+      contextId: input.contextId ?? input.title.slice(0, 80),
     });
     if (result.ok) {
       log?.(`openrouter-paid-fallback: ${paidModel} success`);
@@ -620,7 +676,12 @@ async function runArticleEnrichmentRequest(
   }
 
   // OpenRouter exhausted — try OpenAI direct as the very last resort.
-  const fallback = await callOpenAIFallback({ prompt, onAttemptLog: log });
+  const fallback = await callOpenAIFallback({
+    prompt,
+    onAttemptLog: log,
+    kind: "article-enrichment",
+    contextId: input.contextId ?? input.title.slice(0, 80),
+  });
   if (fallback) {
     const parsed = parseEnrichmentFromResponse(fallback.content);
     if (parsed && isResponseComplete(parsed, bodyHasContent, inputTruncated)) {

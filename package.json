@@ -21,6 +21,7 @@
     "export:notebook": "python3 notebooks/src/export_news_slice.py",
     "kagi:ingest": "pnpm --filter @news/api kagi:ingest",
     "pipeline:run": "pnpm --filter @news/api pipeline:run",
+    "inspect:pair": "pnpm --filter @news/api inspect:pair",
     "kagi:backfill-redirects": "pnpm --filter @news/api kagi:backfill-redirects",
     "kagi:backfill-dedupe": "pnpm --filter @news/api kagi:backfill-dedupe",
     "kagi:dedupe-status": "pnpm --filter @news/api kagi:dedupe-status",

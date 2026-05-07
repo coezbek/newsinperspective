@@ -1,5 +1,8 @@
 import { env } from "../config/env.js";
 import { resolveCountryFromDomain } from "./country-from-domain.js";
+import { logLlmRequest, logLlmResponse } from "../lib/llm-trace.js";
+
+const SOURCE_PROFILE_TRACE_KIND = "openrouter-source-profile";
 
 export interface SourceProfileEnrichmentResult {
   description: string | null;
@@ -102,6 +105,12 @@ export async function enrichSourceProfileWithOpenRouter(input: {
     `Source name: ${input.sourceName}`,
   ].join("\n");
 
+  const trace = logLlmRequest({
+    kind: SOURCE_PROFILE_TRACE_KIND,
+    model,
+    contextId: input.domain,
+    prompt,
+  });
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -118,6 +127,12 @@ export async function enrichSourceProfileWithOpenRouter(input: {
 
     if (!response.ok) {
       const details = await response.text();
+      logLlmResponse({
+        id: trace.id, kind: SOURCE_PROFILE_TRACE_KIND, model,
+        contextId: input.domain, startedAt: trace.startedAt,
+        ok: false, httpStatus: response.status, content: details,
+        error: `http ${response.status}`,
+      });
       return {
         description: null,
         country: fastPathCountry,
@@ -134,11 +149,19 @@ export async function enrichSourceProfileWithOpenRouter(input: {
     }
 
     const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
     const content = payload.choices?.[0]?.message?.content ?? "";
+    const finishReason = payload.choices?.[0]?.finish_reason;
     const parsed = parseSourceProfileFromResponse(content);
     if (!parsed) {
+      logLlmResponse({
+        id: trace.id, kind: SOURCE_PROFILE_TRACE_KIND, model,
+        contextId: input.domain, startedAt: trace.startedAt,
+        ok: false, content, finishReason, usage: payload.usage ?? null,
+        error: "No parseable source profile JSON in model response",
+      });
       return {
         description: null,
         country: fastPathCountry,
@@ -154,6 +177,11 @@ export async function enrichSourceProfileWithOpenRouter(input: {
       };
     }
 
+    logLlmResponse({
+      id: trace.id, kind: SOURCE_PROFILE_TRACE_KIND, model,
+      contextId: input.domain, startedAt: trace.startedAt,
+      ok: true, content, finishReason, usage: payload.usage ?? null,
+    });
     return {
       ...parsed,
       country: parsed.country ?? fastPathCountry,
@@ -162,6 +190,11 @@ export async function enrichSourceProfileWithOpenRouter(input: {
       error: null,
     };
   } catch (error) {
+    logLlmResponse({
+      id: trace.id, kind: SOURCE_PROFILE_TRACE_KIND, model,
+      contextId: input.domain, startedAt: trace.startedAt,
+      ok: false, error: error instanceof Error ? error.message : String(error),
+    });
     return {
       description: null,
       country: fastPathCountry,

@@ -9,7 +9,7 @@
  * Features:
  * - Wikipedia API integration (multi-step search + content fetch)
  * - Intelligent disambiguation (type-aware entity matching)
- * - Disk caching (7-day TTL with cache invalidation)
+ * - Disk caching (30-day TTL with cache invalidation)
  * - Retry logic (3 retries with exponential backoff)
  * - Timeout protection (5-second AbortController)
  * - Error recovery (graceful degradation on API failures)
@@ -44,19 +44,16 @@ const WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php";
 const WIKIPEDIA_TIMEOUT_MS = 5000;
 const MAX_RETRIES = 3;
 const BACKOFF_MS = [1000, 3000, 10000];
-// Positive entries (entity → Wikipedia page) re-validate after a week so
-// summary/image refreshes flow through. Negative entries (entity has no
-// Wikipedia hit) are stable for 100 days — once "Hãng" or "el marco" misses,
-// it'll keep missing, no point re-asking Wikipedia repeatedly.
-const POSITIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const NEGATIVE_TTL_MS = 100 * 24 * 60 * 60 * 1000;
+// Unified 30-day TTL for both positive (entity → Wikipedia page) and negative
+// (no Wikipedia match) entries. Long enough to amortize away most repeat
+// lookups; short enough that summary/image refreshes flow through monthly.
+const POSITIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const NEGATIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const WIKIPEDIA_BATCH_SIZE = 50; // MediaWiki action API hard cap on `pageids`
 
 const wikipediaCache = new DiskCache<CachedEntity>({
   namespace: "wikipedia",
-  // Outer TTL is the larger of the two so negative entries don't get evicted
-  // early. The per-entry positive TTL is enforced inside getCachedResult.
-  ttlMs: NEGATIVE_TTL_MS,
+  ttlMs: POSITIVE_TTL_MS,
   disableEnvVar: "WIKIPEDIA_CACHE_DISABLE",
   dirEnvVar: "WIKIPEDIA_CACHE_DIR",
 });
@@ -810,7 +807,7 @@ class EntityLinkerService {
   /**
    * Get cached entity result
    *
-   * Checks if cache is valid (7-day TTL)
+   * Checks if cache is valid (30-day TTL)
    * Removes expired cache files
    *
    * @param entityName - Entity name to lookup
@@ -821,8 +818,7 @@ class EntityLinkerService {
       wikipediaCache.keyFor(this.normalizeKey(entityName)),
     );
     if (!cached) return null;
-    if (cached.notFound) return cached; // 100-day TTL, enforced by DiskCache
-    // Positive entries get a tighter 7-day TTL — Wikipedia summaries change.
+    if (cached.notFound) return cached;
     if (Date.now() - cached.cachedAt > POSITIVE_TTL_MS) return null;
     return cached;
   }

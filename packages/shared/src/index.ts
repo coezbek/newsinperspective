@@ -66,6 +66,7 @@ export const storyDetailSchema = storyListItemSchema.extend({
       sentiment: z.number(),
       subjectivity: z.number(),
       biasSignals: z.array(z.string()),
+      country: z.string().nullable().optional(),
     }),
   ),
 });

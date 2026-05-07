@@ -12,6 +12,7 @@
 
 import type { SourceProfileEnrichmentResult } from "./source-profile-enrichment.js";
 import { resolveCountryFromDomain } from "./country-from-domain.js";
+import { DiskCache } from "./disk-cache.js";
 
 export interface WikidataEnrichmentResult extends SourceProfileEnrichmentResult {
   wikidataId: string;
@@ -23,6 +24,39 @@ const WP_REST_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/";
 const USER_AGENT =
   "NewsInPerspective/1.0 (https://github.com/coezbek/NewsInPerspectiveCodex; c.oezbek@gmail.com) source-profile enrichment";
 const HTTP_TIMEOUT_MS = 8000;
+
+// 30-day TTL for all Wikidata/Wikipedia source-profile lookups. Source profiles
+// (country, HQ, owner) change very rarely; caching aggressively here is safe
+// and removes the bulk of the latency on repeat enrichment runs.
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const searchCache = new DiskCache<SearchCandidate[]>({
+  namespace: "wikidata-search",
+  ttlMs: CACHE_TTL_MS,
+  disableEnvVar: "WIKIDATA_CACHE_DISABLE",
+  dirEnvVar: "WIKIDATA_CACHE_DIR",
+});
+
+const sparqlCache = new DiskCache<Array<[string, CandidateProps]>>({
+  namespace: "wikidata-sparql",
+  ttlMs: CACHE_TTL_MS,
+  disableEnvVar: "WIKIDATA_CACHE_DISABLE",
+  dirEnvVar: "WIKIDATA_CACHE_DIR",
+});
+
+const summaryCache = new DiskCache<{ summary: string | null }>({
+  namespace: "wikipedia-summary",
+  ttlMs: CACHE_TTL_MS,
+  disableEnvVar: "WIKIDATA_CACHE_DISABLE",
+  dirEnvVar: "WIKIDATA_CACHE_DIR",
+});
+
+const enrichCache = new DiskCache<{ result: WikidataEnrichmentResult | null }>({
+  namespace: "wikidata-enrich",
+  ttlMs: CACHE_TTL_MS,
+  disableEnvVar: "WIKIDATA_CACHE_DISABLE",
+  dirEnvVar: "WIKIDATA_CACHE_DIR",
+});
 
 function normalizeDomain(domain: string): string {
   return domain.toLowerCase().replace(/^www\./, "").trim();
@@ -79,17 +113,19 @@ interface SearchCandidate {
 }
 
 async function searchCandidates(query: string): Promise<SearchCandidate[]> {
-  const url = new URL(WBSEARCH_URL);
-  url.searchParams.set("action", "wbsearchentities");
-  url.searchParams.set("search", query);
-  url.searchParams.set("language", "en");
-  url.searchParams.set("format", "json");
-  url.searchParams.set("type", "item");
-  url.searchParams.set("limit", "5");
-  const response = await fetchWithTimeout(url.toString());
-  if (!response.ok) throw new Error(`wbsearchentities ${response.status}`);
-  const data = (await response.json()) as { search?: SearchCandidate[] };
-  return Array.isArray(data.search) ? data.search : [];
+  return searchCache.with({ q: query }, async () => {
+    const url = new URL(WBSEARCH_URL);
+    url.searchParams.set("action", "wbsearchentities");
+    url.searchParams.set("search", query);
+    url.searchParams.set("language", "en");
+    url.searchParams.set("format", "json");
+    url.searchParams.set("type", "item");
+    url.searchParams.set("limit", "5");
+    const response = await fetchWithTimeout(url.toString());
+    if (!response.ok) throw new Error(`wbsearchentities ${response.status}`);
+    const data = (await response.json()) as { search?: SearchCandidate[] };
+    return Array.isArray(data.search) ? data.search : [];
+  });
 }
 
 interface SparqlBindings {
@@ -130,6 +166,21 @@ interface CandidateProps {
  * returned map; multi-valued fields (websites, subsidiaries) are aggregated.
  */
 async function fetchCandidateProperties(
+  qids: string[],
+): Promise<Map<string, CandidateProps>> {
+  const out = new Map<string, CandidateProps>();
+  if (qids.length === 0) return out;
+  // Cache by sorted QID set so call-order doesn't fragment the cache.
+  const cacheKey = { qids: [...qids].sort() };
+  const entries = await sparqlCache.with(cacheKey, async () => {
+    const map = await fetchCandidatePropertiesUncached(qids);
+    return [...map.entries()];
+  });
+  for (const [k, v] of entries) out.set(k, v);
+  return out;
+}
+
+async function fetchCandidatePropertiesUncached(
   qids: string[],
 ): Promise<Map<string, CandidateProps>> {
   const out = new Map<string, CandidateProps>();
@@ -199,15 +250,33 @@ SELECT ?item ?website ?countryLabel ?hqLabel ?ownerLabel ?parentLabel
 }
 
 async function fetchWikipediaSummary(title: string): Promise<string | null> {
-  const url = `${WP_REST_SUMMARY}${encodeURIComponent(title)}`;
-  const response = await fetchWithTimeout(url);
-  if (!response.ok) return null;
-  const data = (await response.json()) as { extract?: string };
-  if (!data.extract) return null;
-  return trimToSentence(data.extract, 280);
+  const cached = await summaryCache.with({ title }, async () => {
+    const url = `${WP_REST_SUMMARY}${encodeURIComponent(title)}`;
+    const response = await fetchWithTimeout(url);
+    if (!response.ok) return { summary: null };
+    const data = (await response.json()) as { extract?: string };
+    if (!data.extract) return { summary: null };
+    return { summary: trimToSentence(data.extract, 280) };
+  });
+  return cached.summary;
 }
 
 export async function enrichSourceProfileFromWikidata(input: {
+  domain: string;
+  sourceName: string;
+}): Promise<WikidataEnrichmentResult | null> {
+  const cacheKey = {
+    domain: normalizeDomain(input.domain),
+    sourceName: input.sourceName.trim().toLowerCase(),
+  };
+  const wrapped = await enrichCache.with(cacheKey, async () => {
+    const result = await enrichSourceProfileFromWikidataUncached(input);
+    return { result };
+  });
+  return wrapped.result;
+}
+
+async function enrichSourceProfileFromWikidataUncached(input: {
   domain: string;
   sourceName: string;
 }): Promise<WikidataEnrichmentResult | null> {

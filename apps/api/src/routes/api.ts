@@ -19,6 +19,7 @@ import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import {
   computeClusterPerspective,
+  getClusterReadiness,
   getStoredClusterPerspective,
 } from "../services/cluster-perspective.js";
 import {
@@ -79,6 +80,23 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/stories/:id", async (request, reply) => {
     const params = z.object({ id: z.string() }).parse(request.params);
+    // Gate on full pipeline readiness — same threshold as the listing
+    // filter, so a deep-link to a half-enriched cluster behaves like the
+    // listing (which would have hidden it) instead of rendering wrong data.
+    const readiness = await getClusterReadiness(params.id);
+    if (readiness.totalArticles === 0) {
+      reply.code(404);
+      return { message: "Story not found" };
+    }
+    if (!readiness.ready) {
+      reply.code(425);
+      return {
+        message: readiness.reason ?? "Story still being enriched",
+        enriched: readiness.enrichedArticles,
+        total: readiness.totalArticles,
+        hasPerspective: readiness.hasPerspective,
+      };
+    }
     const detail = await getStoryDetail(params.id);
     if (!detail) {
       reply.code(404);
@@ -89,6 +107,20 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/stories/:id/comparison", async (request, reply) => {
     const params = z.object({ id: z.string() }).parse(request.params);
+    const readiness = await getClusterReadiness(params.id);
+    if (readiness.totalArticles === 0) {
+      reply.code(404);
+      return { message: "Story not found" };
+    }
+    if (!readiness.ready) {
+      reply.code(425);
+      return {
+        message: readiness.reason ?? "Comparison unavailable while enrichment is in progress",
+        enriched: readiness.enrichedArticles,
+        total: readiness.totalArticles,
+        hasPerspective: readiness.hasPerspective,
+      };
+    }
     const comparison = await getStoryComparison(params.id);
     if (!comparison) {
       reply.code(404);
@@ -122,38 +154,23 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
     let perspective = !query.refresh ? await getStoredClusterPerspective(params.id) : null;
     if (!perspective) {
-      // Readiness guard: the lazy compute persists its result, so calling
-      // it before stage 2 (LLM enrichment) has populated translations gives
-      // SBERT a mix of empty strings (non-English articles, no translation)
-      // and uncleaned English bodies, then locks that garbage divergence
-      // score in until someone forces ?refresh=true. Refuse to compute when
-      // <50% of the cluster's articles have a populated translatedFullText
-      // OR framingSummary; surface 425 Too Early so the UI can show a
-      // "pipeline still running" state instead of caching a wrong score.
-      const { prisma } = await import("../lib/prisma.js");
-      const links = await prisma.clusterArticle.findMany({
-        where: { clusterId: params.id },
-        select: {
-          article: {
-            select: { translatedFullText: true, framingSummary: true },
-          },
-        },
-      });
-      const total = links.length;
-      const enriched = links.filter(
-        (l) => l.article?.translatedFullText || l.article?.framingSummary,
-      ).length;
-      if (total === 0) {
+      // Readiness guard via the shared helper. Same reasoning as before:
+      // the lazy compute persists its result, so calling it on a half-
+      // enriched cluster locks in a wrong divergence score until someone
+      // forces ?refresh=true. Surface 425 so the UI shows "pipeline in
+      // progress" instead of bad numbers.
+      const readiness = await getClusterReadiness(params.id);
+      if (readiness.totalArticles === 0) {
         reply.code(404);
         return { message: `Cluster ${params.id} has no articles` };
       }
-      if (enriched / total < 0.5) {
+      if (!readiness.ready) {
         reply.code(425);
         return {
-          message:
-            "Perspective unavailable: cluster enrichment in progress. Try again after the LLM enrichment stage completes.",
-          enriched,
-          total,
+          message: readiness.reason ?? "Cluster not ready",
+          enriched: readiness.enrichedArticles,
+          total: readiness.totalArticles,
+          hasPerspective: readiness.hasPerspective,
         };
       }
       try {

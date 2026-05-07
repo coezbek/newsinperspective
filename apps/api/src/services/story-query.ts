@@ -3,6 +3,7 @@ import type { ArticleDetail, SourceProfileDto, StoryComparison, StoryDetail, Sto
 import { extractRegion } from "../domain/category.js";
 import { computeAuthorityStats, isGlobalTierDomain, scoreDomainAuthority } from "../domain/source-ranking.js";
 import { prisma } from "../lib/prisma.js";
+import { resolveCountryFromDomain } from "./country-from-domain.js";
 
 function toIsoDate(value: Date): string {
   return value.toISOString().slice(0, 10);
@@ -447,7 +448,44 @@ export async function listStoriesByDate(
       },
     },
   });
-  const allDomains = [...new Set(rows.flatMap((row) => row.articles.flatMap((item) => uniqueDomains(item.article))))];
+
+  // Hide clusters whose pipeline hasn't fully run yet. A cluster surfaces
+  // in the listing only after stage 2 has enriched at least half of its
+  // articles AND stage 4 has produced a `perspective_v1` feature row.
+  // Anything less and the divergence label / pairwise heatmap on the
+  // cluster page is computed against pre-translation text (or worse,
+  // empty strings for non-English bodies), which gives users a wrong
+  // first impression and persists into the embedding cache.
+  //
+  // The main query above uses `features: { take: 1 }` and the downstream
+  // code expects that one row to be the kagi-ingest keyword feature
+  // (which has no `kind` field). Pulling more rows there would risk
+  // breaking the keyword extraction. Do a separate batched query just
+  // for perspective_v1 row existence — one extra DB call, no per-row N+1.
+  const perspectiveRows = await prisma.nlpFeature.findMany({
+    where: {
+      clusterId: { in: rows.map((r) => r.id) },
+      scopeType: ScopeType.CLUSTER,
+      featureSet: { path: ["kind"], equals: "perspective_v1" },
+    },
+    select: { clusterId: true },
+  });
+  const clustersWithPerspective = new Set(
+    perspectiveRows.map((r) => r.clusterId).filter((v): v is string => Boolean(v)),
+  );
+  const readyRows = rows.filter((row) => {
+    const total = row.articles.length;
+    if (total === 0) return false;
+    const enriched = row.articles.filter(
+      (item) =>
+        (item.article.translatedFullText && item.article.translatedFullText.trim()) ||
+        (item.article.framingSummary && item.article.framingSummary.trim()),
+    ).length;
+    if (enriched / total < 0.5) return false;
+    return clustersWithPerspective.has(row.id);
+  });
+
+  const allDomains = [...new Set(readyRows.flatMap((row) => row.articles.flatMap((item) => uniqueDomains(item.article))))];
   const profileRows = allDomains.length > 0
     ? await prisma.sourceProfile.findMany({
         where: { domain: { in: allDomains } },
@@ -456,7 +494,7 @@ export async function listStoriesByDate(
     : [];
   const profileCountByDomain = new Map(profileRows.map((row) => [row.domain, row.articleCount]));
 
-  const scoredRows = rows.map((row) => {
+  const scoredRows = readyRows.map((row) => {
     const clusterDomains = [...new Set(row.articles.flatMap((item) => uniqueDomains(item.article)))];
     const usableArticles = row.articles.filter(
       ({ article }) => article.extractionStatus !== ExtractionStatus.FAILED,
@@ -554,10 +592,13 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
   const profileRows = clusterDomains.length > 0
     ? await prisma.sourceProfile.findMany({
         where: { domain: { in: clusterDomains } },
-        select: { domain: true, articleCount: true },
+        select: { domain: true, articleCount: true, country: true, countryOfOrigin: true },
       })
     : [];
   const profileCountByDomain = new Map(profileRows.map((item) => [item.domain, item.articleCount]));
+  const countryByDomain = new Map(
+    profileRows.map((item) => [item.domain, item.countryOfOrigin ?? item.country ?? null]),
+  );
 
   // Drop articles whose body extraction failed — they have no text to compare,
   // so they pollute the per-article list, near-duplicate detection and counts
@@ -600,7 +641,9 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
     const hasTranslatedTitle = !!(article.translatedTitle && article.translatedTitle.trim().length > 0);
     const hasTranslatedSummary = !!(article.translatedSummary && article.translatedSummary.trim().length > 0);
     const hasTranslatedBody = !!(article.translatedFullText && article.translatedFullText.trim().length > 0);
-    const listFullText = !isEnglish && hasTranslatedBody ? article.translatedFullText : article.fullText;
+    // Same rationale as the article-detail path: the LLM-cleaned body is
+    // higher signal than the raw scrape regardless of source language.
+    const listFullText = hasTranslatedBody ? article.translatedFullText : article.fullText;
     const listTitle = !isEnglish && hasTranslatedTitle ? article.translatedTitle : article.title;
     const listSummary = !isEnglish && hasTranslatedSummary ? article.translatedSummary : article.summary;
     const isTranslated = !isEnglish && (hasTranslatedTitle || hasTranslatedSummary || hasTranslatedBody);
@@ -627,6 +670,9 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       sentiment: feature?.sentiment ?? 0,
       subjectivity: feature?.subjectivity ?? 0,
       biasSignals: feature?.biasSignals ?? [],
+      country:
+        countryByDomain.get(article.domain) ??
+        resolveCountryFromDomain(article.domain, article.sourceName),
     };
   });
   const articlesByDomain = new Map<string, typeof baseArticles>();
@@ -811,9 +857,16 @@ export async function getArticleDetail(id: string): Promise<ArticleDetail | null
   // translated text, so the highlighter stays aligned.
   const isEnglish = !article.language || article.language.toLowerCase().slice(0, 2) === "en";
   const hasTranslatedBody = !!(article.translatedFullText && article.translatedFullText.trim().length > 0);
-  const displayFullText = !isEnglish && hasTranslatedBody
-    ? article.translatedFullText
-    : article.fullText;
+  // Prefer the LLM-cleaned `translatedFullText` for ALL articles when it's
+  // populated. For non-English articles it's the English translation; for
+  // English articles it's the chrome-stripped cleaned body (nav menus,
+  // image captions, "Subscribe" prompts, etc. all removed). Both are
+  // strictly higher signal than the raw scrape, which often includes the
+  // entire site navigation rendered as text.
+  // `fullTextIsTranslated` stays narrow: it remains true only for
+  // language-shifted output, so the UI's "Translated from <Language>"
+  // affordance doesn't mislabel cleaned-but-not-translated English bodies.
+  const displayFullText = hasTranslatedBody ? article.translatedFullText : article.fullText;
   const fullTextIsTranslated = !isEnglish && hasTranslatedBody;
   const hasTranslatedTitle = !!(article.translatedTitle && article.translatedTitle.trim().length > 0);
   const displayTitle = !isEnglish && hasTranslatedTitle

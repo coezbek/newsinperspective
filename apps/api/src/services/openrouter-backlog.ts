@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Prisma, ScopeType } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
@@ -6,6 +7,32 @@ import { enrichSourceProfileWithOpenRouter } from "./source-profile-enrichment.j
 import { enrichSourceProfileFromWikidata } from "./source-profile-wikidata.js";
 
 type JsonObject = Record<string, unknown>;
+
+/**
+ * Stable signature over the (articleId, title|summary|body) tuples that
+ * went into a cluster's LLM-generated keyword set. Stored alongside the
+ * keywords so a later run can detect whether any contributing article has
+ * been re-enriched and the keywords are now stale.
+ *
+ * Mirror of `buildClusterInputSignature` in cluster-perspective.ts but
+ * keyed on the keyword-input fields (title + summary + body) rather than
+ * the embedding-input field (framingSummary / translatedFullText). Both
+ * caches invalidate independently; an article body re-extraction can
+ * change keywords without changing the perspective if framingSummary
+ * stays stable, and vice versa.
+ */
+export function hashKeywordInput(input: { title: string; summary: string | null; body: string | null }): string {
+  const concat = `${input.title}\n\n${input.summary ?? ""}\n\n${input.body ?? ""}`;
+  return createHash("sha256").update(concat).digest("hex").slice(0, 16);
+}
+
+export function buildClusterKeywordSignature(
+  pairs: Array<{ articleId: string; hash: string }>,
+): string {
+  const sorted = [...pairs].sort((a, b) => a.articleId.localeCompare(b.articleId));
+  const joined = sorted.map((p) => `${p.articleId}:${p.hash}`).join("|");
+  return createHash("sha256").update(joined).digest("hex").slice(0, 16);
+}
 
 function toInputJson(value: unknown): Prisma.InputJsonValue {
   return value as Prisma.InputJsonValue;
@@ -196,11 +223,46 @@ export async function runOpenRouterBacklog(options?: {
     take: articleLimit * 4,
   });
 
+  // Compute the current article-enrichment input signature for every
+  // fetched article up-front. The signature mirrors what the LLM will
+  // see in `buildArticleFeaturesWithOpenRouter` — title + summary + body
+  // — so a body re-extraction or a title cleanup automatically marks
+  // the existing enrichment as stale.
+  const currentArticleSignatures = new Map<string, string>();
+  for (const feature of articleFeatures) {
+    if (!feature.article) continue;
+    const a = feature.article;
+    const sig = hashKeywordInput({
+      title: a.title,
+      summary: a.summary,
+      body: a.fullText ?? a.contentSnippet,
+    });
+    currentArticleSignatures.set(feature.id, sig);
+  }
+
   const pendingArticles = articleFeatures
     .filter((feature) => feature.article)
     .filter((feature) => {
       const payload = feature.featureSet as JsonObject;
-      return payload.aiEnrichmentStatus !== "ready";
+      // Pending: never enriched, OR previously enriched but the input
+      // text has changed since (re-extraction / title cleanup / etc.) so
+      // the cached translatedFullText / framingSummary / keywords now
+      // describe stale text. Without this guard, an article re-enriched
+      // by a weaker model in an earlier run (returning empty keywords →
+      // heuristic native-language fallback) stays "ready" forever — see
+      // the orf.at "angriff getötet menschen" bug from May 2026.
+      if (payload.aiEnrichmentStatus !== "ready") return true;
+      const stored = typeof payload.aiEnrichmentInputSignature === "string"
+        ? payload.aiEnrichmentInputSignature
+        : null;
+      const current = currentArticleSignatures.get(feature.id) ?? null;
+      // Trust-by-default: only re-enrich when BOTH signatures are present
+      // and they actually disagree. Missing-signature is treated as
+      // "grandfathered, leave alone" — pre-this-guard data is validated
+      // explicitly via the one-shot `backfill-signatures` script which
+      // writes a current signature to every "ready" row, after which any
+      // future text change reliably invalidates.
+      return stored !== null && current !== null && stored !== current;
     })
     .slice(0, articleLimit);
 
@@ -246,6 +308,13 @@ export async function runOpenRouterBacklog(options?: {
             // surface partial-content articles without recomputing.
             aiEnrichmentInputTruncated: next.inputTruncated,
             aiEnrichmentBodyAppearsTruncated: next.bodyAppearsTruncated,
+            // Hash of the title+summary+body the LLM saw. On the next
+            // backlog pass, a mismatch flips this row back to pending
+            // automatically — covers body re-extraction, title cleanup,
+            // or any other upstream content change. Mirrors the
+            // signature pattern used for cluster perspective and cluster
+            // keywords.
+            aiEnrichmentInputSignature: currentArticleSignatures.get(feature.id) ?? null,
           }),
         },
       });
@@ -334,6 +403,7 @@ export async function runOpenRouterBacklog(options?: {
             include: {
               article: {
                 select: {
+                  id: true,
                   title: true,
                   summary: true,
                   contentSnippet: true,
@@ -350,11 +420,48 @@ export async function runOpenRouterBacklog(options?: {
     take: clusterLimit * 4,
   });
 
+  // Compute the current keyword-input signature for every fetched cluster
+  // up-front, so the staleness check can compare against the stored value
+  // without re-walking article text inside the filter callback.
+  const currentKeywordSignatures = new Map<string, string>();
+  for (const feature of clusterFeatures) {
+    if (!feature.cluster) continue;
+    const articles = feature.cluster.articles.slice(0, 6).map((item) => item.article);
+    const signature = buildClusterKeywordSignature(
+      articles.map((a) => ({
+        articleId: a.id,
+        hash: hashKeywordInput({
+          title: a.title,
+          summary: a.summary,
+          body: a.fullText ?? a.contentSnippet,
+        }),
+      })),
+    );
+    currentKeywordSignatures.set(feature.id, signature);
+  }
+
   const pendingClusters = clusterFeatures
     .filter((feature) => feature.cluster)
     .filter((feature) => {
       const payload = feature.featureSet as JsonObject;
-      return payload.keywordStatus === "keywords_pending";
+      // Pending: never been keyworded, or keywords went stale because at
+      // least one contributing article got re-enriched / re-extracted.
+      // Stale "ready" rows fall back through this filter so the LLM gets
+      // a fresh shot — without this, keyword sets persist forever and end
+      // up describing pre-translation German/Korean/etc. body text long
+      // after stage 2 has populated proper translations.
+      if (payload.keywordStatus === "keywords_pending") return true;
+      if (payload.keywordStatus === "ready") {
+        const stored = typeof payload.keywordInputSignature === "string"
+          ? payload.keywordInputSignature
+          : null;
+        const current = currentKeywordSignatures.get(feature.id) ?? null;
+        // Trust-by-default (see equivalent comment on the article-level
+        // filter above). Missing-signature rows are validated by the
+        // backfill script, not by burning fresh LLM credits per-row.
+        return stored !== null && current !== null && stored !== current;
+      }
+      return false;
     })
     .slice(0, clusterLimit);
 
@@ -393,6 +500,10 @@ export async function runOpenRouterBacklog(options?: {
           keywordStatus: openrouter.status,
           keywordModel: openrouter.model,
           keywordError: openrouter.error,
+          // Record the input signature so a later run can detect when the
+          // cluster's articles have been re-enriched and the keyword set
+          // is stale. Recomputed on every read; mismatch = re-keyword.
+          keywordInputSignature: currentKeywordSignatures.get(feature.id) ?? null,
         }),
       },
     });

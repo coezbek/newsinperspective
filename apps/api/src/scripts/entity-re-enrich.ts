@@ -2,6 +2,7 @@ import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { enrichArticlesWithEntities } from "../services/article-enrichment.js";
 import { createFileLogger } from "../lib/file-logger.js";
+import { acquireProcessLock, ProcessLockError } from "../lib/process-lock.js";
 
 const logger = createFileLogger("re-enrich.log");
 
@@ -21,6 +22,21 @@ async function main() {
   const limitFlag = parseFlag("limit");
   const limit = limitFlag ? Number.parseInt(limitFlag, 10) : undefined;
   const force = process.argv.includes("--force");
+
+  // Single-instance lock: parallel runs all hammer Wikipedia past the throttle
+  // and produce duplicate work. Fast-fail if another run is in progress.
+  let releaseLock: (() => void) | null = null;
+  try {
+    releaseLock = acquireProcessLock("entity-re-enrich");
+  } catch (err) {
+    if (err instanceof ProcessLockError) {
+      console.error(`Another entity-re-enrich is already running: ${err.message}`);
+      process.exitCode = 2;
+      await prisma.$disconnect();
+      return;
+    }
+    throw err;
+  }
 
   console.log(`\n=== ENTITY RE-ENRICHMENT ===`);
   console.log(`Date: ${date ?? "(no filter)"}`);
@@ -61,6 +77,7 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await prisma.$disconnect();
+    releaseLock?.();
   }
 }
 

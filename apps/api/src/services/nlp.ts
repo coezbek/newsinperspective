@@ -19,9 +19,22 @@ export function buildArticleFeatures(
   const detectedLanguage = language ?? detectLanguageFromText(title, summary, body);
   // When language inference is unknown, downstream tokenization uses a combined stopword set.
   const analysisLanguage = detectedLanguage ?? null;
+  const isEnglish =
+    !analysisLanguage || analysisLanguage.toLowerCase().slice(0, 2) === "en";
   return {
     keywords: extractKeywords(analysisLanguage, title, summary, body),
-    keywordsEnglish: extractKeywords(analysisLanguage, title, summary, body),
+    // `keywordsEnglish` MUST be English, by contract with downstream
+    // consumers (sidecar TF-IDF, country_sentiment.top_keywords, search).
+    // The heuristic `extractKeywords` is purely tokenizer-based and emits
+    // tokens in whatever language the article was written in — so for
+    // non-English bodies the previous "extractKeywords twice" pattern was
+    // populating both fields with native-language tokens, then surfacing
+    // German / Korean / Chinese stopword-survivors as "English keywords"
+    // on the perspective panel. Leave the field empty when the article
+    // isn't English; the LLM enrichment will fill it with proper English
+    // keywords. If the LLM fails / returns nothing, an empty list is the
+    // honest answer, not language-mismatched filler.
+    keywordsEnglish: isEnglish ? extractKeywords(analysisLanguage, title, summary, body) : [],
     entities: extractEntities(title, summary, body),
     personEntities: [],
     organizationEntities: [],

@@ -24,6 +24,7 @@
 import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { env } from "../config/env.js";
+import { logLlmRequest, logLlmResponse } from "../lib/llm-trace.js";
 import {
   orderOpenRouterModels,
   resolveOpenRouterModels,
@@ -145,6 +146,8 @@ async function translateOnce(
   model: string,
   log?: (m: string) => void,
 ): Promise<{ ok: boolean; status: number | null; content: string | null; retryAfterMs: number | null; error: string | null }> {
+  const traceKind = "cluster-translate-titles";
+  const trace = logLlmRequest({ kind: traceKind, model, contextId: title.slice(0, 80), prompt: title });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -171,6 +174,11 @@ async function translateOnce(
       signal: controller.signal,
     });
     if (!response.ok) {
+      const details = await response.text().catch(() => "");
+      logLlmResponse({
+        id: trace.id, kind: traceKind, model, contextId: title.slice(0, 80), startedAt: trace.startedAt,
+        ok: false, httpStatus: response.status, content: details, error: `http ${response.status}`,
+      });
       return {
         ok: false,
         status: response.status,
@@ -179,11 +187,24 @@ async function translateOnce(
         error: `http ${response.status}`,
       };
     }
-    const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const payload = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
     const content = payload.choices?.[0]?.message?.content ?? "";
+    const finishReason = payload.choices?.[0]?.finish_reason;
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId: title.slice(0, 80), startedAt: trace.startedAt,
+      ok: true, content, finishReason, usage: payload.usage ?? null,
+    });
     return { ok: true, status: response.status, content, retryAfterMs: null, error: null };
   } catch (err) {
-    log?.(`network error on ${model}: ${err instanceof Error ? err.message : String(err)}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    log?.(`network error on ${model}: ${msg}`);
+    logLlmResponse({
+      id: trace.id, kind: traceKind, model, contextId: title.slice(0, 80), startedAt: trace.startedAt,
+      ok: false, error: msg,
+    });
     return { ok: false, status: null, content: null, retryAfterMs: null, error: String(err) };
   } finally {
     clearTimeout(timer);

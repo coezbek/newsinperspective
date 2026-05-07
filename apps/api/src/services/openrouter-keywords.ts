@@ -2,6 +2,9 @@ import { env } from "../config/env.js";
 import { orderOpenRouterModels, resolveOpenRouterModels } from "./openrouter-models.js";
 import { callOpenAIFallback } from "./openai-fallback.js";
 import { withLlmCache } from "./llm-cache.js";
+import { logLlmRequest, logLlmResponse } from "../lib/llm-trace.js";
+
+const KEYWORDS_TRACE_KIND = "openrouter-keywords";
 
 interface OpenRouterKeywordInput {
   title: string;
@@ -135,6 +138,12 @@ async function runKeywordRequest(
 
     for (const model of orderedModels) {
       log?.(`round ${round + 1}/${maxRounds}: -> model ${model}`);
+      const trace = logLlmRequest({
+        kind: KEYWORDS_TRACE_KIND,
+        model,
+        contextId: input.title.slice(0, 80),
+        prompt,
+      });
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), openRouterTimeoutMs);
       let response: Response | null = null;
@@ -160,6 +169,11 @@ async function runKeywordRequest(
       } catch (error) {
         lastError = `OpenRouter request failed: ${error instanceof Error ? error.message : String(error)}`;
         log?.(`round ${round + 1}/${maxRounds}: ${model} network error: ${lastError.slice(0, 140)}`);
+        logLlmResponse({
+          id: trace.id, kind: KEYWORDS_TRACE_KIND, model,
+          contextId: input.title.slice(0, 80), startedAt: trace.startedAt,
+          ok: false, error: lastError,
+        });
         sawRetryableError = true;
         continue;
       } finally {
@@ -169,6 +183,11 @@ async function runKeywordRequest(
       if (!response.ok) {
         const details = await response.text();
         lastError = `OpenRouter error ${response.status}: ${details.slice(0, 240)}`;
+        logLlmResponse({
+          id: trace.id, kind: KEYWORDS_TRACE_KIND, model,
+          contextId: input.title.slice(0, 80), startedAt: trace.startedAt,
+          ok: false, httpStatus: response.status, content: details, error: lastError,
+        });
         log?.(`round ${round + 1}/${maxRounds}: ${model} http ${response.status}`);
         if (isRetryableStatus(response.status)) {
           sawRetryableError = true;
@@ -187,13 +206,20 @@ async function runKeywordRequest(
       }
 
       const payload = (await response.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
       };
       const content = payload.choices?.[0]?.message?.content ?? "";
+      const finishReason = payload.choices?.[0]?.finish_reason;
       const keywords = parseKeywordsFromResponse(content).slice(0, maxKeywords);
 
       if (keywords.length > 0) {
         log?.(`round ${round + 1}/${maxRounds}: ${model} success (${keywords.length} keywords)`);
+        logLlmResponse({
+          id: trace.id, kind: KEYWORDS_TRACE_KIND, model,
+          contextId: input.title.slice(0, 80), startedAt: trace.startedAt,
+          ok: true, content, finishReason, usage: payload.usage ?? null,
+        });
         return {
           keywords,
           model,
@@ -203,6 +229,11 @@ async function runKeywordRequest(
 
       lastError = "No parseable keyword JSON in model response";
       log?.(`round ${round + 1}/${maxRounds}: ${model} parse failure`);
+      logLlmResponse({
+        id: trace.id, kind: KEYWORDS_TRACE_KIND, model,
+        contextId: input.title.slice(0, 80), startedAt: trace.startedAt,
+        ok: false, content, finishReason, usage: payload.usage ?? null, error: lastError,
+      });
       sawRetryableError = true;
     }
 
@@ -218,7 +249,12 @@ async function runKeywordRequest(
   }
 
   // OpenRouter exhausted — fall back to OpenAI direct if configured.
-  const fallback = await callOpenAIFallback({ prompt, onAttemptLog: log });
+  const fallback = await callOpenAIFallback({
+    prompt,
+    onAttemptLog: log,
+    kind: "keywords",
+    contextId: input.title.slice(0, 80),
+  });
   if (fallback) {
     const keywords = parseKeywordsFromResponse(fallback.content).slice(0, maxKeywords);
     if (keywords.length > 0) {
