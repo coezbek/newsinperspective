@@ -11,7 +11,7 @@ Monorepo for a news-comparison project that ingests RSS feeds from Kagi's public
   - [Prerequisites](#prerequisites)
   - [Steps](#steps)
   - [Defaults & ports](#defaults--ports)
-  - [Configuration notes](#configuration-notes)
+  - [API keys you need](#api-keys-you-need)
   - [Troubleshooting](#troubleshooting)
 - [Ingestion](#ingestion)
 - [Daily pipeline](#daily-pipeline)
@@ -87,10 +87,18 @@ Linux/macOS, with:
 - Frontend: `http://localhost:5317`
 - Postgres: `localhost:55432`
 
-### Configuration notes
-- Logical run dates default to `UTC` via `APP_DATE_TIMEZONE`; stored timestamps remain UTC instants in Postgres.
-- For the first few runs, the default `.env` sets `INGEST_FEED_LIMIT=50` so ingestion completes quickly while you validate the pipeline. Remove or increase that limit once you are ready for broader collection.
-- If OpenRouter free models are hot, adjust `OPENROUTER_MODEL_OFFSET` or provide a broader comma-separated `OPENROUTER_MODEL` list.
+### API keys you need
+
+Stage 1 of the pipeline (Kagi ingest) needs no keys. Stages 2-5 do — without
+at least one working LLM provider, the daily run produces no translations,
+framing summaries, entities, or perspective metrics. Set these in `.env`:
+
+| Variable | Required? | Where to get it | What it does |
+| --- | --- | --- | --- |
+| `OPENROUTER_API_KEY` | **Yes** | https://openrouter.ai/keys | Primary LLM path. Drives stage 2 enrichment (translation, `framingSummary`, keywords, persons/orgs/places) by rotating through the free models in `OPENROUTER_MODEL`. |
+| `OPENAI_API_KEY` | Recommended | https://platform.openai.com/api-keys | Fallback used only after every OpenRouter free model has failed for an article. Without it, enrichment can stall when the free pool is saturated. |
+
+Every other variable in `.env.example` ships with a working default — see the inline comments there for tuning notes (ingestion concurrency, sidecar URLs, caches, dedupe thresholds, model rotation order).
 
 ### Troubleshooting
 - If `pnpm db:start` fails with a Docker container-name conflict, you already have an existing `news-in-perspective-postgres` container from another checkout. Reuse that container or stop/remove it before retrying.
@@ -235,9 +243,10 @@ free-tier model per article and produces five text fields:
 
 - `translatedTitle` / `translatedSummary` — short English versions for display.
 - `translatedFullText` — the chrome-stripped, English-translated body. Used
-  by the UI (article view, story-detail panel). Capped on input at 25K chars
-  before the LLM call; bounded on output by `ENRICHMENT_MAX_OUTPUT_TOKENS`
-  (4096) — both truncations are flagged on the result.
+  by the UI (article view, story-detail panel). Capped on input at 10K chars
+  before the LLM call (`TRANSLATED_FULL_TEXT_MAX_CHARS`) and on output at
+  8192 tokens (`ENRICHMENT_MAX_OUTPUT_TOKENS`); both are hardcoded constants
+  in `openrouter-article-enrichment.ts`. Both truncations are flagged on the result.
 - **`framingSummary`** — an abstractive 4-6 sentence summary written
   specifically to capture *what makes this source's framing distinctive*
   (stance, emphasis, attribution patterns). This is the field SBERT embeds
