@@ -23,6 +23,7 @@
     categories: string[];
     selectedCategory: string;
     stories: StoryListItem[];
+    topAllCluster: StoryListItem | null;
     selectedStory: StoryDetail | null;
     comparison: StoryComparison | null;
     loading: boolean;
@@ -95,7 +96,7 @@
   const HERO_ROTATING_WORDS = ["outlets", "regions", "days", "framings", "narratives"];
   let heroRotatingIndex = 0;
   let heroRotateTimer: ReturnType<typeof setInterval> | null = null;
-  $: featuredCluster = daySections[0]?.stories?.[0] ?? null;
+  $: featuredCluster = daySections[0]?.topAllCluster ?? daySections[0]?.stories?.[0] ?? null;
   $: featuredDomains = (featuredCluster?.topDomains ?? []).slice(0, 6);
   $: featuredSources = (() => {
     const domains = featuredDomains;
@@ -593,8 +594,6 @@
       ...existing,
       loading: true,
       selectedCategory: nextCategory,
-      selectedStory: null,
-      comparison: null,
       error: "",
     }));
 
@@ -625,6 +624,7 @@
       categories: [],
       selectedCategory: "",
       stories: [],
+      topAllCluster: null,
       selectedStory: null,
       comparison: null,
       loading: true,
@@ -649,6 +649,7 @@
         ...section,
         categories,
         stories,
+        topAllCluster: section.topAllCluster ?? stories[0] ?? null,
         loading: false,
       }));
 
@@ -1078,14 +1079,13 @@
           </div>
         {:else}
           <div class="cluster-strip-skeleton" aria-hidden="true">
-            <span class="cluster-strip-tag">Live · top cluster</span>
+            <div class="cluster-strip-header">
+              <span class="cluster-strip-tag">Live · top cluster</span>
+              <span class="cluster-strip-title cluster-strip-title-placeholder"></span>
+              <span class="cluster-strip-meta cluster-strip-meta-placeholder"></span>
+            </div>
             <div class="cluster-arc">
-              <span class="cluster-arc-line"></span>
-              {#each Array(5) as _, idx}
-                <span class="cluster-node cluster-node-skeleton" style="--i: {idx}; --n: 5">
-                  <span class="cluster-node-dot"></span>
-                </span>
-              {/each}
+              <span class="cluster-arc-bar"></span>
             </div>
           </div>
         {/if}
@@ -1756,49 +1756,40 @@
   {#if currentView.kind === "feed" || currentView.kind === "tag" || currentView.kind === "date"}
     {#each daySections as section (section.date)}
     <section class="day-block panel" use:debugComponent={componentLabel("DaySection", section.date)}>
-      <div class="day-separator" use:debugComponent={componentLabel("DaySeparator", section.date)}>
-        <span>{section.date}</span>
-      </div>
-
-      <div class="day-head" use:debugComponent={componentLabel("DayHeader", section.date)}>
-        <div>
-          <p class="eyebrow">Top Stories</p>
+      <div class="day-bar" use:debugComponent={componentLabel("DayBar", section.date)}>
+        <div class="day-bar-lead">
+          <span class="day-pill" use:debugComponent={componentLabel("DaySeparator", section.date)}>{section.date}</span>
+          <p class="eyebrow" use:debugComponent={componentLabel("DayHeader", section.date)}>Top Stories</p>
         </div>
-        <div class="inline-stats">
-          <div class="inline-stat">
-            <span class="stat-label">Clusters</span>
-            <strong>{section.stories.length}</strong>
-          </div>
-          <div class="inline-stat">
-            <span class="stat-label">Sources</span>
-            <strong>{storySourceTotal(section)}</strong>
-          </div>
-          <div class="inline-stat">
-            <span class="stat-label">Articles</span>
-            <strong>{storyArticleTotal(section)}</strong>
-          </div>
-        </div>
-      </div>
 
-      <div class="tab-row" use:debugComponent={componentLabel("CategoryTabs", section.date)}>
-        <button
-          class="tab"
-          class:selected={!section.selectedCategory}
-          use:debugComponent={componentLabel("CategoryTab", "All")}
-          on:click={() => handleCategoryChange(section.date, "")}
-        >
-          All
-        </button>
-        {#each section.categories as category}
+        <div class="tab-row" use:debugComponent={componentLabel("CategoryTabs", section.date)}>
           <button
             class="tab"
-            class:selected={section.selectedCategory === category}
-            use:debugComponent={componentLabel("CategoryTab", formatCategoryLabel(category))}
-            on:click={() => handleCategoryChange(section.date, category)}
+            class:selected={!section.selectedCategory}
+            use:debugComponent={componentLabel("CategoryTab", "All")}
+            on:click={() => handleCategoryChange(section.date, "")}
           >
-            {formatCategoryLabel(category)}
+            All
           </button>
-        {/each}
+          {#each section.categories as category}
+            <button
+              class="tab"
+              class:selected={section.selectedCategory === category}
+              use:debugComponent={componentLabel("CategoryTab", formatCategoryLabel(category))}
+              on:click={() => handleCategoryChange(section.date, category)}
+            >
+              {formatCategoryLabel(category)}
+            </button>
+          {/each}
+        </div>
+
+        <div class="day-bar-stats">
+          <span><strong>{section.stories.length}</strong> clusters</span>
+          <span aria-hidden="true">·</span>
+          <span><strong>{storySourceTotal(section)}</strong> sources</span>
+          <span aria-hidden="true">·</span>
+          <span><strong>{storyArticleTotal(section)}</strong> articles</span>
+        </div>
       </div>
 
       <div class="day-layout" use:debugComponent={componentLabel("DayLayout", section.date)}>
@@ -2216,6 +2207,33 @@
     animation: cluster-skeleton 1.4s ease-in-out infinite;
   }
 
+  .cluster-strip-title-placeholder,
+  .cluster-strip-meta-placeholder {
+    display: inline-block;
+    height: 1em;
+    border-radius: 6px;
+    background: linear-gradient(90deg, rgba(20,32,51,0.06), rgba(20,32,51,0.12), rgba(20,32,51,0.06));
+    background-size: 200% 100%;
+    animation: cluster-skeleton 1.4s ease-in-out infinite;
+  }
+  .cluster-strip-title-placeholder {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 32ch;
+  }
+  .cluster-strip-meta-placeholder {
+    width: 14ch;
+    height: 0.78rem;
+  }
+  .cluster-arc-bar {
+    flex: 1 1 auto;
+    align-self: stretch;
+    border-radius: 12px;
+    background: linear-gradient(90deg, rgba(20,32,51,0.06), rgba(20,32,51,0.12), rgba(20,32,51,0.06));
+    background-size: 200% 100%;
+    animation: cluster-skeleton 1.4s ease-in-out infinite;
+  }
+
   @keyframes cluster-node-float {
     0%, 100% { transform: translateY(0); }
     50% { transform: translateY(-3px); }
@@ -2406,12 +2424,58 @@
     }
   }
 
-  .hero-row,
-  .day-head {
+  .hero-row {
     display: flex;
     align-items: start;
     justify-content: space-between;
     gap: 16px;
+  }
+
+  .day-bar {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    column-gap: 16px;
+    row-gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .day-bar-lead {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+  }
+
+  .day-bar-stats {
+    grid-column: 2;
+    grid-row: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .day-bar-stats strong {
+    color: var(--text);
+    font-size: 0.9rem;
+    font-weight: 700;
+  }
+
+  .day-bar .tab-row {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    flex-wrap: wrap;
+    overflow: visible;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
   }
 
   .eyebrow,
@@ -2503,7 +2567,7 @@
     font: inherit;
   }
 
-  .day-separator {
+  .day-pill {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2513,7 +2577,6 @@
     color: var(--accent-strong);
     font-weight: 700;
     letter-spacing: 0.02em;
-    margin-bottom: 16px;
   }
 
   .inline-stats {
@@ -2542,8 +2605,7 @@
     display: flex;
     gap: 10px;
     overflow-x: auto;
-    padding: 12px 0 4px;
-    margin-bottom: 10px;
+    padding: 0;
   }
 
   .tab {
@@ -3340,10 +3402,25 @@
     }
 
     .hero-row,
-    .day-head,
     .day-layout {
       grid-template-columns: 1fr;
       display: grid;
+    }
+
+    .day-bar {
+      grid-template-columns: 1fr;
+    }
+
+    .day-bar-stats {
+      grid-column: 1;
+      grid-row: auto;
+      flex-wrap: wrap;
+      white-space: normal;
+    }
+
+    .day-bar .tab-row {
+      grid-column: 1;
+      grid-row: auto;
     }
 
     .settings-panel {
