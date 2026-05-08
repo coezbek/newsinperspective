@@ -1,5 +1,5 @@
 import { ExtractionStatus, ScopeType } from "@prisma/client";
-import type { ArticleDetail, SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
+import type { ArticleDetail, ArticleRatings, SourceProfileDto, StoryComparison, StoryDetail, StoryFacetDto, StoryListItem, TagProfileDto } from "@news/shared";
 import { extractRegion } from "../domain/category.js";
 import { computeAuthorityStats, isGlobalTierDomain, scoreDomainAuthority } from "../domain/source-ranking.js";
 import { prisma } from "../lib/prisma.js";
@@ -673,6 +673,7 @@ export async function getStoryDetail(id: string): Promise<StoryDetail | null> {
       country:
         countryByDomain.get(article.domain) ??
         resolveCountryFromDomain(article.domain, article.sourceName),
+      ratings: (article.ratings as ArticleRatings | null) ?? null,
     };
   });
   const articlesByDomain = new Map<string, typeof baseArticles>();
@@ -912,6 +913,7 @@ export async function getArticleDetail(id: string): Promise<ArticleDetail | null
     sentiment: feature?.sentiment ?? 0,
     subjectivity: feature?.subjectivity ?? 0,
     biasSignals: feature?.biasSignals ?? [],
+    ratings: (article.ratings as ArticleRatings | null) ?? null,
     relatedStory: relatedStory
       ? {
           id: relatedStory.id,

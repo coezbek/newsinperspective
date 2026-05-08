@@ -110,6 +110,66 @@
     );
   }
 
+  // Wrap inline domain references like "wsws.org" or "(scmp.com)" in the
+  // narrative HTML with clickable links to the representative article from
+  // that domain. Skips text already inside an <a>, <code>, or <strong> tag
+  // (those are handled by `injectSourceFavicons`). Mirrors the structure of
+  // the source-name injector but matches a domain regex instead.
+  function injectSourceDomains(html: string): string {
+    if (!articlesByDomain || articlesByDomain.size === 0) return html;
+    // Match a plausible domain token NOT already wrapped in an anchor / code
+    // / strong tag. We do the "not already wrapped" check by splitting on
+    // tags and only transforming text segments.
+    const replaceInText = (text: string): string => {
+      return text.replace(
+        /\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b/gi,
+        (match) => {
+          const key = match.toLowerCase();
+          const candidates = articlesByDomain.get(key) ?? articlesByDomain.get(key.replace(/^www\./, ""));
+          if (!candidates || candidates.length === 0) return match;
+          const article = candidates[0];
+          if (!articlePath) return match;
+          const href = articlePath(article.id);
+          const favicon = faviconUrl
+            ? `<img class="source-inline-favicon" src="${faviconUrl(article.domain)}" alt="" loading="lazy" />`
+            : "";
+          return `${favicon}${favicon ? "&nbsp;" : ""}<a class="source-inline-domain" href="${href}" data-article-id="${article.id}">${match}</a>`;
+        },
+      );
+    };
+    // Walk the HTML with a tag-aware splitter. Inside a tag, leave content
+    // alone; outside, run the text replacer. Skip the contents of <a>, <code>,
+    // and <strong> elements entirely.
+    let out = "";
+    let depth = 0; // nesting depth inside a no-touch element
+    // Skip the contents of existing anchors (don't double-wrap) and code
+    // spans (technical strings shouldn't be linkified). We DO process the
+    // inside of <strong> tags since the LLM packs domain references like
+    // "(wsws.org)" inside the bolded angle headlines.
+    const skipTags = /^(?:a|code)$/i;
+    const tokenRegex = /<\/?([a-z][a-z0-9-]*)(?:\s[^>]*)?>/gi;
+    let last = 0;
+    let match: RegExpExecArray | null;
+    while ((match = tokenRegex.exec(html)) !== null) {
+      const text = html.slice(last, match.index);
+      out += depth > 0 ? text : replaceInText(text);
+      const tag = match[0];
+      const name = match[1] || "";
+      out += tag;
+      if (skipTags.test(name)) {
+        if (tag.startsWith("</")) {
+          depth = Math.max(0, depth - 1);
+        } else if (!tag.endsWith("/>")) {
+          depth += 1;
+        }
+      }
+      last = tokenRegex.lastIndex;
+    }
+    const tail = html.slice(last);
+    out += depth > 0 ? tail : replaceInText(tail);
+    return out;
+  }
+
   // Click delegate: the narrative HTML is rendered via {@html}, so Svelte's
   // event bindings don't attach. We catch clicks on injected source links and
   // route them through onNavigate for client-side navigation.
@@ -173,14 +233,179 @@
     narrative?: Narrative | null;
   }
 
+  interface ArticleRatings {
+    leftRightLeaning: number | null;
+    inclusiveness: number | null;
+    factfulness: number | null;
+    sentiment: number | null;
+    simpleLanguage: number | null;
+    multiFaceted: number | null;
+    sourced: number | null;
+    emotionalTone: number | null;
+    constructiveness: number | null;
+    overallStars: number | null;
+  }
+
   interface ArticleRef {
     id: string;
+    title?: string | null;
     sourceName: string;
     domain: string;
     url: string;
     hasFullText?: boolean;
     sentiment?: number | null;
     country?: string | null;
+    ratings?: ArticleRatings | null;
+  }
+
+  type AxisKey =
+    | "none"
+    | "sbert"
+    | "leftRightLeaning"
+    | "inclusiveness"
+    | "factfulness"
+    | "sentiment"
+    | "simpleLanguage"
+    | "multiFaceted"
+    | "sourced"
+    | "emotionalTone"
+    | "constructiveness"
+    | "overallStars";
+
+  // Order matters for menu rendering. Keep "None" last.
+  const AXIS_OPTIONS: { key: AxisKey; label: string; hint: string }[] = [
+    { key: "sbert", label: "SBERT framing distance", hint: "MDS projection of source embeddings" },
+    { key: "leftRightLeaning", label: "Left ↔ Right", hint: "Political leaning, −10 left to +10 right" },
+    { key: "inclusiveness", label: "Inclusiveness", hint: "Majority-only ↔ inclusive" },
+    { key: "factfulness", label: "Fact ↔ Opinion", hint: "Opinion ↔ factual" },
+    { key: "sentiment", label: "Sentiment", hint: "Negative ↔ positive" },
+    { key: "simpleLanguage", label: "Language", hint: "Complex ↔ simple" },
+    { key: "multiFaceted", label: "Viewpoints", hint: "Single ↔ diverse perspectives" },
+    { key: "sourced", label: "Sourcing", hint: "Unsourced ↔ well-sourced" },
+    { key: "emotionalTone", label: "Emotion", hint: "Detached ↔ charged" },
+    { key: "constructiveness", label: "Constructive", hint: "Alarmist ↔ solutions" },
+    { key: "overallStars", label: "Overall quality", hint: "0 to 5 stars" },
+    { key: "none", label: "None", hint: "Hide this axis" },
+  ];
+
+  function axisLabelFor(key: AxisKey): string {
+    return AXIS_OPTIONS.find((o) => o.key === key)?.label ?? key;
+  }
+
+  // Inner-margin applied to SBERT rank-transformed coords on both ends so the
+  // extreme points get a bit of breathing room against the chart edges.
+  const SBERT_AXIS_MARGIN = 0.06;
+
+  function ratingNativeBounds(key: Exclude<AxisKey, "none" | "sbert">): { min: number; max: number; pad: number } {
+    if (key === "overallStars") return { min: 0, max: 5, pad: 0.5 };
+    return { min: -10, max: 10, pad: 1 };
+  }
+
+  // Choose ~3-7 integer-ish tickmarks across [min, max].
+  function chooseTicks(min: number, max: number): number[] {
+    const span = max - min;
+    if (span <= 0) return [min];
+    let step: number;
+    if (span <= 6) step = 1;
+    else if (span <= 12) step = 2;
+    else step = 5;
+    const ticks: number[] = [];
+    const start = Math.ceil(min / step) * step;
+    for (let v = start; v <= max + 1e-9; v += step) ticks.push(Math.round(v * 100) / 100);
+    if (ticks[0] !== min) ticks.unshift(min);
+    if (ticks[ticks.length - 1] !== max) ticks.push(max);
+    const seen = new Set<number>();
+    return ticks.filter((v) => (seen.has(v) ? false : (seen.add(v), true)));
+  }
+
+  // Per-axis observed value range across this cluster's articles, padded by ±1
+  // (or ±0.5 for stars) and clamped to the native bounds. Stretches a tight
+  // band like factfulness ∈ {+4, …, +7} across the whole axis instead of
+  // crowding the right half.
+  const observedRatingExtents = $derived.by<Map<string, { min: number; max: number; n: number }>>(() => {
+    const out = new Map<string, { min: number; max: number; n: number }>();
+    for (const a of articles) {
+      const r = a.ratings;
+      if (!r) continue;
+      for (const k of Object.keys(r) as (keyof ArticleRatings)[]) {
+        const v = r[k];
+        if (typeof v !== "number") continue;
+        const cur = out.get(k);
+        if (!cur) out.set(k, { min: v, max: v, n: 1 });
+        else {
+          if (v < cur.min) cur.min = v;
+          if (v > cur.max) cur.max = v;
+          cur.n += 1;
+        }
+      }
+    }
+    return out;
+  });
+
+  function ratingDisplayRange(key: Exclude<AxisKey, "none" | "sbert">): { min: number; max: number } {
+    const native = ratingNativeBounds(key);
+    const obs = observedRatingExtents.get(key);
+    if (!obs || obs.n === 0) return { min: native.min, max: native.max };
+    let lo = Math.max(native.min, obs.min - native.pad);
+    let hi = Math.min(native.max, obs.max + native.pad);
+    const minSpan = native.pad * 2;
+    if (hi - lo < minSpan) {
+      const mid = (lo + hi) / 2;
+      lo = Math.max(native.min, mid - minSpan / 2);
+      hi = Math.min(native.max, mid + minSpan / 2);
+    }
+    if (hi <= lo) return { min: native.min, max: native.max };
+    return { min: lo, max: hi };
+  }
+
+  function normalizeRating(value: number, key: Exclude<AxisKey, "none" | "sbert">): number {
+    const r = ratingDisplayRange(key);
+    return Math.max(0, Math.min(1, (value - r.min) / (r.max - r.min)));
+  }
+
+  // Pole labels + tickmarks for each axis. SBERT MDS coords are rank-transformed
+  // into [0, 1] and have no semantic poles, so we show neutral hints + quartile
+  // ticks. Rating axes get domain-specific poles and ticks across the *observed*
+  // range so the data fills the axis.
+  interface AxisMeta {
+    leftLabel: string;
+    rightLabel: string;
+    ticks: { pos: number; label: string }[];
+  }
+  function axisMetaFor(key: AxisKey): AxisMeta | null {
+    if (key === "none") return null;
+    if (key === "sbert") {
+      const m = SBERT_AXIS_MARGIN;
+      return {
+        leftLabel: "←",
+        rightLabel: "→",
+        ticks: [0, 0.25, 0.5, 0.75, 1].map((pos) => ({
+          pos: m + pos * (1 - 2 * m),
+          label: "",
+        })),
+      };
+    }
+    const poles: Record<string, [string, string]> = {
+      leftRightLeaning: ["Left", "Right"],
+      inclusiveness: ["Majority-only", "Inclusive"],
+      factfulness: ["Opinion", "Factual"],
+      sentiment: ["Negative", "Positive"],
+      simpleLanguage: ["Complex", "Simple"],
+      multiFaceted: ["Single", "Diverse"],
+      sourced: ["Unsourced", "Well-sourced"],
+      emotionalTone: ["Detached", "Charged"],
+      constructiveness: ["Alarmist", "Solutions"],
+      overallStars: ["0★", "5★"],
+    };
+    const [l, r] = poles[key] ?? ["", ""];
+    const range = ratingDisplayRange(key);
+    const tickValues = chooseTicks(range.min, range.max);
+    const span = range.max - range.min || 1;
+    const ticks = tickValues.map((v) => ({
+      pos: (v - range.min) / span,
+      label: Number.isInteger(v) ? String(v) : v.toFixed(1),
+    }));
+    return { leftLabel: l, rightLabel: r, ticks };
   }
 
   // Static fallback for the divergence thresholds — only used if the server
@@ -229,6 +454,28 @@
     return map;
   });
 
+  // Domain → article lookup, used by `injectSourceDomains` to turn bare /
+  // parenthesised domain references the LLM emits inline (e.g. "wsws.org",
+  // "(scmp.com)") into clickable article links. Indexed both with and
+  // without the leading "www." so either spelling matches.
+  const articlesByDomain = $derived.by(() => {
+    const map = new Map<string, ArticleRef[]>();
+    for (const a of articles) {
+      const dom = (a.domain || "").toLowerCase();
+      if (!dom) continue;
+      const list = map.get(dom) ?? [];
+      list.push(a);
+      map.set(dom, list);
+      const stripped = dom.replace(/^www\./, "");
+      if (stripped !== dom) {
+        const list2 = map.get(stripped) ?? [];
+        list2.push(a);
+        map.set(stripped, list2);
+      }
+    }
+    return map;
+  });
+
   // Sources that have at least one article with extracted body text. Sources
   // without text get filtered out of the heatmap/axis because the SBERT
   // distance matrix is degenerate for them (and we already exclude them from
@@ -256,39 +503,92 @@
     return articlesForSource(sourceName)[0]?.id ?? null;
   }
 
-  // Mean sentiment across all articles from this source in this cluster.
-  // Returns null when no article has a sentiment score.
-  function sourceSentiment(sourceName: string): number | null {
-    const list = articlesForSource(sourceName);
-    let sum = 0;
-    let n = 0;
-    for (const a of list) {
-      if (typeof a.sentiment === "number" && isFinite(a.sentiment)) {
-        sum += a.sentiment;
-        n += 1;
-      }
+  // Mean cosine distance from each source to every other source in this
+  // cluster's pairwise matrix. The diagonal of the heatmap shows this value
+  // (replaces the previous mean-sentiment readout, which was almost always
+  // ~0 because article-level sentiment is calibrated to be neutral). It also
+  // feeds the "Most unique" / "Most encompassing" picks in the framing
+  // divergence card. Indexed by sourceName for O(1) lookup.
+  const sourceMeanDistances = $derived.by<Map<string, number>>(() => {
+    const out = new Map<string, number>();
+    const matrix = data?.pairwise_distance ?? {};
+    const sources = Object.keys(matrix).filter(hasText);
+    if (sources.length < 2) return out;
+    const counts = new Map<string, number>();
+    for (const a of articles) {
+      const k = a.sourceName || a.domain || "";
+      if (k) counts.set(k, (counts.get(k) ?? 0) + 1);
     }
-    return n === 0 ? null : sum / n;
-  }
+    const ranked = pickTopSourcesByExtremity({
+      matrix,
+      sources,
+      articleCounts: counts,
+      n: sources.length,
+    });
+    for (const r of ranked) out.set(r.sourceName, r.meanDistance);
+    return out;
+  });
 
-  // Same ±0.05 threshold as StoryDetailPanel's sentiment-pill labelling.
-  function sentimentTone(score: number): "positive" | "neutral" | "negative" {
-    if (score > 0.05) return "positive";
-    if (score < -0.05) return "negative";
-    return "neutral";
-  }
-
-  const SENTIMENT_COLORS: Record<"positive" | "neutral" | "negative", { bg: string; fg: string }> = {
-    positive: { bg: "#dff5e1", fg: "#1e6b3a" },
-    neutral:  { bg: "#eef0f4", fg: "#4a5568" },
-    negative: { bg: "#fde2e4", fg: "#8b1e3f" },
+  // Highest- and lowest-mean-distance sources in the cluster — the source
+  // whose framing diverges most from everyone else (Most unique) and the
+  // one closest to the cluster centroid (Most encompassing). null when the
+  // matrix is too small to be meaningful.
+  type ExtremePick = {
+    sourceName: string;
+    meanDistance: number;
+    articleId: string | null;
+    domain: string;
+    title: string | null;
   };
-
-  function diagonalCellStyle(score: number | null): string {
-    if (score === null) return "background: #f4f4f4; color: #aaa;";
-    const c = SENTIMENT_COLORS[sentimentTone(score)];
-    return `background: ${c.bg}; color: ${c.fg};`;
-  }
+  const extremeSources = $derived.by<{
+    mostUnique: ExtremePick | null;
+    median: ExtremePick | null;
+    mostEncompassing: ExtremePick | null;
+  }>(() => {
+    if (sourceMeanDistances.size < 2) {
+      return { mostUnique: null, median: null, mostEncompassing: null };
+    }
+    // Sort sources ascending by mean distance. Tie-break by source name so the
+    // median pick stays stable across renders when several sources tie.
+    const sorted = [...sourceMeanDistances.entries()].sort((a, b) => {
+      if (a[1] !== b[1]) return a[1] - b[1];
+      return a[0].localeCompare(b[0]);
+    });
+    const low = sorted[0];
+    const high = sorted[sorted.length - 1];
+    // Median: middle entry for odd counts, lower-middle for even counts.
+    // We pick a real source (not the interpolated value) so the rendered
+    // designation can link to a representative article.
+    const medianIdx = Math.floor((sorted.length - 1) / 2);
+    const mid = sorted[medianIdx];
+    const enrich = (entry: [string, number] | undefined): ExtremePick | null => {
+      if (!entry) return null;
+      const [sourceName, meanDistance] = entry;
+      const list = articlesForSource(sourceName);
+      const first = list[0];
+      return {
+        sourceName,
+        meanDistance,
+        articleId: first?.id ?? null,
+        domain: first?.domain ?? "",
+        title: first?.title ?? null,
+      };
+    };
+    const mostUnique = enrich(high);
+    const mostEncompassing = enrich(low);
+    let median = enrich(mid);
+    // Suppress the median pick when it would duplicate either extreme —
+    // happens for clusters with only 2-3 sources where the "middle" IS
+    // already one of the ends.
+    if (
+      median &&
+      (median.sourceName === mostUnique?.sourceName ||
+        median.sourceName === mostEncompassing?.sourceName)
+    ) {
+      median = null;
+    }
+    return { mostUnique, median, mostEncompassing };
+  });
 
   function handleCompareClick(event: MouseEvent, aId: string, bId: string): void {
     if (!comparePath) return;
@@ -369,87 +669,167 @@
     return [coord1, coord2];
   }
 
-  const useScatter2D = $derived((data?.n_articles ?? 0) > 10);
+  // Axis selections. X defaults to SBERT; Y default keys off cluster size
+  // (matching the previous heuristic where small clusters fell back to 1D).
+  // Once the user picks anything from the menu we stop overriding their choice.
+  let xAxis = $state<AxisKey>("sbert");
+  let yAxis = $state<AxisKey>("sbert");
+  let xUserSet = $state(false);
+  let yUserSet = $state(false);
 
-  const axisPoints = $derived.by<AxisPoint[]>(() => {
-    if (!data || !faviconUrl) return [];
+  $effect(() => {
+    if (!data) return;
+    if (!yUserSet) {
+      yAxis = data.n_articles > 10 ? "sbert" : "none";
+    }
+  });
+
+  const useScatter2D = $derived(xAxis !== "none" && yAxis !== "none");
+
+  // Per-source SBERT MDS coordinates, computed only when at least one axis
+  // requires SBERT. Returns coord-1 in `x`, coord-2 in `y` (only filled when
+  // both axes use SBERT, so the user can compare two SBERT dimensions).
+  const sbertCoords = $derived.by<{ x: Map<string, number>; y: Map<string, number> } | null>(() => {
+    if (!data) return null;
+    if (xAxis !== "sbert" && yAxis !== "sbert") return null;
     const matrix = data.pairwise_distance ?? {};
-    const sourcesInMatrix = Object.keys(matrix).filter(hasText);
-    if (sourcesInMatrix.length < 2) return [];
-
-    // Article counts per source (within the cluster) for tie-break + label/badge.
-    const counts = new Map<string, { count: number; domain: string; articleId: string }>();
-    for (const a of articles) {
-      const key = a.sourceName || a.domain || "";
-      if (!key) continue;
-      const prev = counts.get(key);
-      if (prev) {
-        prev.count += 1;
-      } else {
-        counts.set(key, { count: 1, domain: a.domain, articleId: a.id });
-      }
-    }
-
-    // Pick top-N sources by EXTREMITY (mean distance to other sources), not by
-    // article count. Wire services like Reuters/AP show up in every cluster but
-    // frame neutrally — picking by article count promoted exactly the sources
-    // with the *least* divergence to display. Larger top-N for 2D since the
-    // scatter plot has more screen real estate.
-    const topN = useScatter2D ? 16 : 10;
-    const articleCountsForPicker = new Map<string, number>();
-    for (const [s, info] of counts) articleCountsForPicker.set(s, info.count);
-    const picked = pickTopSourcesByExtremity({
-      matrix,
-      sources: sourcesInMatrix,
-      articleCounts: articleCountsForPicker,
-      n: topN,
-    });
-    const ranked = picked
-      .map((p) => ({
-        sourceName: p.sourceName,
-        ...(counts.get(p.sourceName) ?? { count: 0, domain: "", articleId: "" }),
-      }))
-      .filter((s) => s.domain);
-
-    if (ranked.length < 2) return [];
-
-    // Build subset distance matrix.
-    const names = ranked.map((r) => r.sourceName);
-    const D = names.map((a) =>
-      names.map((b) => (a === b ? 0 : matrix[a]?.[b] ?? matrix[b]?.[a] ?? 0)),
+    const sourcesArr = Object.keys(matrix).filter(hasText);
+    if (sourcesArr.length < 2) return null;
+    const D = sourcesArr.map((a) =>
+      sourcesArr.map((b) => (a === b ? 0 : matrix[a]?.[b] ?? matrix[b]?.[a] ?? 0)),
     );
-
-    const dims = useScatter2D ? 2 : 1;
+    const dims: 1 | 2 = xAxis === "sbert" && yAxis === "sbert" ? 2 : 1;
     const coords = classicalMds(D, dims);
-    const xRaw = coords[0] ?? [];
-    const yRaw = coords[1];
+    // Inset rank-transformed coords so the extreme rank-0 / rank-(n-1) points
+    // don't sit flush against the chart edges.
+    const inset = (vs: number[]): number[] => vs.map((v) => SBERT_AXIS_MARGIN + v * (1 - 2 * SBERT_AXIS_MARGIN));
+    const c0 = inset(rankTransform(coords[0] ?? []));
+    const c1 = dims === 2 ? inset(rankTransform(coords[1] ?? [])) : null;
+    const xMap = new Map<string, number>();
+    const yMap = new Map<string, number>();
+    sourcesArr.forEach((s, i) => {
+      // Whichever axis(es) selected SBERT, route coord-0 to that axis.
+      // When both, coord-0 → X, coord-1 → Y.
+      if (xAxis === "sbert" && yAxis === "sbert") {
+        xMap.set(s, c0[i] ?? 0.5);
+        yMap.set(s, (c1 ? c1[i] : 0.5) ?? 0.5);
+      } else if (xAxis === "sbert") {
+        xMap.set(s, c0[i] ?? 0.5);
+      } else {
+        yMap.set(s, c0[i] ?? 0.5);
+      }
+    });
+    return { x: xMap, y: yMap };
+  });
 
-    // For 2D we rank-transform each axis independently so points spread evenly
-    // across the canvas. Pure MDS coordinates often cluster the most-similar
-    // sources tightly while leaving outliers stranded — the rank transform
-    // preserves the MDS *ordering* in each dimension but gives every point
-    // ~1/N units of breathing room. For 1D we keep raw coords so the spacing
-    // still encodes distance.
-    let xCoords: number[];
-    let yCoords: number[] | undefined;
-    if (useScatter2D) {
-      xCoords = rankTransform(xRaw);
-      yCoords = yRaw ? rankTransform(yRaw) : undefined;
-    } else {
-      const xMin = Math.min(...xRaw);
-      const xMax = Math.max(...xRaw);
-      const xSpan = xMax - xMin || 1;
-      xCoords = xRaw.map((v) => (v - xMin) / xSpan);
+  const scatterPoints = $derived.by<AxisPoint[]>(() => {
+    if (!data || !faviconUrl) return [];
+    if (xAxis === "none" && yAxis === "none") return [];
+
+    const sourcesInMatrix = new Set(Object.keys(data.pairwise_distance ?? {}).filter(hasText));
+    const needsSbert = xAxis === "sbert" || yAxis === "sbert";
+
+    function coordFor(axis: AxisKey, article: ArticleRef, source: string, which: "x" | "y"): number | null {
+      if (axis === "none") return 0.5;
+      if (axis === "sbert") {
+        if (!sbertCoords) return null;
+        const map = which === "x" ? sbertCoords.x : sbertCoords.y;
+        return map.get(source) ?? null;
+      }
+      const v = article.ratings?.[axis as keyof ArticleRatings];
+      return typeof v === "number" ? normalizeRating(v, axis) : null;
     }
 
-    return ranked.map((r, i) => ({
-      sourceName: r.sourceName,
-      domain: r.domain,
-      articleId: r.articleId,
-      articleCount: r.count,
-      x: xCoords[i] ?? 0.5,
-      ...(yCoords ? { y: yCoords[i] ?? 0.5 } : {}),
-    }));
+    const points: AxisPoint[] = [];
+    // Per-source counts for tooltip badge (no longer used to pick sources, but
+    // still useful as "this favicon represents 1 of N articles from source").
+    const sourceCounts = new Map<string, number>();
+    for (const a of articles) {
+      const k = a.sourceName || a.domain || "";
+      if (k) sourceCounts.set(k, (sourceCounts.get(k) ?? 0) + 1);
+    }
+
+    for (const a of articles) {
+      const source = a.sourceName || a.domain || "";
+      if (!source || !a.domain) continue;
+      // SBERT axes only have coords for sources in the pairwise matrix.
+      if (needsSbert && !sourcesInMatrix.has(source)) continue;
+      const x = coordFor(xAxis, a, source, "x");
+      if (x === null) continue;
+      let y: number | null = null;
+      if (yAxis !== "none") {
+        y = coordFor(yAxis, a, source, "y");
+        if (y === null) continue;
+      }
+      points.push({
+        sourceName: source,
+        domain: a.domain,
+        articleId: a.id,
+        articleCount: sourceCounts.get(source) ?? 1,
+        x,
+        ...(yAxis !== "none" && y !== null ? { y } : {}),
+      });
+    }
+
+    if (points.length < 2) return [];
+    return points;
+  });
+
+  // Bin scatter points that share a position (rating axes are integer-valued
+  // so many articles land on the same coord) and spread bin members on a
+  // small circle so favicons don't fully stack. Offsets are emitted in rem
+  // units, consumed by CSS `--dx` / `--dy` translate variables on the marker.
+  const scatterPointsSpread = $derived.by<(AxisPoint & { dx: number; dy: number })[]>(() => {
+    const eps = 0.01;
+    const buckets = new Map<string, AxisPoint[]>();
+    for (const p of scatterPoints) {
+      const kx = Math.round(p.x / eps);
+      const ky = p.y === undefined ? 0 : Math.round(p.y / eps);
+      const key = `${kx},${ky}`;
+      const arr = buckets.get(key) ?? [];
+      arr.push(p);
+      buckets.set(key, arr);
+    }
+    const out: (AxisPoint & { dx: number; dy: number })[] = [];
+    for (const arr of buckets.values()) {
+      if (arr.length === 1) {
+        out.push({ ...arr[0], dx: 0, dy: 0 });
+        continue;
+      }
+      // Distribute across concentric rings; each ring's radius is the larger
+      // of a base step and the no-overlap minimum derived from its slot count
+      // (chord = 2·r·sin(π/n) ≥ markerWidth ⇒ r ≥ markerHalf / sin(π/n)).
+      // Ring 0 takes up to 6 markers, each outer ring grows capacity by 4.
+      // Phase-rotated by ring index so members don't align radially.
+      const MARKER_HALF = 0.78; // rem; ~22px favicon half + a hair of slack
+      const ringCounts: number[] = [];
+      let remaining = arr.length;
+      let rIdx = 0;
+      while (remaining > 0) {
+        const cap = rIdx === 0 ? 6 : 6 + rIdx * 4;
+        const take = Math.min(remaining, cap);
+        ringCounts.push(take);
+        remaining -= take;
+        rIdx += 1;
+      }
+      let i = 0;
+      ringCounts.forEach((count, idx) => {
+        const angularStep = Math.PI / Math.max(2, count);
+        const minR = MARKER_HALF / Math.max(Math.sin(angularStep), 0.01);
+        const baseR = 0.9 + idx * 1.6;
+        const radius = Math.max(baseR, minR);
+        for (let k = 0; k < count; k += 1) {
+          const angle = (2 * Math.PI * k) / count + idx * 0.39;
+          out.push({
+            ...arr[i],
+            dx: Math.cos(angle) * radius,
+            dy: Math.sin(angle) * radius,
+          });
+          i += 1;
+        }
+      });
+    }
+    return out;
   });
 
   /**
@@ -565,8 +945,64 @@
       lastClusterId = clusterId;
       data = null;
       error = null;
+      xAxis = "sbert";
+      yAxis = "sbert";
+      xUserSet = false;
+      yUserSet = false;
+      xMenuOpen = false;
+      yMenuOpen = false;
       void load(false);
     }
+  });
+
+  let xMenuOpen = $state(false);
+  let yMenuOpen = $state(false);
+
+  function selectAxis(which: "x" | "y", key: AxisKey): void {
+    if (which === "x") {
+      xAxis = key;
+      xUserSet = true;
+      xMenuOpen = false;
+    } else {
+      yAxis = key;
+      yUserSet = true;
+      yMenuOpen = false;
+    }
+  }
+
+  function toggleMenu(which: "x" | "y", event: MouseEvent): void {
+    event.stopPropagation();
+    if (which === "x") {
+      xMenuOpen = !xMenuOpen;
+      yMenuOpen = false;
+    } else {
+      yMenuOpen = !yMenuOpen;
+      xMenuOpen = false;
+    }
+  }
+
+  // Close any open axis menu on outside click / Escape.
+  $effect(() => {
+    if (!xMenuOpen && !yMenuOpen) return;
+    function handleDocClick(event: MouseEvent): void {
+      const t = event.target as HTMLElement | null;
+      if (!t || !t.closest(".axis-picker")) {
+        xMenuOpen = false;
+        yMenuOpen = false;
+      }
+    }
+    function handleKey(event: KeyboardEvent): void {
+      if (event.key === "Escape") {
+        xMenuOpen = false;
+        yMenuOpen = false;
+      }
+    }
+    document.addEventListener("click", handleDocClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("click", handleDocClick);
+      document.removeEventListener("keydown", handleKey);
+    };
   });
 
   async function load(refresh: boolean): Promise<void> {
@@ -604,7 +1040,7 @@
   }
 </script>
 
-<div class="perspective-stack">
+<div class="perspective-stack" data-debug-component="PerspectivePanel">
 {#if error}
     <p class="perspective-error">{error}</p>
   {/if}
@@ -612,10 +1048,10 @@
   {#if loading && !data}
     <p class="perspective-loading">Loading perspective…</p>
   {:else if data}
-    <div class="perspective-row perspective-row--top">
-      <div class="perspective-block divergence-block">
+    <div class="perspective-row perspective-row--top" data-debug-component="PerspectiveRowTop">
+      <div class="perspective-block divergence-block" data-debug-component="DivergenceBlock">
         <h5>Framing divergence</h5>
-        <div class="divergence-summary">
+        <div class="divergence-summary" data-debug-component="DivergenceSummary">
           <div class={divergenceClass(data.divergence_label)}>
             <span class="divergence-score">{divergencePct(data.divergence_score)}</span>
             <span class="divergence-sublabel">{data.divergence_label ?? "n/a"}</span>
@@ -628,10 +1064,47 @@
           Mean cosine distance between sources, scaled to a percentile of all clusters analysed.
           Bands: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}.
         </p>
+        {#if extremeSources.mostUnique && extremeSources.mostEncompassing && extremeSources.mostUnique.sourceName !== extremeSources.mostEncompassing.sourceName}
+          <ul class="extreme-sources">
+            {#each [
+              { kind: "unique", label: "Most unique", entry: extremeSources.mostUnique, hint: "Frames the story most differently from the rest" },
+              ...(extremeSources.median
+                ? [{ kind: "median" as const, label: "The voice in the middle", entry: extremeSources.median, hint: "Median source by mean cosine distance to the rest of the cluster" }]
+                : []),
+              { kind: "encompassing", label: "Most encompassing", entry: extremeSources.mostEncompassing, hint: "Closest to the cluster's central framing" },
+            ] as pick (pick.kind)}
+              {@const e = pick.entry}
+              <li class="extreme-source extreme-source--{pick.kind}" title={pick.hint}>
+                <p class="extreme-source-eyebrow">{pick.label}</p>
+                {#if e.title}
+                  {#if e.articleId && articlePath}
+                    <h6 class="extreme-source-title">
+                      <a
+                        class="extreme-source-title-link"
+                        href={articlePath(e.articleId)}
+                        onclick={(event) => handleSourceClick(event, e.articleId!)}
+                      >{e.title}</a>
+                    </h6>
+                  {:else}
+                    <h6 class="extreme-source-title">{e.title}</h6>
+                  {/if}
+                {/if}
+                <p class="extreme-source-meta">
+                  {#if e.domain && faviconUrl}
+                    <img class="extreme-source-favicon" src={faviconUrl(e.domain)} alt="" loading="lazy" width="14" height="14" onerror={onFaviconError} />
+                  {/if}
+                  <span class="extreme-source-name">{e.sourceName}</span>
+                  <span class="extreme-source-sep">·</span>
+                  <span class="extreme-source-score">mean distance <strong>{e.meanDistance.toFixed(2)}</strong></span>
+                </p>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </div>
 
       {#if heatmap}
-        <div class="perspective-block">
+        <div class="perspective-block" data-debug-component="HeatmapBlock">
           <h5>Pairwise distance matrix</h5>
           <p class="perspective-note">
             Cosine distance between mean source embeddings — top {heatmap.sources.length} most-divergent sources (mean distance to others). Cells colored by the global framing-divergence thresholds: low &lt; {thresholds.p25.toFixed(2)} · moderate &lt; {thresholds.p75.toFixed(2)} · high &lt; {thresholds.p90.toFixed(2)} · very high ≥ {thresholds.p90.toFixed(2)}. Range in cluster: {heatmap.min.toFixed(2)} – {heatmap.max.toFixed(2)}.
@@ -667,18 +1140,22 @@
                       {@const aId = i !== j ? representativeArticleId(cell.a) : null}
                       {@const bId = i !== j ? representativeArticleId(cell.b) : null}
                       {@const linkable = i !== j && aId && bId && comparePath}
-                      {@const diagSent = i === j ? sourceSentiment(cell.a) : null}
+                      {@const diagMean = i === j ? sourceMeanDistances.get(cell.a) ?? null : null}
                       {@const diagArticleId = i === j ? representativeArticleId(cell.a) : null}
                       {@const diagLinkable = i === j && diagArticleId && articlePath}
                       <td
                         class="heatmap-cell"
                         class:diagonal={i === j}
                         class:clickable={linkable || diagLinkable}
-                        style={i === j ? diagonalCellStyle(diagSent) : heatStyle(cell.value, false)}
+                        style={i === j
+                          ? diagMean !== null
+                            ? heatStyle(diagMean, false)
+                            : "background: #f4f4f4; color: #aaa;"
+                          : heatStyle(cell.value, false)}
                         title={i === j
-                          ? diagSent !== null
-                            ? `${cell.a} — sentiment ${diagSent.toFixed(2)} (${sentimentTone(diagSent)})`
-                            : `${cell.a} — sentiment unavailable`
+                          ? diagMean !== null
+                            ? `${cell.a} — mean distance to other sources ${diagMean.toFixed(3)} (${classifyDistance(diagMean)})`
+                            : `${cell.a} — mean distance unavailable`
                           : linkable
                             ? `Compare ${cell.a} ↔ ${cell.b} (cosine ${cell.value.toFixed(3)}, ${classifyDistance(cell.value)})`
                             : `${cell.a} ↔ ${cell.b}: ${cell.value.toFixed(3)} (${classifyDistance(cell.value)})`}
@@ -691,14 +1168,14 @@
                           >{cell.value.toFixed(2)}</a>
                         {:else if i !== j}
                           {cell.value.toFixed(2)}
-                        {:else if diagLinkable && diagSent !== null}
+                        {:else if diagLinkable && diagMean !== null}
                           <a
                             class="heatmap-cell-link"
                             href={articlePath!(diagArticleId!)}
                             onclick={(event) => handleSourceClick(event, diagArticleId!)}
-                          >{diagSent.toFixed(2)}</a>
-                        {:else if diagSent !== null}
-                          {diagSent.toFixed(2)}
+                          >{diagMean.toFixed(2)}</a>
+                        {:else if diagMean !== null}
+                          {diagMean.toFixed(2)}
                         {/if}
                       </td>
                     {/each}
@@ -711,50 +1188,167 @@
       {/if}
     </div>
 
-    {#if axisPoints.length >= 2 && faviconUrl}
-      <div class="perspective-block">
+    {#if (scatterPoints.length >= 2 || xAxis === "none" && yAxis === "none") && faviconUrl}
+      <div class="perspective-block" data-debug-component="SourcePositioningBlock">
         <h5>Source positioning</h5>
-        {#if useScatter2D}
-          <p class="perspective-note source-axis-help">
-            Top {axisPoints.length} most-divergent sources (mean distance to others), projected from the SBERT distance matrix to two dimensions (classical MDS). Closer favicons frame the story more similarly. Axes are unitless.
+        <p class="perspective-note source-axis-help">
+          One favicon per article. Pick a dimension for each axis: SBERT framing-distance (classical MDS of source embeddings), one of ten LLM-rated dimensions (each in [−10, +10] except overall stars in [0, 5]), or hide the axis. {useScatter2D ? "Both axes shown — closer points frame the story more similarly along both dimensions." : "Single axis shown — closer points frame the story more similarly along that dimension."}
+        </p>
+
+        {#if scatterPoints.length < 2}
+          <p class="perspective-note">
+            {xAxis === "none" && yAxis === "none"
+              ? "Pick at least one dimension to plot."
+              : "Not enough articles with the selected dimensions to plot."}
           </p>
-          <div class="source-scatter">
-            {#each axisPoints as p}
-              <a
-                class="source-axis-marker scatter"
-                style="--x: {p.x}; --y: {p.y ?? 0.5}"
-                href={articlePath ? articlePath(p.articleId) : "#"}
-                onclick={(event) => p.articleId && handleSourceClick(event, p.articleId)}
-                title={`${p.sourceName} — ${p.articleCount} article${p.articleCount === 1 ? "" : "s"}`}
-              >
-                <img
-                  class="source-axis-favicon"
-                  src={faviconUrl(p.domain)}
-                  alt={p.sourceName}
-                  width="22"
-                  height="22"
-                  loading="lazy"
-                  onerror={onFaviconError}
-                />
-                <span class="source-axis-label">{p.sourceName}</span>
-              </a>
+          <div class="axis-picker-row">
+            {#each [{ which: "x" as const, key: xAxis, open: xMenuOpen }, { which: "y" as const, key: yAxis, open: yMenuOpen }] as ax (ax.which)}
+              <div class="axis-picker axis-picker--inline">
+                <button
+                  type="button"
+                  class="axis-button"
+                  aria-haspopup="menu"
+                  aria-expanded={ax.open}
+                  onclick={(event) => toggleMenu(ax.which, event)}
+                >{ax.which.toUpperCase()}: {axisLabelFor(ax.key)} ▾</button>
+                {#if ax.open}
+                  <ul class="axis-menu" role="menu">
+                    {#each AXIS_OPTIONS as opt}
+                      <li>
+                        <button
+                          type="button"
+                          class="axis-menu-item"
+                          class:active={ax.key === opt.key}
+                          onclick={() => selectAxis(ax.which, opt.key)}
+                          title={opt.hint}
+                        >{opt.label}</button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
             {/each}
           </div>
+        {:else if useScatter2D}
+          {@const xMeta = axisMetaFor(xAxis)}
+          {@const yMeta = axisMetaFor(yAxis)}
+          <div class="scatter-frame">
+            <div class="axis-side axis-side--y">
+              {#if yMeta}<span class="axis-pole axis-pole--y-top">{yMeta.rightLabel}</span>{/if}
+            <div class="axis-picker axis-picker--y">
+              <button
+                type="button"
+                class="axis-button"
+                aria-haspopup="menu"
+                aria-expanded={yMenuOpen}
+                onclick={(event) => toggleMenu("y", event)}
+              >Y: {axisLabelFor(yAxis)} ▾</button>
+              {#if yMenuOpen}
+                <ul class="axis-menu" role="menu">
+                  {#each AXIS_OPTIONS as opt}
+                    <li>
+                      <button
+                        type="button"
+                        class="axis-menu-item"
+                        class:active={yAxis === opt.key}
+                        onclick={() => selectAxis("y", opt.key)}
+                        title={opt.hint}
+                      >{opt.label}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+              {#if yMeta}<span class="axis-pole axis-pole--y-bottom">{yMeta.leftLabel}</span>{/if}
+            </div>
+            <div class="source-scatter">
+              {#if yMeta}
+                {#each yMeta.ticks as t}
+                  <span class="axis-tick axis-tick--y" style="--y: {t.pos}">
+                    {#if t.label}<span class="axis-tick-label">{t.label}</span>{/if}
+                  </span>
+                {/each}
+              {/if}
+              {#if xMeta}
+                {#each xMeta.ticks as t}
+                  <span class="axis-tick axis-tick--x" style="--x: {t.pos}">
+                    {#if t.label}<span class="axis-tick-label">{t.label}</span>{/if}
+                  </span>
+                {/each}
+              {/if}
+              {#each scatterPointsSpread as p}
+                <a
+                  class="source-axis-marker scatter"
+                  style="--x: {p.x}; --y: {p.y ?? 0.5}; --dx: {p.dx}rem; --dy: {p.dy}rem"
+                  href={articlePath ? articlePath(p.articleId) : "#"}
+                  onclick={(event) => p.articleId && handleSourceClick(event, p.articleId)}
+                  title={`${p.sourceName} — ${p.articleCount} article${p.articleCount === 1 ? "" : "s"} from this source in cluster`}
+                >
+                  <img
+                    class="source-axis-favicon"
+                    src={faviconUrl(p.domain)}
+                    alt={p.sourceName}
+                    width="22"
+                    height="22"
+                    loading="lazy"
+                    onerror={onFaviconError}
+                  />
+                </a>
+              {/each}
+            </div>
+            <div class="axis-side axis-side--x">
+              {#if xMeta}<span class="axis-pole axis-pole--x">{xMeta.leftLabel}</span>{/if}
+            <div class="axis-picker axis-picker--x">
+              <button
+                type="button"
+                class="axis-button"
+                aria-haspopup="menu"
+                aria-expanded={xMenuOpen}
+                onclick={(event) => toggleMenu("x", event)}
+              >X: {axisLabelFor(xAxis)} ▾</button>
+              {#if xMenuOpen}
+                <ul class="axis-menu" role="menu">
+                  {#each AXIS_OPTIONS as opt}
+                    <li>
+                      <button
+                        type="button"
+                        class="axis-menu-item"
+                        class:active={xAxis === opt.key}
+                        onclick={() => selectAxis("x", opt.key)}
+                        title={opt.hint}
+                      >{opt.label}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+              {#if xMeta}<span class="axis-pole axis-pole--x">{xMeta.rightLabel}</span>{/if}
+            </div>
+          </div>
         {:else}
-          {@const placed = assignRows(axisPoints, 0.07)}
+          {@const oneDKey = (xAxis !== "none" ? xAxis : yAxis) as AxisKey}
+          {@const oneDMeta = axisMetaFor(oneDKey)}
+          {@const oneDPoints = xAxis === "none" ? scatterPoints.map((p) => ({ ...p, x: p.y ?? 0.5 })) : scatterPoints}
+          {@const placed = assignRows(oneDPoints, 0.04)}
           {@const rowCount = Math.max(...placed.map((p) => p.row)) + 1}
-          <p class="perspective-note source-axis-help">
-            Top {axisPoints.length} most-divergent sources (mean distance to others), projected to one dimension (classical MDS). Closer favicons frame the story more similarly.
-          </p>
-          <div class="source-axis" style="--row-count: {rowCount}">
+          <div class="source-axis source-axis--with-ticks" style="--row-count: {rowCount}">
             <div class="source-axis-line"></div>
+            {#if oneDMeta}
+              {#each oneDMeta.ticks as t}
+                <span class="axis-tick axis-tick--x axis-tick--1d" style="--x: {t.pos}">
+                  {#if t.label}<span class="axis-tick-label">{t.label}</span>{/if}
+                </span>
+              {/each}
+              <span class="axis-pole axis-pole--1d-left">{oneDMeta.leftLabel}</span>
+              <span class="axis-pole axis-pole--1d-right">{oneDMeta.rightLabel}</span>
+            {/if}
             {#each placed as p}
               <a
                 class="source-axis-marker"
                 style="--x: {p.x}; --row: {p.row}"
                 href={articlePath ? articlePath(p.articleId) : "#"}
                 onclick={(event) => p.articleId && handleSourceClick(event, p.articleId)}
-                title={`${p.sourceName} — ${p.articleCount} article${p.articleCount === 1 ? "" : "s"}`}
+                title={`${p.sourceName} — ${p.articleCount} article${p.articleCount === 1 ? "" : "s"} from this source in cluster`}
               >
                 <img
                   class="source-axis-favicon"
@@ -765,17 +1359,44 @@
                   loading="lazy"
                   onerror={onFaviconError}
                 />
-                <span class="source-axis-label">{p.sourceName}</span>
               </a>
+            {/each}
+          </div>
+          <div class="axis-picker-row">
+            {#each [{ which: "x" as const, key: xAxis, open: xMenuOpen }, { which: "y" as const, key: yAxis, open: yMenuOpen }] as ax (ax.which)}
+              <div class="axis-picker axis-picker--inline">
+                <button
+                  type="button"
+                  class="axis-button"
+                  aria-haspopup="menu"
+                  aria-expanded={ax.open}
+                  onclick={(event) => toggleMenu(ax.which, event)}
+                >{ax.which.toUpperCase()}: {axisLabelFor(ax.key)} ▾</button>
+                {#if ax.open}
+                  <ul class="axis-menu" role="menu">
+                    {#each AXIS_OPTIONS as opt}
+                      <li>
+                        <button
+                          type="button"
+                          class="axis-menu-item"
+                          class:active={ax.key === opt.key}
+                          onclick={() => selectAxis(ax.which, opt.key)}
+                          title={opt.hint}
+                        >{opt.label}</button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
             {/each}
           </div>
         {/if}
       </div>
     {/if}
 
-    <div class="perspective-row perspective-row--bottom">
+    <div class="perspective-row perspective-row--bottom" data-debug-component="PerspectiveRowBottom">
     {#if data.distinctive_words.length > 0}
-      <div class="perspective-block">
+      <div class="perspective-block" data-debug-component="DistinctiveWordsBlock">
         <h5>What each source emphasises</h5>
         <table class="distinctive-table">
           <thead>
@@ -827,7 +1448,7 @@
     {/if}
 
     {#if data.country_sentiment.length > 0}
-      <div class="perspective-block">
+      <div class="perspective-block" data-debug-component="CountrySentimentBlock">
         <h5>Sentiment by country</h5>
         <ul class="country-list">
           {#each data.country_sentiment as c}
@@ -869,23 +1490,23 @@
     </div>
 
     {#if data.narrative?.error}
-      <div class="perspective-block">
+      <div class="perspective-block" data-debug-component="NarrativeErrorBlock">
         <p class="perspective-error">{data.narrative.error}</p>
       </div>
     {/if}
 
     {#if data.narrative?.framingAngles || data.narrative?.countryNarrative}
-      <div class="perspective-row perspective-row--narrative">
+      <div class="perspective-row perspective-row--narrative" data-debug-component="NarrativeRow">
         {#if data.narrative.framingAngles}
-          <div class="perspective-block narrative-block">
+          <div class="perspective-block narrative-block" data-debug-component="EditorialAnglesBlock">
             <h5>Editorial angles</h5>
-            <div class="narrative-body" onclick={handleNarrativeClick}>{@html injectSourceFavicons(renderMarkdown(data.narrative.framingAngles))}</div>
+            <div class="narrative-body" onclick={handleNarrativeClick} data-debug-component="EditorialAnglesBody">{@html injectSourceDomains(injectSourceFavicons(renderMarkdown(data.narrative.framingAngles)))}</div>
           </div>
         {/if}
         {#if data.narrative.countryNarrative}
-          <div class="perspective-block narrative-block">
+          <div class="perspective-block narrative-block" data-debug-component="NationalNarrativesBlock">
             <h5>National narratives</h5>
-            <div class="narrative-body" onclick={handleNarrativeClick}>{@html injectCountryFlags(renderMarkdown(data.narrative.countryNarrative))}</div>
+            <div class="narrative-body" onclick={handleNarrativeClick} data-debug-component="NationalNarrativesBody">{@html injectCountryFlags(renderMarkdown(data.narrative.countryNarrative))}</div>
           </div>
         {/if}
       </div>
@@ -895,7 +1516,7 @@
     {/if}
 
     {#if articles && articles.length > 0}
-      <div class="perspective-block country-map-block">
+      <div class="perspective-block country-map-block" data-debug-component="CountryMapBlock">
         <CountryMap
           articles={articles.map((a) => ({ domain: a.domain, country: a.country ?? null }))}
         />
@@ -917,6 +1538,78 @@
 </div>
 
 <style>
+  .extreme-sources {
+    margin: 0.85rem 0 0 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+  }
+  .extreme-source {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.55rem 0.7rem 0.6rem;
+    border: 1px solid var(--surface-border, #d6dde7);
+    border-radius: 8px;
+    background: var(--surface-soft, #f6f8fb);
+    border-left-width: 3px;
+  }
+  .extreme-source--unique { border-left-color: #c0382b; }
+  .extreme-source--median { border-left-color: #6b7280; }
+  .extreme-source--encompassing { border-left-color: #2563eb; }
+  .extreme-source-eyebrow {
+    margin: 0;
+    font-size: 0.7rem;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted, #58708f);
+    font-weight: 600;
+  }
+  .extreme-source-title {
+    margin: 0.15rem 0 0.05rem;
+    font-size: 0.95rem;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+    font-weight: 600;
+  }
+  .extreme-source-title-link {
+    color: inherit;
+    text-decoration: none;
+  }
+  .extreme-source-title-link:hover { text-decoration: underline; }
+  .extreme-source-meta {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+    color: var(--muted, #58708f);
+  }
+  .extreme-source-favicon {
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    flex: none;
+  }
+  .extreme-source-name {
+    font-weight: 500;
+    color: inherit;
+  }
+  .extreme-source-sep {
+    color: rgba(88, 112, 143, 0.5);
+  }
+  .extreme-source-score {
+    font-variant-numeric: tabular-nums;
+  }
+  .extreme-source-score strong {
+    font-weight: 600;
+    color: inherit;
+  }
+
   .perspective-header {
     display: flex;
     align-items: center;
@@ -1042,6 +1735,15 @@
     color: #0a3c96;
     border-bottom-color: currentColor;
   }
+  .narrative-body :global(.source-inline-domain) {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(10, 60, 150, 0.45);
+  }
+  .narrative-body :global(.source-inline-domain:hover) {
+    color: #0a3c96;
+    border-bottom-color: currentColor;
+  }
   .source-link { color: #1c4566; text-decoration: none; border-bottom: 1px dotted #9bb1c7; }
   .source-link:hover { color: #0a3c96; border-bottom-color: #0a3c96; }
   .source-count { color: #888; font-weight: 400; font-size: 0.75rem; margin-left: 0.2rem; }
@@ -1051,6 +1753,22 @@
     height: calc(2.6rem + var(--row-count, 1) * 2.4rem);
     margin: 0.4rem 4rem 1.5rem;
   }
+  .source-axis--with-ticks { margin-bottom: 2.2rem; }
+  .axis-tick--1d { top: calc(1.1rem - 3px); height: 6px; bottom: auto; }
+  .axis-tick--1d .axis-tick-label {
+    top: 10px;
+    bottom: auto;
+    transform: translateX(-50%);
+  }
+  .axis-pole--1d-left,
+  .axis-pole--1d-right {
+    position: absolute;
+    bottom: -1.2rem;
+    font-size: 0.7rem;
+    color: var(--muted, #58708f);
+  }
+  .axis-pole--1d-left { left: 0; }
+  .axis-pole--1d-right { right: 0; }
   .source-axis-line {
     position: absolute;
     left: 0; right: 0; top: 1.1rem;
@@ -1096,10 +1814,148 @@
   }
   .source-axis-marker:hover .source-axis-label { color: #0a3c96; }
   .source-axis-marker:hover .source-axis-favicon { box-shadow: 0 2px 6px rgba(10, 60, 150, 0.25); }
+  .scatter-frame {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: 1fr auto;
+    grid-template-areas:
+      "ypick scatter"
+      ".     xpick";
+    column-gap: 0.5rem;
+    row-gap: 0.4rem;
+    margin: 0.4rem 0 1rem;
+  }
+  .axis-picker {
+    position: relative;
+    display: inline-flex;
+  }
+  .axis-picker--y { align-self: center; }
+  .axis-picker--x { }
+  .axis-picker--inline { display: inline-flex; }
+  .axis-side--y {
+    grid-area: ypick;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.4rem 0;
+  }
+  .axis-side--x {
+    grid-area: xpick;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0 0.2rem;
+  }
+  .axis-pole {
+    font-size: 0.68rem;
+    color: var(--muted, #58708f);
+    white-space: nowrap;
+  }
+  .axis-pole--y-top,
+  .axis-pole--y-bottom {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    text-align: center;
+  }
+  .axis-tick {
+    position: absolute;
+    background: rgba(28, 46, 73, 0.4);
+    pointer-events: none;
+  }
+  .axis-tick--x {
+    bottom: 0;
+    left: calc(var(--x) * 100%);
+    width: 1px;
+    height: 6px;
+    transform: translateX(-50%);
+  }
+  .axis-tick--y {
+    left: 0;
+    top: calc((1 - var(--y)) * 100%);
+    height: 1px;
+    width: 6px;
+    transform: translateY(-50%);
+  }
+  .axis-tick-label {
+    position: absolute;
+    font-size: 0.62rem;
+    color: var(--muted, #58708f);
+    background: rgba(255, 255, 255, 0.85);
+    padding: 0 3px;
+    border-radius: 2px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .axis-tick--x .axis-tick-label {
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  .axis-tick--y .axis-tick-label {
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .axis-picker-row {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+  }
+  .axis-button {
+    background: #fff;
+    border: 1px solid var(--surface-border, #d6dde7);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.78rem;
+    color: #34455d;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .axis-button:hover { border-color: #0a3c96; color: #0a3c96; }
+  .axis-picker--y .axis-button {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+  }
+  .axis-menu {
+    position: absolute;
+    z-index: 10;
+    list-style: none;
+    margin: 0;
+    padding: 0.25rem 0;
+    background: #fff;
+    border: 1px solid var(--surface-border, #d6dde7);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(20, 55, 111, 0.18);
+    min-width: 14rem;
+  }
+  .axis-picker--y .axis-menu { top: 0; left: 100%; margin-left: 0.4rem; }
+  .axis-picker--x .axis-menu { bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 0.4rem; }
+  .axis-picker--inline .axis-menu { top: 100%; left: 50%; transform: translateX(-50%); margin-top: 0.4rem; }
+  .axis-menu li { margin: 0; }
+  .axis-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: 0;
+    padding: 0.35rem 0.7rem;
+    font-size: 0.8rem;
+    color: #34455d;
+    cursor: pointer;
+  }
+  .axis-menu-item:hover { background: #eef3f8; color: #0a3c96; }
+  .axis-menu-item.active { background: #dde7f1; color: #0a3c96; font-weight: 600; }
+
   .source-scatter {
+    grid-area: scatter;
     position: relative;
     height: 18rem;
-    margin: 0.4rem 4rem 3rem;
+    margin: 0;
     background:
       linear-gradient(to right, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 25% 100%,
       linear-gradient(to bottom, rgba(28, 46, 73, 0.04) 1px, transparent 1px) 0 0 / 100% 25%,
@@ -1111,7 +1967,12 @@
     position: absolute;
     left: calc(var(--x) * 100%);
     top: calc((1 - var(--y)) * 100%);
-    transform: translate(-50%, -50%);
+    transform: translate(calc(-50% + var(--dx, 0rem)), calc(-50% + var(--dy, 0rem)));
+    transition: transform 120ms ease;
+  }
+  .source-axis-marker.scatter:hover {
+    z-index: 5;
+    transform: translate(calc(-50% + var(--dx, 0rem)), calc(-50% + var(--dy, 0rem))) scale(1.15);
   }
   .source-axis-marker.scatter::before { display: none; }
   .heatmap-wrap { overflow: auto; padding-bottom: 0.4rem; max-height: 26rem; max-width: 100%; }
@@ -1126,7 +1987,11 @@
   .heatmap-col-label .heatmap-favicon { margin-left: 0; }
   .heatmap-col-fallback { display: inline-block; font-size: 0.7rem; color: #58708f; text-transform: uppercase; }
   .heatmap-cell { width: 2rem; height: 2rem; text-align: center; color: #34455d; font-variant-numeric: tabular-nums; border-radius: 2px; padding: 0; }
-  .heatmap-cell.diagonal { font-weight: 600; }
+  .heatmap-cell.diagonal {
+    font-weight: 600;
+    box-shadow: inset 0 0 0 2px rgba(33, 47, 73, 0.55);
+    border-radius: 4px;
+  }
   .heatmap-cell.clickable { cursor: pointer; }
   .heatmap-cell.clickable:hover { outline: 2px solid #0a3c96; outline-offset: -1px; }
   .heatmap-cell-link {

@@ -63,6 +63,12 @@ run_stage() {
   run_stage "5-perspective-calibrate" \
     "pnpm --filter @news/api exec tsx src/scripts/perspective-calibrate.ts" || exit $?
 
+  run_stage "6-perspective-narrative" \
+    "pnpm --filter @news/api exec tsx src/scripts/perspective-narrative.ts --from-date ${DATE}" || exit $?
+
+  run_stage "7-perspective-resolve-countries" \
+    "pnpm --filter @news/api exec tsx src/scripts/perspective-resolve-countries.ts --apply-empty" || exit $?
+
   PIPELINE_END=$(date +%s)
   banner "PIPELINE COMPLETE  total=$((PIPELINE_END - PIPELINE_START))s"
 ) 2>&1 | tee -a "${LOG}"

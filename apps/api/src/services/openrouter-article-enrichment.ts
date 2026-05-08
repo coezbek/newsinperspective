@@ -60,8 +60,30 @@ export interface OpenRouterArticleEnrichmentResult {
    * the field (older cached responses or models that ignore the prompt).
    */
   bodyAppearsTruncated: boolean | null;
+  /**
+   * Per-article qualitative ratings produced by the LLM. Each axis is an
+   * integer in [-10, +10] except `overallStars` which is [0, 5]. Any axis
+   * may be `null` when the model deems it not applicable to the article
+   * (e.g. `leftRightLeaning` for a non-US-aligned outlet). The whole
+   * object is `null` when the model omitted it (older cached responses,
+   * non-newsworthy articles, parse failure on this field only).
+   */
+  ratings: ArticleRatings | null;
   model: string;
   error: string | null;
+}
+
+export interface ArticleRatings {
+  leftRightLeaning: number | null;
+  inclusiveness: number | null;
+  factfulness: number | null;
+  sentiment: number | null;
+  simpleLanguage: number | null;
+  multiFaceted: number | null;
+  sourced: number | null;
+  emotionalTone: number | null;
+  constructiveness: number | null;
+  overallStars: number | null;
 }
 
 /**
@@ -148,6 +170,34 @@ function computeBackoffMs(round: number, retryAfterMs: number | null): number {
   return Math.min(base + jitter, openRouterMaxBackoffMs);
 }
 
+function clampInt(value: unknown, min: number, max: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const rounded = Math.round(value);
+  if (rounded < min || rounded > max) return null;
+  return rounded;
+}
+
+function parseRatings(value: unknown): ArticleRatings | null {
+  if (!value || typeof value !== "object") return null;
+  const r = value as Record<string, unknown>;
+  const out: ArticleRatings = {
+    leftRightLeaning: clampInt(r.leftRightLeaning, -10, 10),
+    inclusiveness: clampInt(r.inclusiveness, -10, 10),
+    factfulness: clampInt(r.factfulness, -10, 10),
+    sentiment: clampInt(r.sentiment, -10, 10),
+    simpleLanguage: clampInt(r.simpleLanguage, -10, 10),
+    multiFaceted: clampInt(r.multiFaceted, -10, 10),
+    sourced: clampInt(r.sourced, -10, 10),
+    emotionalTone: clampInt(r.emotionalTone, -10, 10),
+    constructiveness: clampInt(r.constructiveness, -10, 10),
+    overallStars: clampInt(r.overallStars, 0, 5),
+  };
+  // If the model returned an empty/all-null object, treat as missing so we
+  // don't persist meaningless rows.
+  const hasAny = Object.values(out).some((v) => v !== null);
+  return hasAny ? out : null;
+}
+
 function uniqueStrings(values: unknown, limit = 8): string[] {
   if (!Array.isArray(values)) return [];
   return values
@@ -176,6 +226,7 @@ export function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArt
       places?: unknown;
       language?: unknown;
       bodyAppearsTruncated?: unknown;
+      ratings?: unknown;
     };
 
     // Default to newsworthy when the field is missing — older cached
@@ -232,6 +283,7 @@ export function parseEnrichmentFromResponse(content: string): Omit<OpenRouterArt
       // thinks" semantic distinct from "model said false".
       bodyAppearsTruncated:
         typeof parsed.bodyAppearsTruncated === "boolean" ? parsed.bodyAppearsTruncated : null,
+      ratings: isNewsworthy ? parseRatings(parsed.ratings) : null,
     };
   } catch {
     return null;
@@ -267,6 +319,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
       notNewsworthyReason: null,
       inputTruncated,
       bodyAppearsTruncated: null,
+      ratings: null,
       model: primaryModel,
       error: "OPENROUTER_API_KEY missing",
     };
@@ -289,7 +342,7 @@ export async function extractArticleEnrichmentWithOpenRouter(
   const prompt = [
     "Analyze this news article and return strict JSON only.",
     "JSON shape:",
-    "{\"isNewsworthy\":true,\"notNewsworthyReason\":\"...\",\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"translatedFullText\":\"...\",\"framingSummary\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\",\"bodyAppearsTruncated\":true|false}",
+    "{\"isNewsworthy\":true,\"notNewsworthyReason\":\"...\",\"keywords\":[\"...\"],\"translatedTitle\":\"...\",\"translatedSummary\":\"...\",\"translatedFullText\":\"...\",\"framingSummary\":\"...\",\"persons\":[\"...\"],\"organizations\":[\"...\"],\"places\":[\"...\"],\"language\":\"...\",\"bodyAppearsTruncated\":true|false,\"ratings\":{\"leftRightLeaning\":-3,\"inclusiveness\":2,\"factfulness\":7,\"sentiment\":-4,\"simpleLanguage\":5,\"multiFaceted\":3,\"sourced\":6,\"emotionalTone\":-2,\"constructiveness\":1,\"overallStars\":4}}",
     "isNewsworthy rules:",
     "- false if the Body is corporate footer / registration / copyright / address / phone / business-license boilerplate (e.g. starts with 'CEO:', contains 'business registration number', 'communication sales registration', 'All Rights Reserved' as the bulk of the text)",
     "- false if Body is a paywall / login / subscription wall (e.g. 'Become an Insider', 'Subscribe to read', 'Sign in to continue')",
@@ -329,6 +382,21 @@ export async function extractArticleEnrichmentWithOpenRouter(
     "- factual and faithful — do not editorialize, do not invent claims the article didn't make",
     "- if the article is genuinely framing-neutral wire copy, say so concisely (1-2 sentences) — a short summary is better than padding with shared content",
     "- if isNewsworthy=false, set framingSummary=null",
+    "",
+    "Ratings rules (every field is an INTEGER; use null when not applicable):",
+    "- leftRightLeaning: US political spectrum, -10 = strongly left-wing, +10 = strongly right-wing. Use null when the outlet/article is not aligned on the US political spectrum (non-US topic with no US framing, foreign-language local news, sports, tech specs, etc.)",
+    "- inclusiveness: -10 = focuses solely on majority/dominant-group perspective and excludes minorities; +10 = thoroughly includes minority and LGBTQ+ perspectives and voices",
+    "- factfulness: -10 = pure opinion / op-ed / commentary; +10 = strictly factual reporting with attribution",
+    "- sentiment: -10 = extremely negative tone toward the events portrayed; +10 = extremely positive",
+    "- simpleLanguage: -10 = dense, technical, complex grammar and rare vocabulary; +10 = very simple, plain, easy-to-read language",
+    "- multiFaceted: -10 = single viewpoint only; +10 = multiple distinct viewpoints thoroughly represented and engaged with",
+    "- sourced: -10 = no sources, citations, or named accounts; +10 = strong reliance on named sources, direct quotes, documents, and verifiable references",
+    "- emotionalTone: -10 = detached / clinical / neutral wording; +10 = highly emotional / charged / loaded language",
+    "- constructiveness: -10 = alarmist, problem-only, no path forward; +10 = solutions-oriented constructive journalism with explicit remedies",
+    "- overallStars: integer 0-5 quality rating of the article overall (0 = unusable, 5 = exemplary)",
+    "- if isNewsworthy=false, omit the ratings object or set ratings=null",
+    "- be honest and precise: most wire copy will sit near 0 on most axes; do not manufacture extreme values but use the full scale when justified",
+    "",
     "Body-truncation rules:",
     "- set bodyAppearsTruncated=true if the Body ends mid-sentence, mid-thought, mid-paragraph, or otherwise looks cut off (no concluding period; ends with a comma, conjunction, or article like 'the' / 'and'; ends mid-quote)",
     "- set bodyAppearsTruncated=true if a 'truncation note' above explicitly tells you the Body was cut",
@@ -709,6 +777,7 @@ async function runArticleEnrichmentRequest(
     notNewsworthyReason: null,
     inputTruncated,
     bodyAppearsTruncated: null,
+    ratings: null,
     model: primaryModel,
     error: lastError,
   };

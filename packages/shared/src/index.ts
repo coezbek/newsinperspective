@@ -2,6 +2,23 @@ import { z } from "zod";
 
 export const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
+const ratingAxis = z.number().int().min(-10).max(10).nullable();
+
+export const articleRatingsSchema = z.object({
+  leftRightLeaning: ratingAxis,
+  inclusiveness: ratingAxis,
+  factfulness: ratingAxis,
+  sentiment: ratingAxis,
+  simpleLanguage: ratingAxis,
+  multiFaceted: ratingAxis,
+  sourced: ratingAxis,
+  emotionalTone: ratingAxis,
+  constructiveness: ratingAxis,
+  overallStars: z.number().int().min(0).max(5).nullable(),
+});
+
+export type ArticleRatings = z.infer<typeof articleRatingsSchema>;
+
 export const articleComparisonSchema = z.object({
   articleId: z.string(),
   title: z.string(),
@@ -67,6 +84,7 @@ export const storyDetailSchema = storyListItemSchema.extend({
       subjectivity: z.number(),
       biasSignals: z.array(z.string()),
       country: z.string().nullable().optional(),
+      ratings: articleRatingsSchema.nullable().optional(),
     }),
   ),
 });
@@ -98,6 +116,7 @@ export const articleDetailSchema = z.object({
   sentiment: z.number(),
   subjectivity: z.number(),
   biasSignals: z.array(z.string()),
+  ratings: articleRatingsSchema.nullable().optional(),
   relatedStory: z
     .object({
       id: z.string(),

@@ -94,10 +94,39 @@
     if (score < -0.05) return { label: "Negative sentiment", tone: "negative" };
     return { label: "Neutral sentiment", tone: "neutral" };
   }
+
+  // Min/max for each rating axis across all articles in this cluster.
+  // The LLM rarely uses the full -10..+10 range (factfulness clusters near
+  // +6/+7, sentiment near -2..-4 for hard news, etc.) so showing the cluster
+  // band beneath each marker gives readers a relative sense of where THIS
+  // article sits within the cluster's actual distribution.
+  type RatingAxisKey =
+    | "inclusiveness" | "factfulness" | "sentiment" | "simpleLanguage"
+    | "multiFaceted" | "sourced" | "emotionalTone" | "constructiveness";
+  const RATING_AXIS_KEYS: RatingAxisKey[] = [
+    "inclusiveness", "factfulness", "sentiment", "simpleLanguage",
+    "multiFaceted", "sourced", "emotionalTone", "constructiveness",
+  ];
+  const clusterRanges = $derived.by<Record<RatingAxisKey, { min: number; max: number } | null>>(() => {
+    const out = {} as Record<RatingAxisKey, { min: number; max: number } | null>;
+    for (const key of RATING_AXIS_KEYS) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (const a of story.articles) {
+        const v = a.ratings?.[key];
+        if (typeof v === "number" && Number.isFinite(v)) {
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+      }
+      out[key] = Number.isFinite(min) && Number.isFinite(max) ? { min, max } : null;
+    }
+    return out;
+  });
 </script>
 
-<div class="detail-head" class:detail-head--focus={showEntities}>
-  <header>
+<div class="detail-head" class:detail-head--focus={showEntities} data-debug-component={`StoryDetailHead [${story.id.slice(0, 10)}]`}>
+  <header data-debug-component="StoryDetailHeader">
     {#if !showEntities}
       <p class="eyebrow">
         {formatScopeLabel(story.region, story.category)}
@@ -118,7 +147,7 @@
       {story.sourceCount} sources{#if !showEntities} ·
       {formatDateRange(story.dateFrom, story.dateUntil)}{/if}
     </p>
-    <div class="domain-strip" aria-label="Top domains">
+    <div class="domain-strip" aria-label="Top domains" data-debug-component="StoryDomainStrip">
       {#each story.topDomains as domain}
         <a
           class="domain-chip domain-link"
@@ -143,9 +172,9 @@
     </div>
   </header>
 
-  <div class="comparison">
+  <div class="comparison" data-debug-component="StoryComparison">
     {#if comparison}
-      <div class="chip-row">
+      <div class="chip-row" data-debug-component="StoryComparisonChips">
         {#each comparison.sharedKeywords as keyword}
           <a href={tagPath(keyword)} class="chip" on:click={(event) => onNavigate(event, tagPath(keyword))}>{keyword}</a>
         {/each}
@@ -161,7 +190,7 @@
 <PerspectivePanel
   clusterId={story.id}
   {apiBase}
-  articles={story.articles.map((a) => ({ id: a.id, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText, sentiment: a.sentiment, country: a.country ?? null }))}
+  articles={story.articles.map((a) => ({ id: a.id, title: a.title, sourceName: a.sourceName, domain: a.domain, url: a.url, hasFullText: !!a.fullText, sentiment: a.sentiment, country: a.country ?? null, ratings: a.ratings ?? null }))}
   {articlePath}
   {comparePath}
   {tagPath}
@@ -170,11 +199,11 @@
   {onFaviconError}
 />
 
-<div class="article-grid" class:article-grid--focus={showEntities}>
+<div class="article-grid" class:article-grid--focus={showEntities} data-debug-component="StoryArticleGrid">
   {#each story.articles as article}
-    <article id={`article-${article.id}`} class="article-entry">
-      <div class="article-head-rail">
-        <header class="article-head">
+    <article id={`article-${article.id}`} class="article-entry" data-debug-component={`StoryArticleEntry [${article.id.slice(0, 10)}]`}>
+      <div class="article-head-rail" data-debug-component="StoryArticleHeadRail">
+        <header class="article-head" data-debug-component="StoryArticleHead">
           <p class="meta article-meta">
             <a class="domain-chip domain-link" href={sourcePath(article.domain)} on:click={(event) => onNavigate(event, sourcePath(article.domain))}>
               <img
@@ -208,9 +237,9 @@
           <h4><a href={articlePath(article.id)} on:click={(event) => onNavigate(event, articlePath(article.id))}>{article.title}</a></h4>
         </header>
       </div>
-      <div class="article-card-body">
-        <div class="article-body">
-          <div class="article-main">
+      <div class="article-card-body" data-debug-component="StoryArticleCardBody">
+        <div class="article-body" data-debug-component="StoryArticleBody">
+          <div class="article-main" data-debug-component="StoryArticleMain">
             {#if article.summary}
               <p>{article.summary}</p>
             {:else if article.extractionStatus === "PENDING"}
@@ -232,8 +261,50 @@
               </p>
             {/if}
             <a class="read-source" href={article.url} target="_blank" rel="noreferrer">Read source ↗</a>
+            {#if article.ratings}
+              {@const r = article.ratings}
+              <div class="article-ratings" aria-label="LLM-assessed article ratings" data-debug-component="ArticleRatings">
+                {#if r.overallStars !== null && r.overallStars !== undefined}
+                  <div class="rating-stars" title={`Overall quality: ${r.overallStars}/5`}>
+                    <span class="rating-label">Overall</span>
+                    <span class="stars" aria-label={`${r.overallStars} of 5 stars`}>
+                      {"★".repeat(r.overallStars)}<span class="stars-empty">{"★".repeat(5 - r.overallStars)}</span>
+                    </span>
+                  </div>
+                {/if}
+                {#each [
+                  { key: "inclusiveness", label: "Inclusiveness", left: "Majority-only", right: "Inclusive" },
+                  { key: "factfulness", label: "Opinion ↔ Fact", left: "Opinion", right: "Factual" },
+                  { key: "sentiment", label: "Sentiment", left: "Negative", right: "Positive" },
+                  { key: "simpleLanguage", label: "Language", left: "Complex", right: "Simple" },
+                  { key: "multiFaceted", label: "Viewpoints", left: "Single", right: "Diverse" },
+                  { key: "sourced", label: "Sourcing", left: "Unsourced", right: "Well-sourced" },
+                  { key: "emotionalTone", label: "Emotion", left: "Detached", right: "Charged" },
+                  { key: "constructiveness", label: "Constructive", left: "Alarmist", right: "Solutions" },
+                ] as axis (axis.key)}
+                  {@const value = r[axis.key as keyof typeof r]}
+                  {#if value !== null && value !== undefined}
+                    {@const range = clusterRanges[axis.key as RatingAxisKey]}
+                    <div class="rating-bar" title={range ? `${axis.label}: ${value} (${axis.left} ↔ ${axis.right}) · cluster range ${range.min > 0 ? '+' : ''}${range.min} to ${range.max > 0 ? '+' : ''}${range.max}` : `${axis.label}: ${value} (${axis.left} ↔ ${axis.right})`}>
+                      <span class="rating-label">{axis.label}</span>
+                      <span class="rating-track" aria-hidden="true">
+                        <span class="rating-axis"></span>
+                        {#if range}
+                          <span
+                            class="rating-cluster-range"
+                            style={`left: ${((range.min + 10) / 20) * 100}%; width: ${Math.max(((range.max - range.min) / 20) * 100, 1.5)}%`}
+                          ></span>
+                        {/if}
+                        <span class="rating-marker" style={`left: ${((value + 10) / 20) * 100}%`}></span>
+                      </span>
+                      <span class="rating-value">{value > 0 ? `+${value}` : value}</span>
+                    </div>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
           </div>
-          <aside class="article-tag-strip" aria-label="Keywords and entities">
+          <aside class="article-tag-strip" aria-label="Keywords and entities" data-debug-component="ArticleTagStrip">
             {#if article.keywords.length > 0}
               <div class="tag-row">
                 <span class="tag-row-label">Keywords</span>
@@ -285,6 +356,79 @@
 }} />
 
 <style>
+  .article-ratings {
+    margin-top: 0.6rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--surface-border, #d6dde7);
+    border-radius: 8px;
+    background: var(--surface-soft, #f6f8fb);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 1rem;
+    row-gap: 0.3rem;
+    font-size: 0.78rem;
+  }
+  .rating-stars,
+  .rating-bar {
+    display: grid;
+    grid-template-columns: 6.5rem 1fr auto;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .rating-stars {
+    grid-column: 1 / -1;
+    grid-template-columns: 6.5rem auto;
+  }
+  .rating-label {
+    color: var(--muted, #58708f);
+    font-size: 0.72rem;
+  }
+  .rating-track {
+    position: relative;
+    height: 0.55rem;
+    display: block;
+  }
+  .rating-axis {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--surface-border, #d6dde7);
+    transform: translateY(-50%);
+  }
+  .rating-cluster-range {
+    position: absolute;
+    top: 50%;
+    height: 0.35rem;
+    background: rgba(47, 109, 255, 0.18);
+    border-radius: 2px;
+    transform: translateY(-50%);
+    pointer-events: none;
+  }
+  .rating-marker {
+    position: absolute;
+    top: 50%;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--accent, #2f6dff);
+    transform: translate(-50%, -50%);
+    z-index: 1;
+  }
+  .rating-value {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted, #58708f);
+    min-width: 2ch;
+    text-align: right;
+  }
+  .stars {
+    color: #f5b700;
+    letter-spacing: 0.05em;
+  }
+  .stars-empty {
+    color: var(--surface-border, #d6dde7);
+  }
   .eyebrow,
   .signals {
     color: var(--muted, #58708f);

@@ -331,6 +331,7 @@ export async function runOpenRouterBacklog(options?: {
         translatedSummary?: string | null;
         translatedFullText?: string | null;
         framingSummary?: string | null;
+        ratings?: typeof next.ratings | null;
         language?: string;
         extractionStatus?: "FAILED";
         extractionError?: string;
@@ -340,6 +341,7 @@ export async function runOpenRouterBacklog(options?: {
         articleUpdate.translatedSummary = null;
         articleUpdate.translatedFullText = null;
         articleUpdate.framingSummary = null;
+        articleUpdate.ratings = null;
         articleUpdate.extractionStatus = "FAILED";
         articleUpdate.extractionError = `Not newsworthy: ${next.notNewsworthyReason ?? "boilerplate"}`;
       } else {
@@ -350,6 +352,12 @@ export async function runOpenRouterBacklog(options?: {
         articleUpdate.translatedSummary = next.translatedSummary;
         articleUpdate.translatedFullText = next.translatedFullText;
         articleUpdate.framingSummary = next.framingSummary;
+        // Only overwrite ratings when the model produced them. A null from a
+        // model that ignored the new field shouldn't clobber an existing
+        // value on a re-enrichment.
+        if (next.ratings) {
+          articleUpdate.ratings = next.ratings;
+        }
       }
       // Persist detected language so downstream stages (entity-re-enrich) can
       // branch on it without inspecting NlpFeature.featureSet.

@@ -1365,7 +1365,7 @@
       {/if}
     </section>
   {:else if currentView.kind === "article"}
-    <section class="panel focus-page article-page">
+    <section class="panel focus-page article-page" use:debugComponent={componentLabel("ArticlePage", shortId(currentView.id))}>
       {#if articleSlot.loading}
         <p class="loading">Loading article...</p>
       {:else if articleSlot.error}
@@ -1373,8 +1373,8 @@
       {:else if articleSlot.detail}
         {@const applyPatch = (patch: Partial<ArticleSlot>) => (articleSlot = { ...articleSlot, ...patch })}
         {@render sectionHeader(articleSlot, applyPatch)}
-        <div class="article-layout">
-          <div class="article-main">
+        <div class="article-layout" use:debugComponent={componentLabel("ArticleLayout")}>
+          <div class="article-main" use:debugComponent={componentLabel("ArticleMain")}>
             {@render sectionTitle(articleSlot)}
             {@render sectionSummary(articleSlot)}
             {@render sectionTranslation(articleSlot)}
@@ -1382,7 +1382,7 @@
             {@render sectionNearDup(articleSlot)}
             {@render sectionSentiment(articleSlot)}
           </div>
-          <aside class="article-aside">
+          <aside class="article-aside" use:debugComponent={componentLabel("ArticleAside")}>
             {@render sectionTags(articleSlot)}
             {@render sectionPerspective(articleSlot, applyPatch)}
             {@render sectionEntities(articleSlot, applyPatch)}
@@ -1393,8 +1393,8 @@
     </section>
   {:else if currentView.kind === "compare"}
     {@const compareStory = compareSlotA.detail?.relatedStory ?? compareSlotB.detail?.relatedStory ?? null}
-    <section class="panel focus-page compare-page">
-      <header class="article-header-strip">
+    <section class="panel focus-page compare-page" use:debugComponent={componentLabel("ComparePage")}>
+      <header class="article-header-strip" use:debugComponent={componentLabel("CompareHeader")}>
         <span class="eyebrow">Compare articles</span>
         {#if compareStory}
           <span class="article-header-sep">·</span>
@@ -1421,7 +1421,7 @@
       {:else if compareSlotA.detail && compareSlotB.detail}
         {@const applyA = (patch: Partial<ArticleSlot>) => (compareSlotA = { ...compareSlotA, ...patch })}
         {@const applyB = (patch: Partial<ArticleSlot>) => (compareSlotB = { ...compareSlotB, ...patch })}
-        <div class="compare-grid">
+        <div class="compare-grid" use:debugComponent={componentLabel("CompareGrid")}>
           {@render sectionHeader(compareSlotA, applyA)}
           {@render sectionHeader(compareSlotB, applyB)}
           {@render sectionTitle(compareSlotA)}
@@ -1454,7 +1454,7 @@
       {@const detail = slot.detail}
       {@const publishedDate = detail.publishedAt.slice(0, 10)}
       {@const feedDate = detail.relatedStory?.date ?? publishedDate}
-      <header class="article-header-strip compare-section">
+      <header class="article-header-strip compare-section" use:debugComponent={componentLabel("ArticleHeaderStrip", shortId(detail.id))}>
         <a
           class="eyebrow article-eyebrow-link"
           href={articlePath(detail.id)}
@@ -1489,7 +1489,7 @@
   {/snippet}
 
   {#snippet sectionTitle(slot: ArticleSlot)}
-    <div class="compare-section article-title-section">
+    <div class="compare-section article-title-section" use:debugComponent={componentLabel("ArticleTitleSection")}>
       {#if slot.detail}
         <h2 class="article-title">{slot.detail.title}</h2>
         {#if slot.detail.originalTitle}
@@ -1503,7 +1503,7 @@
 
   {#snippet sectionSummary(slot: ArticleSlot, showRelatedStory = true)}
     {@const activePerspective = slot.hoveredPerspective ? [slot.hoveredPerspective] : []}
-    <div class="compare-section article-summary-callout">
+    <div class="compare-section article-summary-callout" use:debugComponent={componentLabel("ArticleSummary")}>
       <span class="article-summary-label">Summary</span>
       {#if slot.detail?.summary}
         <p>{@html highlightWords(slot.detail.summary, activePerspective)}</p>
@@ -1522,7 +1522,7 @@
   {/snippet}
 
   {#snippet sectionTranslation(slot: ArticleSlot)}
-    <div class="compare-section">
+    <div class="compare-section" use:debugComponent={componentLabel("ArticleTranslationNotice")}>
       {#if slot.detail?.fullTextIsTranslated}
         <p class="translation-notice">
           Translated from {(slot.detail.language ?? "source").toUpperCase()}.
@@ -1534,9 +1534,9 @@
 
   {#snippet sectionBody(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
     {@const activePerspective = slot.hoveredPerspective ? [slot.hoveredPerspective] : []}
-    <div class="compare-section">
+    <div class="compare-section" use:debugComponent={componentLabel("ArticleBodySection")}>
       {#if slot.detail?.fullText}
-        <div class="article-body-text">
+        <div class="article-body-text" use:debugComponent={componentLabel("ArticleBodyText")}>
           {#each splitParagraphs(slot.detail.fullText) as paragraph, i (i)}
             <p class="article-paragraph">
               <EntityHighlighter
@@ -1561,9 +1561,9 @@
   {/snippet}
 
   {#snippet sectionNearDup(slot: ArticleSlot)}
-    <div class="compare-section">
+    <div class="compare-section" use:debugComponent={componentLabel("ArticleNearDup")}>
       {#if slot.detail && slot.detail.nearDuplicatePeers.length > 0}
-        <div class="other-coverage">
+        <div class="other-coverage" use:debugComponent={componentLabel("OtherCoverage")}>
           <h4 class="other-coverage-title">Also covered by</h4>
           <ul class="other-coverage-list">
             {#each slot.detail.nearDuplicatePeers as peer (peer.articleId)}
@@ -1590,7 +1590,7 @@
   {/snippet}
 
   {#snippet sectionSentiment(slot: ArticleSlot)}
-    <div class="compare-section">
+    <div class="compare-section" use:debugComponent={componentLabel("ArticleSentimentSection")}>
       {#if slot.detail}
         {@render sentimentPill(slot.detail.sentiment)}
       {/if}
@@ -1598,7 +1598,7 @@
   {/snippet}
 
   {#snippet sectionTags(slot: ArticleSlot)}
-    <section class="aside-block compare-section">
+    <section class="aside-block compare-section" use:debugComponent={componentLabel("ArticleTagsAside")}>
       <h4 class="aside-title">Tags</h4>
       {#if slot.detail && slot.detail.keywords.length > 0}
         <div class="chip-row">
@@ -1613,7 +1613,7 @@
   {/snippet}
 
   {#snippet sectionPerspective(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
-    <section class="aside-block compare-section">
+    <section class="aside-block compare-section" use:debugComponent={componentLabel("ArticlePerspectiveAside")}>
       <h4 class="aside-title">Distinctive vs. other sources</h4>
       {#if slot.perspectiveWords.length > 0}
         <p class="aside-hint">Hover a term to highlight it in the article.</p>
@@ -1640,7 +1640,7 @@
   {/snippet}
 
   {#snippet sectionEntities(slot: ArticleSlot, applyPatch: (patch: Partial<ArticleSlot>) => void)}
-    <section class="aside-block compare-section">
+    <section class="aside-block compare-section" use:debugComponent={componentLabel("ArticleEntitiesAside")}>
       <h4 class="aside-title">Named entities</h4>
       {#if slot.entities.length > 0}
         <EntityStats

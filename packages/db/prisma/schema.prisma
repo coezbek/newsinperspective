@@ -113,6 +113,14 @@ model Article {
   /// `translatedFullText` is sliced. Falls back to translatedFullText when
   /// null (older articles, enrichment failures).
   framingSummary  String?
+  /// Per-article qualitative ratings produced by the LLM enrichment phase.
+  /// Shape: { leftRightLeaning, inclusiveness, factfulness, sentiment,
+  /// simpleLanguage, multiFaceted, sourced, emotionalTone, constructiveness,
+  /// overallStars }. Each axis is an integer in [-10, +10] except
+  /// `overallStars` which is [0, 5]. Any axis may be null when N/A.
+  /// Populated only on enrichments produced after the ratings prompt was
+  /// added; older articles remain null and are NOT backfilled.
+  ratings         Json?
   extractionStatus ExtractionStatus @default(PENDING)
   extractedAt     DateTime?
   extractionError String?

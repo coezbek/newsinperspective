@@ -7,7 +7,10 @@ import {
   scoreSentiment,
   scoreSubjectivity,
 } from "../domain/text.js";
-import { extractArticleEnrichmentWithOpenRouter } from "./openrouter-article-enrichment.js";
+import {
+  extractArticleEnrichmentWithOpenRouter,
+  type ArticleRatings,
+} from "./openrouter-article-enrichment.js";
 import { extractKeywordsWithOpenRouter } from "./openrouter-keywords.js";
 
 export function buildArticleFeatures(
@@ -67,6 +70,7 @@ export async function buildArticleFeaturesWithOpenRouter(
     llmError: string | null;
     inputTruncated: boolean;
     bodyAppearsTruncated: boolean | null;
+    ratings: ArticleRatings | null;
   }
 > {
   const base = buildArticleFeatures(title, summary, body, language);
@@ -103,6 +107,7 @@ export async function buildArticleFeaturesWithOpenRouter(
     llmError: openrouter.error,
     inputTruncated: openrouter.inputTruncated,
     bodyAppearsTruncated: openrouter.bodyAppearsTruncated,
+    ratings: openrouter.ratings,
   };
 }
 
