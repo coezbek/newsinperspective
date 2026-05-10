@@ -2,7 +2,11 @@ import "../config/env.js";
 import { prisma } from "../lib/prisma.js";
 import { enrichArticlesWithEntities } from "../services/article-enrichment.js";
 import { createFileLogger } from "../lib/file-logger.js";
-import { acquireProcessLock, ProcessLockError } from "../lib/process-lock.js";
+import {
+  acquireProcessLock,
+  acquireProcessLockWithWait,
+  ProcessLockError,
+} from "../lib/process-lock.js";
 
 const logger = createFileLogger("re-enrich.log");
 
@@ -18,16 +22,25 @@ async function main() {
   //   tsx entity-re-enrich.ts --date=YYYY-MM-DD     # only that ingestion date
   //   tsx entity-re-enrich.ts --limit=N             # cap how many to process
   //   tsx entity-re-enrich.ts --force               # re-process even if already enriched
+  //   tsx entity-re-enrich.ts --wait[=seconds]      # if locked, wait up to N seconds (default 1800)
   const date = parseFlag("date");
   const limitFlag = parseFlag("limit");
   const limit = limitFlag ? Number.parseInt(limitFlag, 10) : undefined;
   const force = process.argv.includes("--force");
+  const waitFlag = parseFlag("wait");
+  const waitArg = process.argv.includes("--wait") || waitFlag !== undefined;
+  const waitSeconds = waitFlag ? Number.parseInt(waitFlag, 10) : 1800;
 
   // Single-instance lock: parallel runs all hammer Wikipedia past the throttle
-  // and produce duplicate work. Fast-fail if another run is in progress.
+  // and produce duplicate work. With --wait, poll until the holder releases.
   let releaseLock: (() => void) | null = null;
   try {
-    releaseLock = acquireProcessLock("entity-re-enrich");
+    releaseLock = waitArg
+      ? await acquireProcessLockWithWait("entity-re-enrich", {
+          timeoutMs: waitSeconds * 1000,
+          log: (message) => console.log(message),
+        })
+      : acquireProcessLock("entity-re-enrich");
   } catch (err) {
     if (err instanceof ProcessLockError) {
       console.error(`Another entity-re-enrich is already running: ${err.message}`);

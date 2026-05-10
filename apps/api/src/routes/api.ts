@@ -14,6 +14,7 @@ import {
 } from "../services/story-query.js";
 import { entityQueryService } from "../services/entity-query.js";
 import { JOB_KINDS, pipelineRunner } from "../services/pipeline-runner.js";
+import { getPipelineLogStatus } from "../services/pipeline-log-status.js";
 import { nextScheduledRun } from "../workers/scheduler.js";
 import { env } from "../config/env.js";
 import { prisma } from "../lib/prisma.js";
@@ -354,6 +355,10 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       type: query.type as any,
     });
     return { domain, totalEntities: entities.length, entities };
+  });
+
+  app.get("/api/pipeline/log-status", async () => {
+    return getPipelineLogStatus();
   });
 
   app.get("/api/pipeline/info", async () => {

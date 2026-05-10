@@ -16,7 +16,9 @@ const defaultFreeModels = [
   "minimax/minimax-m2.5:free",
   // Long context fallbacks and smaller models
   "openrouter/owl-alpha",
-  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+  // nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free removed 2026-05-09:
+  // observed returning unparseable JSON on every article in the 2026-05-08
+  // 20×20 run, burning a full prompt round before failing over.
   "nvidia/nemotron-3-nano-30b-a3b:free",
   "poolside/laguna-m.1:free",
   "poolside/laguna-xs.2:free",

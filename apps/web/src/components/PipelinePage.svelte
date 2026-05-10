@@ -36,10 +36,30 @@
     logTail: string | null;
   }
 
+  interface StageStatus {
+    name: string;
+    status: "running" | "succeeded" | "failed";
+    startedAt: string | null;
+    durationSeconds: number | null;
+    exitCode: number | null;
+    lastLines: string[];
+  }
+
+  interface LogStatus {
+    logFile: string | null;
+    logFileMtime: string | null;
+    pipelineHeader: string | null;
+    pipelineComplete: boolean;
+    pipelineTotalSeconds: number | null;
+    abortMessage: string | null;
+    stages: StageStatus[];
+  }
+
   let { apiBase }: { apiBase: string } = $props();
 
   let info = $state<PipelineInfo | null>(null);
   let jobs = $state<JobRow[]>([]);
+  let logStatus = $state<LogStatus | null>(null);
   let loading = $state(true);
   let error = $state<string>("");
   let selectedJob = $state<JobDetail | null>(null);
@@ -63,15 +83,39 @@
     jobs = payload.jobs;
   }
 
+  async function loadLogStatus(): Promise<void> {
+    const response = await fetch(`${apiBase}/api/pipeline/log-status`);
+    if (!response.ok) throw new Error(`Failed to load log status: ${response.status}`);
+    logStatus = await response.json();
+  }
+
   async function refresh(): Promise<void> {
     try {
-      await Promise.all([loadInfo(), loadJobs()]);
+      await Promise.all([loadInfo(), loadJobs(), loadLogStatus()]);
       error = "";
     } catch (cause) {
       error = cause instanceof Error ? cause.message : "Failed to refresh";
     } finally {
       loading = false;
     }
+  }
+
+  function formatStageDuration(stage: StageStatus): string {
+    if (stage.durationSeconds !== null) {
+      const seconds = stage.durationSeconds;
+      if (seconds < 60) return `${seconds}s`;
+      const minutes = Math.floor(seconds / 60);
+      const rem = seconds % 60;
+      if (minutes < 60) return `${minutes}m ${rem}s`;
+      const hours = Math.floor(minutes / 60);
+      return `${hours}h ${minutes % 60}m`;
+    }
+    if (stage.status === "running") return "running…";
+    return "—";
+  }
+
+  function stageStatusClass(status: StageStatus["status"]): string {
+    return `status status-${status === "succeeded" ? "success" : status === "failed" ? "failed" : "running"}`;
   }
 
   async function loadJobDetail(id: string): Promise<void> {
@@ -246,6 +290,58 @@
           </li>
         {/each}
       </ul>
+    {/if}
+  </section>
+
+  <section class="card live-card" data-debug-component="PipelineLiveStatus">
+    <h3>Latest pipeline run</h3>
+    {#if logStatus && logStatus.logFile}
+      <p class="muted log-meta">
+        <code>{logStatus.logFile.replace(/^.*\/logs\//, "logs/")}</code>
+        {#if logStatus.pipelineHeader}· {logStatus.pipelineHeader}{/if}
+        {#if logStatus.pipelineComplete}· <strong>complete</strong>
+          {#if logStatus.pipelineTotalSeconds !== null}({logStatus.pipelineTotalSeconds}s){/if}
+        {:else if logStatus.abortMessage}· <strong class="abort">aborted: {logStatus.abortMessage}</strong>
+        {:else}· <strong>in progress</strong>
+        {/if}
+      </p>
+      {#if logStatus.stages.length === 0}
+        <p class="muted">No stage banners yet — pipeline starting.</p>
+      {:else}
+        <table class="stages-table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Stage</th>
+              <th>Started</th>
+              <th>Duration</th>
+              <th>Exit</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each logStatus.stages as stage (stage.name + (stage.startedAt ?? ""))}
+              <tr class:running={stage.status === "running"}>
+                <td><span class={stageStatusClass(stage.status)}>{stage.status}</span></td>
+                <td>{stage.name}</td>
+                <td>{stage.startedAt ?? "—"}</td>
+                <td>{formatStageDuration(stage)}</td>
+                <td>{stage.exitCode ?? "—"}</td>
+              </tr>
+              {#if stage.status === "running" && stage.lastLines.length > 0}
+                <tr class="tail-row">
+                  <td colspan="5">
+                    <pre class="stage-tail">{stage.lastLines.join("\n")}</pre>
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    {:else if loading}
+      <p class="muted">Loading…</p>
+    {:else}
+      <p class="muted">No <code>logs/pipeline-*.log</code> found.</p>
     {/if}
   </section>
 
@@ -475,6 +571,49 @@
     font-size: 0.74rem;
     font-weight: 700;
     letter-spacing: 0.04em;
+  }
+
+  .log-meta {
+    margin: -4px 0 12px;
+    font-size: 0.82rem;
+  }
+
+  .log-meta code {
+    background: #eef1f6;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-right: 4px;
+  }
+
+  .log-meta .abort { color: #8b1e3f; }
+
+  .stages-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.86rem;
+  }
+
+  .stages-table th,
+  .stages-table td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid #eef1f6;
+  }
+
+  .stages-table tr.running td { background: #f4f7fc; }
+
+  .stages-table tr.tail-row td { padding-top: 0; padding-bottom: 12px; }
+
+  .stage-tail {
+    background: #0f1620;
+    color: #d6e1ef;
+    padding: 8px 10px;
+    border-radius: 6px;
+    overflow-x: auto;
+    max-height: 220px;
+    font-size: 0.74rem;
+    white-space: pre-wrap;
+    margin: 4px 0 0;
   }
 
   .status-queued { background: #eef1f6; color: #4a5566; }

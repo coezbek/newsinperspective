@@ -127,6 +127,24 @@ async function runKeywordRequest(
   maxKeywords: number,
   log: ((message: string) => void) | undefined,
 ): Promise<OpenRouterKeywordResult> {
+  // LLM_PRIMARY=openai: try OpenAI first; on parse/network failure, fall
+  // through to the OpenRouter chain below as a safety net.
+  if (env.LLM_PRIMARY === "openai" && env.OPENAI_API_KEY) {
+    const direct = await callOpenAIFallback({
+      prompt,
+      onAttemptLog: log,
+      kind: "keywords",
+      contextId: input.title.slice(0, 80),
+    });
+    if (direct) {
+      const keywords = parseKeywordsFromResponse(direct.content).slice(0, maxKeywords);
+      if (keywords.length > 0) {
+        return { keywords, model: direct.model, error: null };
+      }
+      log?.(`openai-primary: ${direct.model} parse failure — falling through to OpenRouter`);
+    }
+  }
+
   let lastError = "OpenRouter request failed";
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
 

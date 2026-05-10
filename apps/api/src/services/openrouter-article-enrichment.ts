@@ -680,6 +680,24 @@ async function runArticleEnrichmentRequest(
   bodyHasContent: boolean,
   inputTruncated: boolean,
 ): Promise<OpenRouterArticleEnrichmentResult> {
+  // LLM_PRIMARY=openai: try OpenAI first; on parse/network failure, fall
+  // through to the OpenRouter chain below as a safety net.
+  if (env.LLM_PRIMARY === "openai" && env.OPENAI_API_KEY) {
+    const direct = await callOpenAIFallback({
+      prompt,
+      onAttemptLog: log,
+      kind: "article-enrichment",
+      contextId: input.contextId ?? input.title.slice(0, 80),
+    });
+    if (direct) {
+      const parsed = parseEnrichmentFromResponse(direct.content);
+      if (parsed && isResponseComplete(parsed, bodyHasContent, inputTruncated)) {
+        return { ...parsed, inputTruncated, model: direct.model, error: null };
+      }
+      log?.(`openai-primary: ${direct.model} parse failure — falling through to OpenRouter`);
+    }
+  }
+
   let lastError = "OpenRouter request failed";
   const maxRounds = openRouterBackoffScheduleMs.length + 1;
 

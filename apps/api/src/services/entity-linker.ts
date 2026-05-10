@@ -837,9 +837,30 @@ class EntityLinkerService {
     }
   }
 
-  /** Stable normalization so "Vladimir Putin" and "vladimir putin" share a cache slot. */
+  /**
+   * Stable normalization so cache lookups collapse trivial surface variants
+   * to the same slot. Without this, a single Wikipedia entity ("Netherlands")
+   * fragments across N near-duplicate cache entries:
+   *   "Netherlands" / "netherlands" / "Netherlands " / "Netherlands."
+   *   "the Netherlands" / "The Netherlands"   ← Wikipedia title doesn't carry the article
+   *   "Netherlands'" (possessive that escaped canonicalize)
+   * Each variant produces a separate disk hash, a fresh Wikipedia search,
+   * a 56s 429 sleep on retry, and a separate negative-cache entry on miss.
+   *
+   * Rules:
+   *   1. Lowercase + collapse internal whitespace.
+   *   2. Strip leading article in any of EN / FR / ES / DE.
+   *   3. Strip trailing punctuation (possessive `'s`, periods, commas).
+   * NER's canonicalizeEntityText already does most of this for fresh
+   * extractions, but this is the second line of defense for entities that
+   * predate the NER fix or arrive through other code paths.
+   */
   private normalizeKey(name: string): string {
-    return name.toLowerCase().replace(/\s+/g, " ").trim();
+    let s = name.toLowerCase().replace(/\s+/g, " ").trim();
+    s = s.replace(/^(?:the|a|an|le|la|les|el|los|las|der|die|das)\s+/, "");
+    s = s.replace(/['']s$/i, "");
+    s = s.replace(/[\s.,;:!?'"`]+$/g, "");
+    return s.trim();
   }
 
   /**

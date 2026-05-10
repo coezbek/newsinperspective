@@ -147,6 +147,46 @@ async function enrichOne(
     return { success: true, entitiesCount: 0 };
   }
 
+  // Within-article partial-name fold for PERSON / ORG. spaCy frequently
+  // emits both the full name and bare surname / first-name on subsequent
+  // mentions ("David Attenborough" + "David" + "Attenborough", "Mike
+  // Gunton" + "Gunton"). Each variant otherwise creates a separate
+  // NamedEntity row and a separate Wikipedia lookup. Fold each single-token
+  // mention into the matching multi-token canonical iff there is EXACTLY
+  // ONE multi-token candidate of the same type that contains the bare
+  // token — preserves disambiguation when an article mentions both
+  // "David Attenborough" and "David Cameron".
+  //
+  // We mutate `candidates[].entityText` so downstream `distinctByKey`,
+  // DB lookup, Wikipedia link, and the per-mention writes all converge
+  // on the canonical surface form. Highlight offsets stay anchored to
+  // the ORIGINAL token in the source text — clicking the bare "David"
+  // highlights its 5-char span but resolves to the David Attenborough
+  // entity row.
+  for (const type of [EntityType.PERSON, EntityType.ORG] as const) {
+    const multiTokenContaining = new Map<string, Set<string>>(); // bare token → multi-token names
+    for (const c of candidates) {
+      if (c.entityType !== type) continue;
+      const tokens = c.entityText.split(/\s+/);
+      if (tokens.length < 2) continue;
+      for (const t of tokens) {
+        const key = t.toLowerCase();
+        const set = multiTokenContaining.get(key) ?? new Set<string>();
+        set.add(c.entityText);
+        multiTokenContaining.set(key, set);
+      }
+    }
+    for (const c of candidates) {
+      if (c.entityType !== type) continue;
+      const tokens = c.entityText.split(/\s+/);
+      if (tokens.length !== 1) continue;
+      const longers = multiTokenContaining.get(c.entityText.toLowerCase());
+      if (!longers || longers.size !== 1) continue;
+      // Single unambiguous parent — fold.
+      c.entityText = longers.values().next().value!;
+    }
+  }
+
   // Dedupe ONLY for the entity-creation/lookup pass — keep one canonical
   // candidate per (name, type) so we make one Wikipedia call per distinct
   // entity. The frontend needs every mention's offset to highlight all

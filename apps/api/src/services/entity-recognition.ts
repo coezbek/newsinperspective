@@ -51,6 +51,13 @@ const ENTITY_STOPLIST = new Set([
   "wifi", "meme", "investing more read", "read next", "sign up", "sign in",
   "log in", "log out", "subscribe", "unsubscribe", "newsletter", "podcast",
   "have an account", "more read", "twitter", "facebook", "instagram",
+  // License / photo-credit / wire-service boilerplate. NER consistently
+  // mis-classifies these as PERSON or ORG. Observed in the 2026-05-09
+  // Attenborough cluster: "Cc By-", "CC", "Photo/Dan Peled, File)",
+  // "AP Photo".
+  "cc", "cc by", "cc by-sa", "cc by-nc", "creative commons",
+  "ap", "afp", "reuters", "getty", "getty images", "ap photo",
+  "afp photo", "pool", "file", "afptv", "epa",
 ]);
 
 /**
@@ -66,10 +73,25 @@ function isNoiseEntity(text: string): boolean {
   if (trimmed.length < 2) return true;
   if (trimmed.length > 80) return true; // currency-rate / ticker dumps
   if (ENTITY_STOPLIST.has(trimmed.toLowerCase())) return true;
-  // Newlines or 3+ slashes — image credits like "AFP/Getty Images\n\n" or
-  // "Amirhossein Khorgooei/ISNA/AFP/Getty Images".
   if (/[\r\n]/.test(trimmed)) return true;
-  if ((trimmed.match(/\//g) ?? []).length >= 2) return true;
+  // Any slash → image credits / bylines: "AFP/Getty Images",
+  // "Amirhossein Khorgooei/ISNA", "Aaron Schwartz/Pool". No real entity
+  // name contains a slash, so this is safe to filter aggressively.
+  if (/\//.test(trimmed)) return true;
+  // Word-count cap. Real entity names rarely exceed 6 tokens; longer
+  // strings are almost always headline / sentence fragments NER mis-
+  // classified — e.g. "American Passengers On Hantavirus-Hit Cruise Ship
+  // To Quarantine In". 80-char cap above doesn't catch these because
+  // they're often within budget character-wise.
+  if (trimmed.split(/\s+/).length > 6) return true;
+  // No token starts with an uppercase letter (after canonicalize already
+  // title-cased ALL-CAPS). Real entity names have at least one capitalized
+  // token. This catches foreign-language stop-word fragments leaked by
+  // NER on non-translated boilerplate ("kadar koli", "ďalšími", "sú",
+  // "vaše", "Cenimo vaše zanimanje za zanesljive"). A real "van der …"
+  // entity always travels with a capitalized token elsewhere in the
+  // multi-word string, so it still passes.
+  if (!/[A-ZÀ-ÖØ-Þ]/.test(trimmed)) return true;
   // Domain-style entity names: "BBC.Egypt", "Briefing.com", "Military.com".
   if (/\.(com|net|org|gov|edu|info|biz|io|co|uk|us)\b/i.test(trimmed)) return true;
   // Mid-token period like "2023.He" — extraction artifact. Skip when the
@@ -103,6 +125,12 @@ function canonicalizeEntityText(raw: string): string {
   s = s.replace(/'s$/i, "");
   s = s.replace(/[\s.,;:!?'"`]+$/g, "");
   s = s.replace(/^[\s.,;:!?'"`]+/g, "");
+  // Strip leading lowercase article. NER often picks up "the Marshall
+  // Islands" / "the Netherlands" / "the Daily Telegraph" from sentence
+  // text — Wikipedia titles don't carry articles, and yesterday's run
+  // showed 14% of fresh cache misses started with lowercase "the ".
+  // Only lowercase: "The Beatles" / "An American Werewolf" must stay.
+  s = s.replace(/^(?:the|a|an|le|la|les|el|los|las|der|die|das)\s+/, "");
   if (s.length >= 5 && s === s.toUpperCase() && /[A-Z]/.test(s)) {
     // Title-case each word so "DUBAI" → "Dubai" and "HONG KONG" → "Hong Kong".
     s = s

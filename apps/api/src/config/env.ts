@@ -56,6 +56,14 @@ const envSchema = z.object({
   // Direct OpenAI fallback used when every OpenRouter free model is exhausted.
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_FALLBACK_MODEL: z.string().default("gpt-5.4-nano"),
+  // Routing override for stage-2 article/keyword enrichment.
+  //   "openrouter" (default): try the free OpenRouter rotation first, fall
+  //                           through to OpenAI only as a last resort.
+  //   "openai":               try OpenAI first; on failure, fall through to
+  //                           the OpenRouter chain. Use when free-tier models
+  //                           are degraded or to spend OpenAI credit
+  //                           preferentially for a single run.
+  LLM_PRIMARY: z.enum(["openrouter", "openai"]).default("openrouter"),
   PERSPECTIVE_SIDECAR_URL: z.string().url().default("http://127.0.0.1:5710"),
   PERSPECTIVE_SIDECAR_TIMEOUT_MS: z.coerce.number().int().default(120000),
 });

@@ -130,6 +130,29 @@ Replacement plan:
 
 Bring the UI back once #1 lands.
 
+## Keyword / tag quality
+
+- **Keywords are too unique to group related stories.** The enrichment prompt was
+  emitting hyper-specific compounds like "Zelenskyy ceasefire proposal",
+  "Kramatorsk air strike", "Victory Day ceasefire" — each unique to one article,
+  so the /tag page fragments related coverage. Prompt updated 2026-05-07
+  (`openrouter-article-enrichment.ts`): tightened to 1–3 words, added a
+  balanced-slot rule (1 location, 1–2 people, 1 org/event, 1–2 themes), forbade
+  combining person/place + action into one keyword, and refreshed the few-shot
+  Example 1 to demonstrate splitting. Follow-ups still open:
+  - **Backfill required.** Existing rows in the DB still hold the old compound
+    keywords. /tag page won't visibly improve until we re-run enrichment over
+    historical articles (or at least a recent date range to sanity-check).
+  - **Canonicalization pass.** Even with the prompt fix, "Ukraine conflict" vs
+    "Ukraine war" vs "Ukraine" still fragment. Plan: maintain a growing canonical
+    keyword vocabulary in the DB, embed each new keyword on enrichment, snap to
+    the nearest existing tag above a similarity threshold (e.g. cosine > 0.85),
+    otherwise add it. Only approach that survives model variance and merges
+    near-synonyms across articles.
+  - **Sanity-check after backfill.** Look at the top-50 tags by frequency and
+    confirm they read as reusable topics ("Trump", "ceasefire", "AI regulation")
+    rather than per-article one-offs.
+
 ## Ingestion
 
 - **Roundup-format detector.** Some sources publish a single article that

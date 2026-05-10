@@ -146,3 +146,39 @@ export function acquireProcessLock(name: string): () => void {
 
   return release;
 }
+
+/**
+ * Like `acquireProcessLock` but, if the lock is currently held by a live
+ * process, waits up to `timeoutMs` for it to be released before giving up.
+ * Throws ProcessLockError if the timeout elapses.
+ */
+export async function acquireProcessLockWithWait(
+  name: string,
+  options: {
+    timeoutMs: number;
+    intervalMs?: number;
+    log?: (message: string) => void;
+  },
+): Promise<() => void> {
+  const intervalMs = options.intervalMs ?? 10_000;
+  const log = options.log ?? (() => {});
+  const deadline = Date.now() + options.timeoutMs;
+  let announced = false;
+
+  for (;;) {
+    try {
+      return acquireProcessLock(name);
+    } catch (err) {
+      if (!(err instanceof ProcessLockError)) throw err;
+      if (Date.now() >= deadline) throw err;
+      if (!announced) {
+        log(
+          `Lock "${name}" held by pid ${err.holder.pid} since ${err.holder.startedAt}; ` +
+            `waiting up to ${Math.round(options.timeoutMs / 1000)}s for release…`,
+        );
+        announced = true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+}
