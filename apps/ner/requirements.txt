@@ -1,4 +1,11 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 spacy==3.7.6
+# spacy-transformers brings in torch + transformers for en_core_web_trf,
+# which lifts entity-type accuracy noticeably over en_core_web_lg
+# (especially ORG vs PERSON disambiguation on names like "Stratford
+# Butterfly Farm" or "Taronga Zoo"). Adds ~1.5GB resident memory to
+# the sidecar; remove if you're memory-constrained and stick to
+# en_core_web_lg.
+spacy-transformers==1.3.5
 pydantic==2.9.2

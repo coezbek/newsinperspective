@@ -14,7 +14,7 @@ import spacy
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-MODEL_NAME = os.environ.get("NER_SPACY_MODEL", "en_core_web_lg")
+MODEL_NAME = os.environ.get("NER_SPACY_MODEL", "en_core_web_trf")
 MAX_CHARS = int(os.environ.get("NER_MAX_CHARS", "50000"))
 KEEP_LABELS = {"PERSON", "ORG", "GPE", "LOC", "EVENT"}
 

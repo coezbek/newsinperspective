@@ -159,9 +159,9 @@ async function enrichOne(
   }
 
   // LLM type override: when stage-2 enrichment classified a name as
-  // PERSON/ORG/PLACE that disagrees with spaCy, trust the LLM. spaCy's
-  // small model (en_core_web_sm) routinely mis-types organization names
-  // as PERSON ("Stratford Butterfly Farm", "Taronga Zoo"), GPE
+  // PERSON/ORG/PLACE that disagrees with spaCy, trust the LLM. Even on
+  // en_core_web_trf, spaCy still occasionally mis-types organization
+  // names as PERSON ("Stratford Butterfly Farm", "Taronga Zoo"), GPE
   // ("Wikimedia"), or partial-name fragments as the wrong type
   // ("Attenborough"→GPE while "David Attenborough"→PERSON). Match on the
   // full surface form, case-insensitive; ambiguous tokens stay spaCy-typed.

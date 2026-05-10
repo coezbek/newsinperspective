@@ -1,7 +1,8 @@
 /**
  * Entity Recognition Service (NER).
  *
- * Thin client over the spaCy sidecar at `apps/ner` (FastAPI + en_core_web_sm).
+ * Thin client over the spaCy sidecar at `apps/ner` (FastAPI + en_core_web_trf
+ * by default; en_core_web_lg available via NER_SPACY_MODEL env if RAM-bound).
  * The sidecar URL is configured via NER_SERVICE_URL.
  *
  * Label mapping spaCy → EntityType:

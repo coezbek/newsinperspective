@@ -7,8 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
+# Install both lg and trf so the model is selectable via NER_SPACY_MODEL
+# at runtime (default trf — see main.py). lg stays available as a
+# memory-light fallback.
 RUN pip install -r requirements.txt \
-    && python -m spacy download en_core_web_lg
+    && python -m spacy download en_core_web_lg \
+    && python -m spacy download en_core_web_trf
 
 COPY main.py ./
 
