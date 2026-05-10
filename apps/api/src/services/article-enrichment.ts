@@ -100,6 +100,17 @@ async function enrichOne(
       fullText: true,
       translatedFullText: true,
       language: true,
+      // Pull the per-article LLM enrichment so we can correct spaCy's
+      // type errors (Stratford Butterfly Farm → PERSON, Wikimedia →
+      // GPE, Taronga Zoo → PERSON). The LLM enrichment classifies
+      // names directly into persons/organizations/places, which is
+      // both more accurate than en_core_web_sm and free at this point
+      // (we already paid for the call in stage 2).
+      features: {
+        where: { scopeType: "ARTICLE" },
+        select: { featureSet: true },
+        take: 1,
+      },
     },
   });
   if (!article) {
@@ -145,6 +156,40 @@ async function enrichOne(
 
   if (candidates.length === 0) {
     return { success: true, entitiesCount: 0 };
+  }
+
+  // LLM type override: when stage-2 enrichment classified a name as
+  // PERSON/ORG/PLACE that disagrees with spaCy, trust the LLM. spaCy's
+  // small model (en_core_web_sm) routinely mis-types organization names
+  // as PERSON ("Stratford Butterfly Farm", "Taronga Zoo"), GPE
+  // ("Wikimedia"), or partial-name fragments as the wrong type
+  // ("Attenborough"→GPE while "David Attenborough"→PERSON). Match on the
+  // full surface form, case-insensitive; ambiguous tokens stay spaCy-typed.
+  const llmTypeBySurface = new Map<string, EntityType>();
+  const featureSet = article.features?.[0]?.featureSet as
+    | { persons?: unknown; organizations?: unknown; places?: unknown }
+    | undefined;
+  const collectNames = (raw: unknown): string[] =>
+    Array.isArray(raw) ? raw.filter((v): v is string => typeof v === "string") : [];
+  for (const n of collectNames(featureSet?.persons)) {
+    llmTypeBySurface.set(n.toLowerCase().trim(), EntityType.PERSON);
+  }
+  for (const n of collectNames(featureSet?.organizations)) {
+    llmTypeBySurface.set(n.toLowerCase().trim(), EntityType.ORG);
+  }
+  for (const n of collectNames(featureSet?.places)) {
+    llmTypeBySurface.set(n.toLowerCase().trim(), EntityType.GPE);
+  }
+  let overrides = 0;
+  for (const c of candidates) {
+    const llmType = llmTypeBySurface.get(c.entityText.toLowerCase().trim());
+    if (llmType && llmType !== c.entityType) {
+      c.entityType = llmType;
+      overrides += 1;
+    }
+  }
+  if (overrides > 0) {
+    console.log(`[enrich:${articleId}] step=llm-type-override applied=${overrides}`);
   }
 
   // Within-article partial-name fold for PERSON / ORG. spaCy frequently
