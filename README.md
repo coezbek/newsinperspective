@@ -54,8 +54,8 @@ Repository: https://github.com/coezbek/newsinperspective
 ## Workspace
 - `apps/api`: Fastify API plus ingestion jobs
 - `apps/web`: Svelte + Vite frontend
-- `apps/perspective`: Python FastAPI sidecar for SBERT framing-divergence + RoBERTa sentiment + TF-IDF
-- `apps/ner`: Python FastAPI sidecar for spaCy `en_core_web_lg` named-entity recognition
+- `apps/perspective`: Python FastAPI sidecar for SBERT framing-divergence + RoBERTa sentiment + TF-IDF (registered as `@news/perspective`; `pnpm run dev` starts it alongside api + web)
+- `apps/ner`: Python FastAPI sidecar for spaCy named-entity recognition. Defaults to `en_core_web_trf` (transformer); set `NER_SPACY_MODEL=en_core_web_lg` to fall back to the lighter model
 - `packages/db`: Prisma schema and generated client
 - `packages/shared`: shared DTOs and schemas
 
@@ -77,8 +77,20 @@ Linux/macOS, with:
 5. Start Postgres: `pnpm db:start`
 6. Generate Prisma client: `pnpm db:generate`
 7. Run migrations: `pnpm db:migrate`
-8. Start the backend in dev mode (terminal 1): `pnpm --filter @news/api dev`
-9. Start the frontend (terminal 2): `pnpm web:start`
+8. Start the NER sidecar: `docker compose up -d ner`
+9. Start everything in dev mode: `pnpm run dev`
+
+Day-to-day, the only commands you need to run are:
+
+```bash
+docker compose up -d   # postgres + ner
+pnpm run dev           # api + web + perspective sidecar (concurrent via turbo)
+```
+
+`pnpm run dev` starts api, web, and the perspective sidecar in
+parallel — `apps/perspective` is registered as the `@news/perspective`
+workspace member, so its `dev` script (`uv run python app.py`) runs
+alongside the others. No second terminal needed for the sidecar.
 
 `package.json` pins `pnpm@10.32.1`, so once Corepack is enabled it will provision the correct `pnpm` version for this repo. If `nvm` is not already installed on your machine, install it first and then run `nvm use`.
 
@@ -95,8 +107,9 @@ framing summaries, entities, or perspective metrics. Set these in `.env`:
 
 | Variable | Required? | Where to get it | What it does |
 | --- | --- | --- | --- |
-| `OPENROUTER_API_KEY` | **Yes** | https://openrouter.ai/keys | Primary LLM path. Drives stage 2 enrichment (translation, `framingSummary`, keywords, persons/orgs/places) by rotating through the free models in `OPENROUTER_MODEL`. |
-| `OPENAI_API_KEY` | Recommended | https://platform.openai.com/api-keys | Fallback used only after every OpenRouter free model has failed for an article. Without it, enrichment can stall when the free pool is saturated. |
+| `OPENROUTER_API_KEY` | **Yes** | https://openrouter.ai/keys | Default LLM path. Drives stage 2 enrichment (translation, `framingSummary`, keywords, persons/orgs/places) by rotating through the free models in `OPENROUTER_MODEL`. |
+| `OPENAI_API_KEY` | Recommended | https://platform.openai.com/api-keys | Fallback used only after every OpenRouter free model has failed for an article. Without it, enrichment can stall when the free pool is saturated. Also used as the **primary** path when `LLM_PRIMARY=openai`. |
+| `LLM_PRIMARY` | Optional (`openrouter` \| `openai`, default `openrouter`) | — | Routing override for stage-2 article + keyword enrichment. Set to `openai` to call OpenAI first (model from `OPENAI_FALLBACK_MODEL`, default `gpt-5.4-nano`) and fall through to the OpenRouter rotation only on parse failure. The 2026-05-09 20×20 run cut stage 2 from 4h41m → 1h10m using this. |
 
 Every other variable in `.env.example` ships with a working default — see the inline comments there for tuning notes (ingestion concurrency, sidecar URLs, caches, dedupe thresholds, model rotation order).
 
@@ -158,18 +171,23 @@ Runtime logs are written to `logs/`, including:
 
 ## Daily pipeline
 
-Each daily run is a chain of five jobs, executed strictly serially by the
-pipeline runner (`apps/api/src/services/pipeline-runner.ts`). The scheduler
-(`apps/api/src/workers/scheduler.ts`) enqueues them in order when
-`AUTO_INGEST=true`, and the same chain can be reproduced manually:
+Each daily run is a chain of seven stages, executed strictly serially:
 
-| Stage | Job kind | Script | Produces |
+| Stage | Critical? | Script | Produces |
 | --- | --- | --- | --- |
-| 1 | `kagi-ingest` | `src/scripts/kagi-ingest.ts` | `Article.fullText`, `StoryCluster`, `ClusterArticle`, plus a best-effort `ClusterPerspective` row per cluster |
-| 2 | `openrouter-backlog` | `src/scripts/enrich-openrouter.ts` | `Article.translatedFullText`, `Article.language`, summary, cluster keywords |
-| 3 | `entity-re-enrich` | `src/scripts/entity-re-enrich.ts` | `NamedEntity`, `EntityMention` (spaCy NER + Wikipedia link inline) |
-| 4 | `cluster-perspective-backfill` | `src/scripts/cluster-perspective-backfill.ts` | Cluster perspective metrics |
-| 5 | `perspective-calibrate` | `src/scripts/perspective-calibrate.ts` | Refreshed divergence-score quantiles (when calibration TTL expired) |
+| 1 `kagi-ingest` | yes | `src/scripts/kagi-ingest.ts` | `Article.fullText`, `StoryCluster`, `ClusterArticle`, plus a best-effort `ClusterPerspective` row per cluster |
+| 2 `openrouter-backlog` | yes | `src/scripts/enrich-openrouter.ts` | `Article.translatedFullText`, `Article.language`, summary, cluster keywords (anchored on per-article keyword union) |
+| 3 `entity-re-enrich` | no | `src/scripts/entity-re-enrich.ts` | `NamedEntity`, `EntityMention` (spaCy NER + LLM type override + within-article partial-name fold + Wikipedia link inline) |
+| 4 `cluster-perspective-backfill` | yes | `src/scripts/cluster-perspective-backfill.ts` | Cluster perspective metrics (calls perspective sidecar) |
+| 5 `perspective-calibrate` | no | `src/scripts/perspective-calibrate.ts` | Refreshed divergence-score quantiles |
+| 6 `perspective-narrative` | no | `src/scripts/perspective-narrative.ts` | LLM-generated framing + per-country narratives per cluster |
+| 7 `perspective-resolve-countries` | no | `src/scripts/perspective-resolve-countries.ts` | LLM-resolved country values for source profiles missing one |
+
+**Stage criticality** (used by `scripts/run-pipeline.sh`): stages 1, 2, 4 are
+**critical** — their output is required by later stages, so a non-zero exit
+aborts the chain. Stages 3, 5, 6, 7 are **noncritical** — a transient failure
+(e.g. a Wikipedia 429 storm in stage 3) logs a `WARNING:` and the chain
+continues so today's data still gets perspective scores and narratives.
 
 Stage 3 reads `translatedFullText` for non-English articles (falling back to
 `fullText` if translation hasn't run), so stage 2 must complete before stage 3.
@@ -178,44 +196,56 @@ spaCy entity inside `enrichArticleWithEntities`.
 
 Running `pnpm kagi:ingest` on its own only completes **stage 1**. It runs an
 inline best-effort `computeClusterPerspective` per cluster, but leaves
-keywords as `keywords_pending` and emits no translations, entities,
-narratives, or recalibration. To get a full daily slice you need to run
-stages 2–5 too. LLM narrative generation (`perspective-narrative`) and
-the LLM country resolver (`perspective-resolve-countries`) are
-**explicit, out-of-band** batch scripts and are intentionally not part
-of the chain.
+keywords as `keywords_pending` and emits no translations, entities, or
+narratives. Use `scripts/run-pipeline.sh` (below) for the full chain.
 
 ### Single-command pipeline run
 
-The canonical chain is wrapped by `pnpm pipeline:run`
-(`src/scripts/pipeline-run.ts`). One process runs all five stages
-serially, mirrors each stage's output to `logs/pipeline-<n>-<name>.log`,
-loops the OpenRouter enrichment until the article backlog drains, and
-prints a token-usage summary at the end.
+`scripts/run-pipeline.sh` runs all seven stages serially, mirrors output
+to `logs/pipeline-<DATE>-<HHMMSS>.log`, scales the article/cluster caps
+with the run size, and applies the critical/noncritical exit semantics
+described above.
 
 ```bash
-# Default: today (UTC), 10 clusters x <=10 articles per cluster.
-pnpm pipeline:run
+# Default: today (UTC), 5 clusters x 5 articles per cluster.
+scripts/run-pipeline.sh
 
-# Explicit options:
-pnpm pipeline:run --date=2026-05-07 --clusters=10 --articles-per-cluster=10
+# Explicit args: DATE CLUSTERS MAX_SOURCES_PER_CLUSTER
+scripts/run-pipeline.sh 2026-05-09 20 20
+
+# Use OpenAI as the primary stage-2 model for this run only:
+LLM_PRIMARY=openai scripts/run-pipeline.sh 2026-05-09 20 20
 
 # With paid OpenRouter fallback enabled (used only after the free pool fails):
 OPENROUTER_PAID_FALLBACK_MODEL=deepseek/deepseek-chat \
-  pnpm pipeline:run
+  scripts/run-pipeline.sh
 ```
+
+Article and cluster caps for stage 2 scale with the run size:
+`ARTICLE_LIMIT = CLUSTERS × MAX_SOURCES`, `CLUSTER_LIMIT = CLUSTERS`. So a
+20×20 run enriches up to 400 articles (vs the previous hard-coded 200).
+
+You can monitor a running pipeline live at the `/pipeline` page in the
+web UI — it polls `GET /api/pipeline/log-status` every 4 s, parses stage
+banners out of the latest `logs/pipeline-*.log`, and renders a per-stage
+status table with the running stage's stdout tail.
 
 For long runs, wrap the command in `tmux` so it survives disconnects:
 
 ```bash
-tmux new-session -d -s pipeline "pnpm pipeline:run 2>&1 | tee logs/pipeline-run.log"
+tmux new-session -d -s pipeline "scripts/run-pipeline.sh 2026-05-09 20 20"
 tmux attach -t pipeline   # detach with Ctrl+b d
 ```
 
-If a stage fails the runner stops and exits non-zero; rerun
-`pnpm pipeline:run` to resume — earlier stages are idempotent
+If a critical stage (1, 2, or 4) fails the runner aborts; re-run the same
+command to resume — earlier stages are idempotent
 (`KAGI_INGEST_SKIP_EXISTING=false` is set so a re-run refreshes article
-bodies for the same date).
+bodies for the same date). Noncritical stages (3, 5, 6, 7) print a
+`WARNING:` and let the chain continue.
+
+There is also `pnpm pipeline:run` (`src/scripts/pipeline-run.ts`) for the
+narrower five-stage TS-only chain; it predates `run-pipeline.sh` and
+doesn't include narrative + country-resolve.
 
 ### Cluster selection knobs (kagi-ingest)
 
@@ -284,14 +314,12 @@ fallback; running `pnpm entity:re-enrich --force` repopulates them.
 `apps/perspective/` is a FastAPI service that computes the cluster framing-divergence
 score (SBERT `all-mpnet-base-v2`), per-source distinctive words (TF-IDF), and
 per-country sentiment (`cardiffnlp/twitter-roberta-base-sentiment-latest`).
-It is **not** in `docker-compose.yml`; start it locally with `uv`:
-
-```bash
-cd apps/perspective
-uv venv
-uv pip install -e .
-uv run python app.py
-```
+It is registered as the `@news/perspective` workspace member, so
+`pnpm run dev` starts it concurrently with api + web — no separate
+terminal. The script it runs is `uv run python app.py`, so `uv` must be
+on `PATH` and `apps/perspective/.venv` must exist
+(`cd apps/perspective && uv venv && uv pip install -e .` once on first
+checkout).
 
 It listens on `127.0.0.1:5710` by default (`PERSPECTIVE_HOST` / `PERSPECTIVE_PORT`
 to override). First request cold-loads ~1 GB of models; `POST /warmup` preloads
@@ -302,17 +330,44 @@ See `apps/perspective/README.md` for the full API and config surface.
 
 ### NER sidecar
 
-`apps/ner/` is a FastAPI service running spaCy `en_core_web_lg`. Bring it up
+`apps/ner/` is a FastAPI service running spaCy. Default model is
+`en_core_web_trf` (transformer); set `NER_SPACY_MODEL=en_core_web_lg` to
+fall back to the lighter model on memory-constrained hosts. Bring it up
 alongside Postgres:
 
 ```bash
+docker compose build ner    # one-time after switching to trf
 docker compose up -d ner
 curl http://127.0.0.1:5711/health
 ```
 
+The container ships both `en_core_web_lg` (~570 MB) and `en_core_web_trf`
+(~430 MB + torch CPU wheels) so the model is selectable at runtime. The
+trf model adds ~1.5 GB of resident memory.
+
 `apps/api/src/services/entity-recognition.ts` is a thin client that maps
 spaCy labels to `EntityType` (`PERSON/ORG/GPE/EVENT`; `LOC→GPE`; `DATE`
 dropped). Configure with `NER_SERVICE_URL` and `NER_SERVICE_TIMEOUT_MS`.
+
+Stage 3 (entity-re-enrich) layers two corrections on top of spaCy's
+output to clean up the residual mis-classifications:
+
+- **LLM type override.** Stage 2 already classified each article's names
+  into `persons[] / organizations[] / places[]`. When that disagrees
+  with spaCy on the same surface form, the LLM type wins (e.g.
+  `Stratford Butterfly Farm` → ORG, `Wikimedia` → ORG).
+- **Within-article partial-name fold.** Bare surname / first-name
+  mentions (`David` + `Attenborough`) collapse into the matching
+  multi-token canonical (`David Attenborough`) iff the parent is
+  unambiguous in the article. Highlight offsets stay anchored to the
+  original token; only the entity row + Wikipedia lookup uses the
+  canonical form.
+
+Wikipedia entity-link cache keys are normalized (lowercase, leading
+articles `the/a/an` + EN/FR/ES/DE equivalents stripped, trailing
+possessive + punctuation removed) so trivial surface variants
+(`Marshall Islands` / `the Marshall Islands` / `Netherlands'`) share a
+disk-cache slot.
 
 ## API endpoints
 
