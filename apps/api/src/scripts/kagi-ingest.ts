@@ -12,6 +12,7 @@ import {
 } from "../services/kagi-news.js";
 import { buildArticleFeatures, buildClusterKeywordFallback } from "../services/nlp.js";
 import { buildTextFingerprint } from "../domain/fingerprint.js";
+import { extractDomain } from "../domain/url.js";
 import { upsertSourceProfiles } from "../services/source-profiles.js";
 import {
   buildSoftDedupePlan,
@@ -463,6 +464,11 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
   for (const source of payload.sources) {
     const originalUrl = source.originalUrl ?? source.link;
     const canonicalUrl = source.finalUrl ?? originalUrl;
+    // Trust the resolved canonical URL over Kagi's listing-time `domain`.
+    // Kagi often hands us Google News redirect links with `domain: "google.com"`;
+    // the browser extractor follows those to the real publisher (e.g. npr.org)
+    // and we want `domain`/`sourceName` to reflect that, not the redirector.
+    const resolvedDomain = extractDomain(canonicalUrl);
     const publishedAt = source.date ? new Date(source.date) : null;
     const extractionStatus = normalizeExtractionStatus(source.extractionStatus);
 
@@ -490,8 +496,8 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
         extractedAt: extractionStatus === ExtractionStatus.SUCCESS ? generatedAt : null,
         extractionError: source.extractionError ?? null,
         publishedAt,
-        sourceName: source.domain,
-        domain: source.domain,
+        sourceName: resolvedDomain,
+        domain: resolvedDomain,
         category,
         ingestionDate: snapshotDate,
       },
@@ -512,8 +518,8 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
         extractedAt: extractionStatus === ExtractionStatus.SUCCESS ? generatedAt : null,
         extractionError: source.extractionError ?? null,
         publishedAt,
-        sourceName: source.domain,
-        domain: source.domain,
+        sourceName: resolvedDomain,
+        domain: resolvedDomain,
         duplicateDomains: [],
         duplicateCount: 0,
         language: null,
@@ -527,7 +533,7 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
     duplicateDomainsByArticleId.set(article.id, article.duplicateDomains);
     dedupeInputs.push({
       id: article.id,
-      domain: source.domain,
+      domain: resolvedDomain,
       title: source.title,
       summary: null,
       body: source.fullText ?? buildAnalysisText(source),
@@ -540,9 +546,9 @@ async function importClusterPayload(payload: IngestedClusterPayload): Promise<{
       source.fullText ? null : buildAnalysisText(source),
       null,
     );
-    const sourceKey = source.domain.trim().toLowerCase();
+    const sourceKey = resolvedDomain.trim().toLowerCase();
     const sourceEntry = sourceStats.get(sourceKey) ?? {
-      sourceName: source.domain,
+      sourceName: resolvedDomain,
       count: 0,
       sentimentSum: 0,
       biasSignals: new Set<string>(),
