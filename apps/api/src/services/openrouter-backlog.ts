@@ -417,6 +417,14 @@ export async function runOpenRouterBacklog(options?: {
                   contentSnippet: true,
                   fullText: true,
                   language: true,
+                  // Per-article LLM keywords to anchor the cluster keyword
+                  // consolidation. Pulled from the article's own NlpFeature
+                  // row (scopeType=ARTICLE).
+                  features: {
+                    where: { scopeType: ScopeType.ARTICLE },
+                    select: { featureSet: true },
+                    take: 1,
+                  },
                 },
               },
             },
@@ -484,14 +492,26 @@ export async function runOpenRouterBacklog(options?: {
     const body = joinText(articles.map((article) => article.fullText ?? article.contentSnippet), 6000);
     const current = feature.featureSet as JsonObject;
 
+    // Walk EVERY article in the cluster (not just top-6) so the seed-keyword
+    // anchor reflects the full distribution, not a 6-article slice.
+    const allClusterArticles = cluster.articles.map((item) => item.article);
     const openrouter = await buildClusterKeywordsWithOpenRouter(
       cluster.title,
-      articles.map((article) => ({
-        title: article.title,
-        summary: article.summary,
-        body: article.fullText ?? article.contentSnippet,
-        language: article.language ?? language,
-      })),
+      allClusterArticles.map((article) => {
+        const articleFeatureSet = (article.features?.[0]?.featureSet ?? null) as
+          | { keywords?: unknown }
+          | null;
+        const articleKeywords = Array.isArray(articleFeatureSet?.keywords)
+          ? articleFeatureSet!.keywords.filter((v): v is string => typeof v === "string")
+          : null;
+        return {
+          title: article.title,
+          summary: article.summary,
+          body: article.fullText ?? article.contentSnippet,
+          language: article.language ?? language,
+          ...(articleKeywords ? { keywords: articleKeywords } : {}),
+        };
+      }),
       {
         onAttemptLog: (msg) =>
           console.log(`[openrouter-backlog][cluster ${cluster.id}] ${msg}`),

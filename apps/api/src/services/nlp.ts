@@ -185,12 +185,25 @@ export async function buildClusterKeywordsWithOpenRouter(
   const summary = joinText(topArticles.map((article) => article.summary), 3000);
   const body = joinText(topArticles.map((article) => article.body), 6000);
 
+  // Pass per-article keywords across ALL cluster members (not just the
+  // top-6 we sample for body text) as anchoring context. The cluster
+  // keyword pass should reflect what each article actually emphasized,
+  // not what the model re-extracts from a 6000-char excerpt.
+  const seedKeywords: string[] = [];
+  for (const article of articles) {
+    if (!Array.isArray(article.keywords)) continue;
+    for (const k of article.keywords) {
+      if (typeof k === "string" && k.trim()) seedKeywords.push(k.trim());
+    }
+  }
+
   const openrouter = await extractKeywordsWithOpenRouter({
     title: clusterTitle,
     summary,
     body,
     language,
     maxKeywords: options?.maxKeywords ?? 8,
+    ...(seedKeywords.length > 0 ? { seedKeywords } : {}),
     ...(options?.onAttemptLog ? { onAttemptLog: options.onAttemptLog } : {}),
   });
 

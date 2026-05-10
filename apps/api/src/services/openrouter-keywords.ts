@@ -12,6 +12,15 @@ interface OpenRouterKeywordInput {
   body: string | null;
   language: string | null;
   maxKeywords?: number;
+  /**
+   * Optional candidate keywords gathered from per-article enrichment in the
+   * same cluster. When supplied, the prompt asks the model to consolidate
+   * the cluster keyword set against these as anchors — i.e. prefer reusing
+   * the most-frequent variants and merging near-synonyms ("climate
+   * activism" / "climate campaign" / "climate change advocacy" → one) —
+   * rather than re-extracting from scratch and inventing fresh wording.
+   */
+  seedKeywords?: string[];
   onAttemptLog?: (message: string) => void;
 }
 
@@ -87,6 +96,22 @@ export async function extractKeywordsWithOpenRouter(
     };
   }
 
+  // Frequency-rank seed keywords so the most-mentioned variants surface
+  // first in the prompt. Lowercased to collapse trivial casing dupes.
+  const seedFreq = new Map<string, { surface: string; count: number }>();
+  for (const k of input.seedKeywords ?? []) {
+    const trimmed = k.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    const prev = seedFreq.get(key);
+    if (prev) prev.count += 1;
+    else seedFreq.set(key, { surface: trimmed, count: 1 });
+  }
+  const seedRanked = [...seedFreq.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 40)
+    .map((entry) => (entry.count > 1 ? `${entry.surface} (×${entry.count})` : entry.surface));
+
   const prompt = [
     "Extract the most informative topical keywords from this news text.",
     "Return strict JSON only with this shape: {\"keywords\": [\"...\", \"...\"]}.",
@@ -99,11 +124,22 @@ export async function extractKeywordsWithOpenRouter(
     `- return at most ${maxKeywords} keywords`,
     "- preserve proper names closely when translating",
     "- prefer 1 to 4 words per keyword",
+    ...(seedRanked.length > 0
+      ? [
+          "- The candidate-keywords list below was extracted from each individual",
+          "  article in this cluster. Use it as the primary anchor: prefer reusing",
+          "  the most-frequent variants verbatim and merging near-synonyms in it",
+          "  to one canonical phrase (e.g. 'climate activism' / 'climate campaign'",
+          "  / 'climate change advocacy' → one). Only invent a fresh phrase when",
+          "  none of the candidates expresses the concept well.",
+        ]
+      : []),
     "Examples:",
     "- good: [\"Zoom security\", \"privilege escalation\", \"macOS vulnerability\", \"webcam access\"]",
     "- good: [\"Lazarus Group\", \"macOS malware\", \"fileless payloads\", \"in-memory loading\"]",
     "- bad: [\"released\", \"new\", \"cyber attack\", \"story\"]",
     "",
+    ...(seedRanked.length > 0 ? [`Candidate keywords (frequency across articles): ${seedRanked.join(", ")}`, ""] : []),
     `Title: ${input.title}`,
     `Summary: ${input.summary ?? ""}`,
     `Body: ${input.body ?? ""}`,
